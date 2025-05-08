@@ -1,2 +1,2 @@
 # DNAS
-DNAS (DefinitelyNotAScam) simple PoC Cryptocurrency 
+DNAS (Definitely Not A Scam) simple PoC Cryptocurrency 
