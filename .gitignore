@@ -1,0 +1,8 @@
+# runtime artifacts
+chain*.json
+wallet*.json
+w*.json
+*.log
+pid
+/dnas
+/dnas-race
