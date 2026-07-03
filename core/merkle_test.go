@@ -74,6 +74,7 @@ func TestSPVProofAgainstChain(t *testing.T) {
 	if err := bc.AddBlock(mineOn(t, bc, alice.Address(), nil)); err != nil {
 		t.Fatal(err)
 	}
+	matureCoinbase(t, bc)
 	tx := signedTx(t, alice, bob.Address(), 5*Coin, Coin, 0)
 	if err := bc.AddBlock(mineOn(t, bc, alice.Address(), []Transaction{tx})); err != nil {
 		t.Fatal(err)

@@ -1,5 +1,9 @@
 go 1.26
 
+// The tui/ client is intentionally not listed here: it has external
+// dependencies (bubbletea, lipgloss) and imports no DNAS module, so it builds as
+// its own module (cd tui && go build ./...). Keeping it out of the workspace
+// avoids forcing go.sum verification onto the internal v0.0.0 modules.
 use (
 	./api
 	./cmd

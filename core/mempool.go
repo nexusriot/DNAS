@@ -2,6 +2,7 @@ package core
 
 import (
 	"errors"
+	"fmt"
 	"sort"
 	"sync"
 )
@@ -10,25 +11,71 @@ import (
 // mempool starts evicting the lowest-fee transaction to make room.
 const DefaultMempoolSize = 5000
 
+// feeFloorMaxMultiplier is how many times the base relay fee the floor reaches
+// when the mempool is completely full. The floor grows quadratically with
+// occupancy between the base (empty) and base*multiplier (full), so light-fee
+// transactions are cheap to relay on an idle network but priced out under load.
+const feeFloorMaxMultiplier = 100
+
 // Mempool holds validated, not-yet-mined transactions keyed by hash. It is
 // bounded: once full, a new transaction is admitted only if it pays a strictly
 // higher fee than the cheapest one already queued, which it then evicts.
+//
+// It also enforces a dynamic minimum relay fee (see MinFee) as local relay
+// policy — NOT a consensus rule. A transaction below the current floor is
+// refused entry here, but if it reaches a node in a mined block it is still
+// accepted; the floor only governs what this node will queue and gossip.
 type Mempool struct {
-	mu  sync.Mutex
-	txs map[string]Transaction
-	max int
+	mu          sync.Mutex
+	txs         map[string]Transaction
+	max         int
+	minRelayFee uint64 // base floor when empty; 0 disables the fee floor
 }
 
-// NewMempool returns an empty mempool with the default size limit.
+// NewMempool returns an empty mempool with the default size limit and no fee
+// floor (base relay fee 0).
 func NewMempool() *Mempool { return NewMempoolWithLimit(DefaultMempoolSize) }
 
 // NewMempoolWithLimit returns an empty mempool holding at most max transactions
-// (values <= 0 fall back to the default).
+// (values <= 0 fall back to the default) and no fee floor.
 func NewMempoolWithLimit(max int) *Mempool {
+	return NewMempoolWithPolicy(max, 0)
+}
+
+// NewMempoolWithPolicy returns an empty mempool bounded at max transactions with
+// the given base minimum relay fee. The effective floor rises with occupancy
+// (see MinFee). A minRelayFee of 0 disables the floor entirely.
+func NewMempoolWithPolicy(max int, minRelayFee uint64) *Mempool {
 	if max <= 0 {
 		max = DefaultMempoolSize
 	}
-	return &Mempool{txs: map[string]Transaction{}, max: max}
+	return &Mempool{txs: map[string]Transaction{}, max: max, minRelayFee: minRelayFee}
+}
+
+// MinFee returns the current dynamic relay-fee floor: the least fee a
+// transaction must pay to be admitted right now. It equals the configured base
+// relay fee when the pool is empty and climbs quadratically toward
+// base*feeFloorMaxMultiplier as the pool fills. Returns 0 when no floor is set.
+func (m *Mempool) MinFee() uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.minFeeLocked()
+}
+
+// minFeeLocked computes the occupancy-scaled fee floor. The caller must hold m.mu.
+func (m *Mempool) minFeeLocked() uint64 {
+	if m.minRelayFee == 0 || m.max <= 0 {
+		return m.minRelayFee
+	}
+	fill := len(m.txs) * 100 / m.max // occupancy percent, 0..100
+	if fill > 100 {
+		fill = 100
+	}
+	// extra = (multiplier-1) * fill^2 / 100^2, so fill=0 -> 0 and fill=100 ->
+	// multiplier-1. The square keeps the floor near the base until the pool is
+	// genuinely congested, then ramps it steeply.
+	extra := uint64(feeFloorMaxMultiplier-1) * uint64(fill*fill) / 10_000
+	return m.minRelayFee * (1 + extra)
 }
 
 // Add verifies the transaction's signature and stores it. Returns whether it
@@ -51,6 +98,11 @@ func (m *Mempool) Add(tx Transaction) (bool, error) {
 	h := tx.Hash()
 	if _, ok := m.txs[h]; ok {
 		return false, nil
+	}
+
+	// Relay policy: refuse anything paying below the current dynamic floor.
+	if floor := m.minFeeLocked(); tx.Fee < floor {
+		return false, fmt.Errorf("fee %d below current relay floor %d", tx.Fee, floor)
 	}
 
 	// Replace-by-fee: a conflicting tx (same sender+nonce) may only be replaced
@@ -157,8 +209,9 @@ func (m *Mempool) Select(bc *Blockchain, max int) []Transaction {
 		if s, ok := cache[addr]; ok {
 			return s
 		}
-		acc := bc.Account(addr)
-		s := sim{balance: acc.Balance, nonce: acc.Nonce}
+		// Use the spendable balance so immature coinbase isn't selected — the
+		// miner would otherwise build a block its own consensus rules reject.
+		s := sim{balance: bc.SpendableBalance(addr), nonce: bc.Account(addr).Nonce}
 		cache[addr] = s
 		return s
 	}
@@ -168,7 +221,7 @@ func (m *Mempool) Select(bc *Blockchain, max int) []Transaction {
 	for len(selected) < max {
 		var ready []Transaction
 		for _, tx := range all {
-			if used[tx.Hash()] || tx.IsExpiredAt(mineHeight) {
+			if used[tx.Hash()] || tx.IsExpiredAt(mineHeight) || tx.IsLockedAt(mineHeight) {
 				continue
 			}
 			s := get(tx.From)

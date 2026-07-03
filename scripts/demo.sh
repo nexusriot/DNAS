@@ -36,18 +36,19 @@ wait_converge() {
 run() { ( cd "$1" && shift && exec "$BIN" node "$@" </dev/null ); }
 
 # node1: miner, no peers.  (stdin from /dev/null -> headless, no REPL)
-run "$DATA/n1" -listen :19000 -api :19080 -mine -db chain.json -wallet w.json >"$DATA/n1.log" 2>&1 &
+run "$DATA/n1" -listen :19000 -api :19080 -mine -db chain.db -wallet w.json >"$DATA/n1.log" 2>&1 &
 N1=$!
 wait_api localhost:19080
 
 # node2: connects to node1.
-run "$DATA/n2" -listen :19001 -api :19081 -peers localhost:19000 -mine -db chain.json -wallet w.json >"$DATA/n2.log" 2>&1 &
+run "$DATA/n2" -listen :19001 -api :19081 -peers localhost:19000 -mine -db chain.db -wallet w.json >"$DATA/n2.log" 2>&1 &
 N2=$!
 wait_api localhost:19081
 
-# node3: a non-mining observer that knows ONLY node1 -- it must discover node2
-# by gossip. (Kept non-mining so the demo has a stable two-miner network.)
-run "$DATA/n3" -listen :19002 -api :19082 -peers localhost:19000 -db chain.json -wallet w.json >"$DATA/n3.log" 2>&1 &
+# node3: a third miner that knows ONLY node1 -- it must discover node2 by gossip.
+# Three racing miners produce frequent equal-work forks; the deterministic
+# tie-break (smaller tip hash wins) still converges them.
+run "$DATA/n3" -listen :19002 -api :19082 -peers localhost:19000 -mine -db chain.db -wallet w.json >"$DATA/n3.log" 2>&1 &
 N3=$!
 wait_api localhost:19082
 
@@ -57,7 +58,7 @@ echo "node1: $A1"
 echo "node3: $A3"
 
 echo; echo "== (4) auth: a node with the wrong -netkey is rejected =="
-run "$DATA/bad" -listen :19003 -api :19083 -peers localhost:19000 -netkey WRONG-KEY -db c.json -wallet w.json >"$DATA/bad.log" 2>&1 &
+run "$DATA/bad" -listen :19003 -api :19083 -peers localhost:19000 -netkey WRONG-KEY -db c.db -wallet w.json >"$DATA/bad.log" 2>&1 &
 BAD=$!
 sleep 3
 if grep -qi "handshake" "$DATA/bad.log"; then
@@ -93,6 +94,19 @@ done
 
 echo; echo "== (expiry) a transaction that expired at height 1 is refused =="
 echo "  $(curl -s -X POST localhost:19080/send -d "{\"to\":\"$A3\",\"amount\":100000000,\"expiry\":1}")"
+
+echo; echo "== (fee floor) dynamic minimum relay fee (rises as the mempool fills) =="
+echo "  min_relay_fee (base units) via node1: $(get localhost:19080/info min_relay_fee)"
+
+echo; echo "== (multisig) derive a 2-of-3 address from three member public keys =="
+PKS=$(python3 -c "import secrets,json;print(json.dumps([secrets.token_hex(32) for _ in range(3)]))" 2>/dev/null)
+if [ -n "$PKS" ]; then
+  echo "  $(curl -s -X POST localhost:19080/multisig/address -d "{\"threshold\":2,\"pubkeys\":$PKS}")"
+fi
+
+echo; echo "== (HD wallet) generate a BIP39 mnemonic and its first addresses =="
+curl -s -X POST localhost:19080/wallet/hd -d '{"count":3}'
+echo
 
 echo; echo "== (SPV) light client verifies the transfer with a merkle proof =="
 PROOF=$(curl -s "localhost:19082/proof/$TXH")

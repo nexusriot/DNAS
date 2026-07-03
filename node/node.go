@@ -1,6 +1,7 @@
 // Package node wires the blockchain, mempool and wallet to an authenticated,
 // encrypted TCP peer network and (optionally) a miner. It handles block and
-// transaction gossip, chain sync, most-work consensus, and peer discovery.
+// transaction gossip, headers-first ranged sync, most-work consensus with
+// reorgs, peer discovery, node-identity authentication and ban scoring.
 package node
 
 import (
@@ -31,7 +32,6 @@ type Config struct {
 	NetKey        string   // pre-shared network key (defaults to DefaultNetKey)
 	MaxPeers      int      // outbound dial cap (defaults to DefaultMaxPeers)
 	Mine          bool     // whether to run the miner
-	DBPath        string   // chain persistence file ("" disables saving)
 }
 
 type peer struct {
@@ -39,6 +39,8 @@ type peer struct {
 	enc  *json.Encoder
 	mu   sync.Mutex // serializes writes to enc
 	addr string     // peer's advertised address (from hello)
+	id   string     // peer's authenticated identity public key
+	ip   string     // remote IP, for ban scoring
 }
 
 func (p *peer) send(m Message) {
@@ -49,11 +51,12 @@ func (p *peer) send(m Message) {
 
 // Node is a running participant in the DNAS network.
 type Node struct {
-	cfg     Config
-	chain   *core.Blockchain
-	mempool *core.Mempool
-	wallet  *wallet.Wallet
-	psk     []byte
+	cfg      Config
+	chain    *core.Blockchain
+	mempool  *core.Mempool
+	wallet   *wallet.Wallet // mining/signing wallet (may be nil)
+	identity *wallet.Wallet // node identity for authenticated handshakes
+	psk      []byte
 
 	peersMu sync.Mutex
 	peers   map[*peer]bool
@@ -61,11 +64,14 @@ type Node struct {
 	seenBlk *seenSet
 	seenTx  *seenSet
 	book    *peerbook
+	bans    *banbook
 
-	tipGen int64 // atomic; bumped whenever the tip changes to interrupt mining
+	mining atomic.Bool // whether the miner is currently active (toggle at runtime)
+	tipGen int64       // atomic; bumped whenever the tip changes to interrupt mining
 }
 
-// New constructs a Node. The wallet enables mining and API-side signing.
+// New constructs a Node. The wallet enables mining and API-side signing; if it
+// is nil an ephemeral key is generated to serve as the node's network identity.
 func New(cfg Config, chain *core.Blockchain, mp *core.Mempool, w *wallet.Wallet) *Node {
 	if cfg.AdvertiseAddr == "" {
 		cfg.AdvertiseAddr = cfg.ListenAddr
@@ -76,16 +82,51 @@ func New(cfg Config, chain *core.Blockchain, mp *core.Mempool, w *wallet.Wallet)
 	if cfg.NetKey == "" {
 		cfg.NetKey = DefaultNetKey
 	}
-	return &Node{
-		cfg:     cfg,
-		chain:   chain,
-		mempool: mp,
-		wallet:  w,
-		psk:     []byte(cfg.NetKey),
-		peers:   map[*peer]bool{},
-		seenBlk: newSeenSet(seenCapacity),
-		seenTx:  newSeenSet(seenCapacity),
-		book:    newPeerbook(cfg.AdvertiseAddr, cfg.MaxPeers),
+	identity := w
+	if identity == nil {
+		identity, _ = wallet.New()
+	}
+	n := &Node{
+		cfg:      cfg,
+		chain:    chain,
+		mempool:  mp,
+		wallet:   w,
+		identity: identity,
+		psk:      []byte(cfg.NetKey),
+		peers:    map[*peer]bool{},
+		seenBlk:  newSeenSet(seenCapacity),
+		seenTx:   newSeenSet(seenCapacity),
+		book:     newPeerbook(cfg.AdvertiseAddr, cfg.MaxPeers),
+		bans:     newBanbook(banThreshold),
+	}
+	n.mining.Store(cfg.Mine)
+	return n
+}
+
+// SetMining turns the miner on or off at runtime (no-op if the node has no
+// wallet to be paid). Mining reports the current state.
+func (n *Node) SetMining(on bool) {
+	if n.wallet == nil {
+		return
+	}
+	n.mining.Store(on)
+	n.onTipChanged() // wake the miner promptly
+}
+
+func (n *Node) Mining() bool { return n.mining.Load() }
+
+// Shutdown stops mining and closes all peer connections. The chain's store is
+// closed separately by the owner (Blockchain.Close).
+func (n *Node) Shutdown() {
+	n.mining.Store(false)
+	n.peersMu.Lock()
+	ps := make([]*peer, 0, len(n.peers))
+	for p := range n.peers {
+		ps = append(ps, p)
+	}
+	n.peersMu.Unlock()
+	for _, p := range ps {
+		_ = p.conn.Close()
 	}
 }
 
@@ -96,12 +137,12 @@ func (n *Node) Start() {
 		n.book.note(a)
 		n.maybeDial(a)
 	}
-	if n.cfg.Mine {
-		if n.wallet == nil {
-			log.Print("mining requested but no wallet; disabled")
-		} else {
-			go n.mineLoop()
-		}
+	// The miner runs whenever the node has a wallet; the atomic flag gates
+	// whether it actually produces blocks, so it can be toggled at runtime.
+	if n.wallet != nil {
+		go n.mineLoop()
+	} else if n.cfg.Mine {
+		log.Print("mining requested but no wallet; disabled")
 	}
 }
 
@@ -202,30 +243,58 @@ func (n *Node) dialLoop(addr string) {
 			time.Sleep(3 * time.Second)
 			continue
 		}
-		log.Printf("connected to peer %s", addr)
 		n.handleConn(conn) // blocks until the connection drops
-		log.Printf("peer %s disconnected; will retry", addr)
 		time.Sleep(3 * time.Second)
 	}
 }
 
 func (n *Node) handleConn(rawConn net.Conn) {
-	sc, err := secureHandshake(rawConn, n.psk)
-	if err != nil {
-		log.Printf("handshake with %s failed: %v", rawConn.RemoteAddr(), err)
+	ip := remoteIP(rawConn)
+	if n.bans.banned(ip) {
 		_ = rawConn.Close()
 		return
 	}
-	p := &peer{conn: sc, enc: json.NewEncoder(sc)}
+
+	// Establish the encrypted, PSK-authenticated channel.
+	sc, sid, err := secureHandshake(rawConn, n.psk)
+	if err != nil {
+		log.Printf("rejected peer %s: handshake failed: %v", ip, err)
+		_ = rawConn.Close()
+		return
+	}
+
+	p := &peer{conn: sc, enc: json.NewEncoder(sc), ip: ip}
+	dec := json.NewDecoder(sc)
+
+	// Authenticated identity exchange: each side proves it holds its identity
+	// key by signing the session id, binding the identity to this session.
+	p.send(Message{Type: MsgIdentity, PubKey: n.identity.PublicKeyHex(), Sig: n.identity.Sign(sid)})
+	var idm Message
+	if err := dec.Decode(&idm); err != nil {
+		_ = sc.Close()
+		return
+	}
+	if idm.Type != MsgIdentity || !wallet.Verify(idm.PubKey, idm.Sig, sid) {
+		log.Printf("rejected peer %s: identity authentication failed", ip)
+		_ = sc.Close()
+		return
+	}
+	p.id = idm.PubKey
+	if n.bans.banned(p.id) {
+		_ = sc.Close()
+		return
+	}
+
 	n.addPeer(p)
 	defer n.removePeer(p)
+	log.Printf("peer connected %s id=%s", ip, short(p.id))
 
-	// Handshake: introduce ourselves, ask for their chain and their peers.
+	// Introduce ourselves, request peers, and start headers-first catch-up
+	// (a block locator lets the peer find our fork point cheaply).
 	p.send(Message{Type: MsgHello, Addr: n.cfg.AdvertiseAddr})
-	p.send(Message{Type: MsgGetChain})
 	p.send(Message{Type: MsgGetPeers})
+	p.send(n.getHeadersMsg())
 
-	dec := json.NewDecoder(sc)
 	for {
 		var m Message
 		if err := dec.Decode(&m); err != nil {
@@ -241,9 +310,6 @@ func (n *Node) handleMessage(p *peer, m Message) {
 		p.addr = m.Addr
 		n.book.note(m.Addr)
 
-	case MsgGetChain:
-		p.send(Message{Type: MsgChain, Chain: n.chain.Blocks()})
-
 	case MsgGetPeers:
 		p.send(Message{Type: MsgPeers, Peers: append(n.book.all(), n.cfg.AdvertiseAddr)})
 
@@ -256,31 +322,6 @@ func (n *Node) handleMessage(p *peer, m Message) {
 			n.maybeDial(addr)
 		}
 
-	case MsgChain:
-		replaced, err := n.chain.ReplaceChain(m.Chain)
-		if err != nil || !replaced {
-			return
-		}
-		log.Printf("adopted heavier chain (height=%d)", n.chain.Height())
-		n.onTipChanged()
-		n.reconcileMempool()
-		n.save()
-
-	case MsgBlock:
-		if m.Block == nil || n.markSeenBlock(m.Block.Hash) {
-			return
-		}
-		if err := n.chain.AddBlock(*m.Block); err != nil {
-			// We may be behind; ask for the full chain to catch up.
-			p.send(Message{Type: MsgGetChain})
-			return
-		}
-		log.Printf("accepted block %d %s", m.Block.Index, short(m.Block.Hash))
-		n.onTipChanged()
-		n.reconcileMempool()
-		n.save()
-		n.broadcastExcept(Message{Type: MsgBlock, Block: m.Block}, p)
-
 	case MsgTx:
 		if m.Tx == nil || n.markSeenTx(m.Tx.Hash()) {
 			return
@@ -288,12 +329,148 @@ func (n *Node) handleMessage(p *peer, m Message) {
 		if m.Tx.IsExpiredAt(n.chain.Height() + 1) {
 			return
 		}
-		added, err := n.mempool.Add(*m.Tx)
-		if err != nil || !added {
+		if added, err := n.mempool.Add(*m.Tx); err != nil || !added {
 			return
 		}
 		n.broadcastExcept(Message{Type: MsgTx, Tx: m.Tx}, p)
+
+	// --- block propagation: announce a hash, pull the body we lack ---
+	case MsgInv:
+		switch {
+		case m.Index == n.chain.Height()+1:
+			p.send(Message{Type: MsgGetData, Index: m.Index})
+		case m.Index > n.chain.Height()+1:
+			p.send(n.getHeadersMsg())
+		}
+
+	case MsgGetData:
+		if b, ok := n.chain.BlockAt(m.Index); ok {
+			p.send(Message{Type: MsgBlock, Block: &b})
+		}
+
+	case MsgBlock:
+		if m.Block == nil || n.markSeenBlock(m.Block.Hash) {
+			return
+		}
+		if err := n.chain.AddBlock(*m.Block); err != nil {
+			// Behind or on a fork: let the locator find where we diverged.
+			p.send(n.getHeadersMsg())
+			return
+		}
+		log.Printf("accepted block %d %s", m.Block.Index, short(m.Block.Hash))
+		n.afterNewBlock()
+		n.broadcastExcept(Message{Type: MsgInv, Index: m.Block.Index, Hash: m.Block.Hash}, p)
+
+	// --- headers-first ranged sync ---
+	case MsgGetHeaders:
+		from := m.From
+		if len(m.Locator) > 0 { // locator-based: reply from just after the fork point
+			from = n.chain.LocatorFork(m.Locator) + 1
+		}
+		if hs := n.chain.HeadersFrom(from, maxHeadersBatch); len(hs) > 0 {
+			p.send(Message{Type: MsgHeaders, Headers: hs})
+		}
+
+	case MsgHeaders:
+		n.onHeaders(p, m.Headers)
+
+	case MsgGetBlocks:
+		if bs := n.chain.BlocksRange(m.From, m.To, maxBlocksBatch); len(bs) > 0 {
+			p.send(Message{Type: MsgBlocks, Blocks: bs})
+		}
+
+	case MsgBlocks:
+		n.onBlocks(p, m.Blocks)
+
+	// --- whole-chain exchange, used only as a fork/bootstrap fallback ---
+	case MsgGetChain:
+		p.send(Message{Type: MsgChain, Chain: n.chain.Blocks()})
+
+	case MsgChain:
+		if replaced, err := n.chain.ReplaceChain(m.Chain); err == nil && replaced {
+			log.Printf("adopted chain via fallback (height=%d)", n.chain.Height())
+			n.afterNewBlock()
+		}
 	}
+}
+
+// onHeaders validates a header batch against our chain and, if it links and its
+// proof-of-work checks out, requests the corresponding block bodies. A batch
+// that doesn't link is a fork (fall back to whole-chain); one that is internally
+// invalid is misbehaviour (ban points).
+func (n *Node) onHeaders(p *peer, headers []core.Header) {
+	if len(headers) == 0 {
+		return
+	}
+	parent, ok := n.chain.HeaderAt(headers[0].Index - 1)
+	if !ok || headers[0].PrevHash != parent.Hash {
+		p.send(Message{Type: MsgGetChain})
+		return
+	}
+	if err := core.ValidateHeaderChain(headers, parent.Hash, parent.Index); err != nil {
+		if n.bans.add(p.id, banBadHeaders) {
+			log.Printf("banning peer id=%s: %v", short(p.id), err)
+		}
+		return
+	}
+	p.send(Message{Type: MsgGetBlocks, From: headers[0].Index, To: headers[len(headers)-1].Index})
+}
+
+// onBlocks applies a downloaded batch of block bodies. A batch that extends our
+// tip is appended block by block; a batch that starts below our tip is a fork
+// suffix, applied as a reorg (transferring only the divergent blocks). Deep or
+// losing forks fall back to a whole-chain exchange.
+func (n *Node) onBlocks(p *peer, blocks []core.Block) {
+	if len(blocks) == 0 {
+		return
+	}
+	first := blocks[0].Index
+
+	if first <= n.chain.Height() {
+		// Fork suffix: reorg from the common ancestor (first-1).
+		adopted, err := n.chain.ReorgFrom(first-1, blocks)
+		if err != nil || !adopted {
+			p.send(Message{Type: MsgGetChain}) // deep/losing fork: fall back
+			return
+		}
+		for _, b := range blocks {
+			n.markSeenBlock(b.Hash)
+		}
+		n.afterNewBlock()
+		tip := n.chain.Tip()
+		log.Printf("reorged onto fork, height=%d %s", tip.Index, short(tip.Hash))
+		n.broadcastExcept(Message{Type: MsgInv, Index: tip.Index, Hash: tip.Hash}, p)
+		if len(blocks) == maxBlocksBatch { // fork may be deeper than one batch
+			p.send(n.getHeadersMsg())
+		}
+		return
+	}
+
+	// Extension: append the batch in order.
+	applied := 0
+	for i := range blocks {
+		if err := n.chain.AddBlock(blocks[i]); err != nil {
+			break
+		}
+		n.markSeenBlock(blocks[i].Hash)
+		applied++
+	}
+	if applied == 0 {
+		p.send(n.getHeadersMsg()) // our tip moved under us; re-sync
+		return
+	}
+	n.afterNewBlock()
+	tip := n.chain.Tip()
+	log.Printf("synced %d block(s), height=%d", applied, tip.Index)
+	n.broadcastExcept(Message{Type: MsgInv, Index: tip.Index, Hash: tip.Hash}, p)
+	if applied == len(blocks) { // a full batch: there may be more
+		p.send(n.getHeadersMsg())
+	}
+}
+
+// getHeadersMsg builds a headers request carrying our block locator.
+func (n *Node) getHeadersMsg() Message {
+	return Message{Type: MsgGetHeaders, Locator: n.chain.Locator()}
 }
 
 func (n *Node) addPeer(p *peer) {
@@ -332,9 +509,20 @@ func (n *Node) markSeenTx(h string) bool    { return n.seenTx.seen(h) }
 
 func (n *Node) onTipChanged() { atomic.AddInt64(&n.tipGen, 1) }
 
+// afterNewBlock runs the bookkeeping common to accepting/adopting new blocks.
+// (Persistence is automatic in the chain's append-only store.)
+func (n *Node) afterNewBlock() {
+	n.onTipChanged()
+	n.reconcileMempool()
+}
+
 func (n *Node) mineLoop() {
-	log.Printf("mining to %s", n.wallet.Address())
+	log.Printf("miner ready for %s (mining=%v)", n.wallet.Address(), n.Mining())
 	for {
+		if !n.mining.Load() {
+			time.Sleep(200 * time.Millisecond) // paused; poll for the toggle
+			continue
+		}
 		tip := n.chain.Tip()
 		height := tip.Index + 1
 		difficulty := n.chain.NextDifficulty()
@@ -382,8 +570,8 @@ func (n *Node) mineLoop() {
 			mined.Index, mined.Difficulty, len(txs), core.FormatAmount(core.BlockReward(height)), short(mined.Hash))
 		n.mempool.Remove(txs)
 		n.onTipChanged()
-		n.save()
-		n.broadcast(Message{Type: MsgBlock, Block: &mined})
+		// Announce the new block by inventory; peers pull the body if they lack it.
+		n.broadcast(Message{Type: MsgInv, Index: mined.Index, Hash: mined.Hash})
 	}
 }
 
@@ -413,18 +601,18 @@ func (n *Node) reconcileMempool() {
 	}
 }
 
-func (n *Node) save() {
-	if n.cfg.DBPath == "" {
-		return
-	}
-	if err := n.chain.Save(n.cfg.DBPath); err != nil {
-		log.Printf("save chain: %v", err)
-	}
-}
-
 func short(h string) string {
 	if len(h) > 10 {
 		return h[:10]
 	}
 	return h
+}
+
+// remoteIP returns the IP portion of a connection's remote address (the ban key).
+func remoteIP(c net.Conn) string {
+	host, _, err := net.SplitHostPort(c.RemoteAddr().String())
+	if err != nil {
+		return c.RemoteAddr().String()
+	}
+	return host
 }

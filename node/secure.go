@@ -32,21 +32,24 @@ type secureConn struct {
 }
 
 // secureHandshake performs a symmetric, pre-shared-key-authenticated X25519 key
-// exchange and returns an encrypted connection. Both peers run it identically.
-// A peer that does not know psk cannot produce a valid HMAC and is rejected,
-// and cannot derive the session key, so it can neither authenticate nor read.
-func secureHandshake(conn net.Conn, psk []byte) (*secureConn, error) {
+// exchange and returns an encrypted connection plus a session id. Both peers run
+// it identically. A peer that does not know psk cannot produce a valid HMAC and
+// is rejected, and cannot derive the session key, so it can neither authenticate
+// nor read. The session id is a deterministic value both peers compute from the
+// handshake transcript; it is used to bind node-identity signatures to this
+// specific session (preventing replay).
+func secureHandshake(conn net.Conn, psk []byte) (*secureConn, []byte, error) {
 	_ = conn.SetDeadline(time.Now().Add(handshakeTimeout))
 	defer func() { _ = conn.SetDeadline(time.Time{}) }()
 
 	curve := ecdh.X25519()
 	priv, err := curve.GenerateKey(rand.Reader)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	salt := make([]byte, 16)
 	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	pub := priv.PublicKey().Bytes() // 32 bytes
 	msg := make([]byte, 0, handshakeLen)
@@ -61,35 +64,54 @@ func secureHandshake(conn net.Conn, psk []byte) (*secureConn, error) {
 
 	in := make([]byte, handshakeLen)
 	if _, err := io.ReadFull(conn, in); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := <-werr; err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	peerPub, peerSalt, peerMAC := in[:32], in[32:48], in[48:80]
 	if !hmac.Equal(peerMAC, hmacSum(psk, peerPub, peerSalt)) {
-		return nil, errors.New("peer authentication failed (wrong network key)")
+		return nil, nil, errors.New("peer authentication failed (wrong network key)")
 	}
 	pk, err := curve.NewPublicKey(peerPub)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	shared, err := priv.ECDH(pk)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	key := deriveKey(shared, psk, salt, peerSalt)
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return &secureConn{conn: conn, gcm: gcm}, nil
+	return &secureConn{conn: conn, gcm: gcm}, sessionID(pub, peerPub, salt, peerSalt), nil
+}
+
+// sessionID deterministically derives a per-session identifier from the
+// handshake transcript, ordering the two peers' contributions so both compute
+// the same value regardless of role.
+func sessionID(pubA, pubB, saltA, saltB []byte) []byte {
+	if bytes.Compare(pubA, pubB) > 0 {
+		pubA, pubB = pubB, pubA
+	}
+	if bytes.Compare(saltA, saltB) > 0 {
+		saltA, saltB = saltB, saltA
+	}
+	h := sha256.New()
+	h.Write([]byte("dnas-session-v1"))
+	h.Write(pubA)
+	h.Write(pubB)
+	h.Write(saltA)
+	h.Write(saltB)
+	return h.Sum(nil)
 }
 
 func hmacSum(key []byte, parts ...[]byte) []byte {

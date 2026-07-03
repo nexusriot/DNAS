@@ -38,6 +38,18 @@ func signedTx(t *testing.T, from *wallet.Wallet, to string, amount, fee, nonce u
 	return tx
 }
 
+// matureCoinbase mines CoinbaseMaturity empty blocks to a throwaway miner so a
+// just-mined coinbase becomes spendable, without touching any asserted balances.
+func matureCoinbase(t *testing.T, bc *Blockchain) {
+	t.Helper()
+	sink, _ := wallet.New()
+	for i := 0; i < CoinbaseMaturity; i++ {
+		if err := bc.AddBlock(mineOn(t, bc, sink.Address(), nil)); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestGenesisDeterministic(t *testing.T) {
 	if GenesisBlock().Hash != GenesisBlock().Hash {
 		t.Fatal("genesis not deterministic")
@@ -70,6 +82,7 @@ func TestTransferAndFee(t *testing.T) {
 		t.Fatal(err)
 	}
 	reward1 := BlockReward(1)
+	matureCoinbase(t, bc) // let alice's coinbase mature before she spends it
 
 	// Alice pays Bob 10 with a fee of 1; Carol mines it.
 	amount, fee := 10*Coin, 1*Coin
@@ -85,7 +98,8 @@ func TestTransferAndFee(t *testing.T) {
 	if got := bc.Balance(bob.Address()); got != amount {
 		t.Errorf("bob = %d, want %d", got, amount)
 	}
-	if got, want := bc.Balance(carol.Address()), reward2+fee; got != want {
+	_ = reward2
+	if got, want := bc.Balance(carol.Address()), BlockReward(bc.Height())+fee; got != want {
 		t.Errorf("carol (miner) = %d, want %d", got, want)
 	}
 	if got := bc.Account(alice.Address()).Nonce; got != 1 {
@@ -100,6 +114,7 @@ func TestReplayRejected(t *testing.T) {
 	if err := bc.AddBlock(mineOn(t, bc, alice.Address(), nil)); err != nil {
 		t.Fatal(err)
 	}
+	matureCoinbase(t, bc)
 	tx := signedTx(t, alice, bob.Address(), 5*Coin, 0, 0)
 	if err := bc.AddBlock(mineOn(t, bc, alice.Address(), []Transaction{tx})); err != nil {
 		t.Fatal(err)
@@ -179,10 +194,11 @@ func TestExpiryEnforcedInBlock(t *testing.T) {
 	if err := bc.AddBlock(mineOn(t, bc, alice.Address(), nil)); err != nil {
 		t.Fatal(err)
 	}
-	// Tip is now height 1, so the next block is height 2.
+	matureCoinbase(t, bc)
+	next := bc.Height() + 1 // the height the spend will land at
 
-	// A transaction that expires at height 1 cannot be mined into block 2.
-	expired := Transaction{From: alice.Address(), To: bob.Address(), Amount: Coin, Nonce: 0, Expiry: 1}
+	// A transaction whose expiry is already in the past can't be mined.
+	expired := Transaction{From: alice.Address(), To: bob.Address(), Amount: Coin, Nonce: 0, Expiry: next - 1}
 	if err := expired.Sign(alice); err != nil {
 		t.Fatal(err)
 	}
@@ -190,8 +206,8 @@ func TestExpiryEnforcedInBlock(t *testing.T) {
 		t.Fatal("expected expired transaction to be rejected in block")
 	}
 
-	// The same transfer expiring at height 2 is valid at height 2.
-	ok := Transaction{From: alice.Address(), To: bob.Address(), Amount: Coin, Nonce: 0, Expiry: 2}
+	// The same transfer expiring at exactly `next` is still valid at `next`.
+	ok := Transaction{From: alice.Address(), To: bob.Address(), Amount: Coin, Nonce: 0, Expiry: next}
 	if err := ok.Sign(alice); err != nil {
 		t.Fatal(err)
 	}
@@ -201,6 +217,132 @@ func TestExpiryEnforcedInBlock(t *testing.T) {
 	if bc.Balance(bob.Address()) != Coin {
 		t.Fatalf("bob balance = %d, want %d", bc.Balance(bob.Address()), Coin)
 	}
+}
+
+func TestBadCoinbaseAmountRejected(t *testing.T) {
+	bc := NewBlockchain()
+	alice, _ := wallet.New()
+	tip := bc.Tip()
+	// Coinbase paying more than the reward (no fees to justify it).
+	cb := NewCoinbase(alice.Address(), BlockReward(1)+Coin)
+	block := Block{
+		Index:        1,
+		Timestamp:    tip.Timestamp + 1,
+		Transactions: []Transaction{cb},
+		PrevHash:     tip.Hash,
+		Difficulty:   bc.NextDifficulty(),
+	}
+	mined, _ := Mine(block, nil)
+	if err := bc.AddBlock(mined); err == nil {
+		t.Fatal("expected an over-paying coinbase to be rejected")
+	}
+}
+
+func TestFirstTxMustBeCoinbase(t *testing.T) {
+	bc := NewBlockchain()
+	alice, _ := wallet.New()
+	tip := bc.Tip()
+	tx := signedTx(t, alice, "dnasx", Coin, 0, 0) // a normal tx, not coinbase
+	block := Block{
+		Index:        1,
+		Timestamp:    tip.Timestamp + 1,
+		Transactions: []Transaction{tx},
+		PrevHash:     tip.Hash,
+		Difficulty:   bc.NextDifficulty(),
+	}
+	mined, _ := Mine(block, nil)
+	if err := bc.AddBlock(mined); err == nil {
+		t.Fatal("expected a block whose first tx is not coinbase to be rejected")
+	}
+}
+
+func TestNonIncreasingTimestampRejected(t *testing.T) {
+	bc := NewBlockchain()
+	alice, _ := wallet.New()
+	tip := bc.Tip()
+	cb := NewCoinbase(alice.Address(), BlockReward(1))
+	block := Block{
+		Index:        1,
+		Timestamp:    tip.Timestamp, // equal to parent -> not increasing
+		Transactions: []Transaction{cb},
+		PrevHash:     tip.Hash,
+		Difficulty:   bc.NextDifficulty(),
+	}
+	mined, _ := Mine(block, nil)
+	if err := bc.AddBlock(mined); err == nil {
+		t.Fatal("expected a non-increasing timestamp to be rejected")
+	}
+}
+
+func TestReplaceChainRejectsForeignGenesis(t *testing.T) {
+	bc := NewBlockchain()
+	// A single block claiming huge difficulty (so it out-weighs our genesis on
+	// the work check) but with a genesis hash that isn't ours.
+	foreign := GenesisBlock()
+	foreign.Difficulty = 12
+	foreign.Hash = "not-our-genesis"
+	adopted, err := bc.ReplaceChain([]Block{foreign})
+	if adopted || err == nil {
+		t.Fatalf("foreign genesis should be rejected: adopted=%v err=%v", adopted, err)
+	}
+}
+
+// buildIndependentChain mines a fresh chain of the given height to a random
+// miner, so its blocks (and therefore its tip hash) differ from any other such
+// chain while carrying identical cumulative work.
+func buildIndependentChain(t *testing.T, height int) []Block {
+	t.Helper()
+	bc := NewBlockchain()
+	w, _ := wallet.New()
+	for i := 0; i < height; i++ {
+		if err := bc.AddBlock(mineOn(t, bc, w.Address(), nil)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return bc.Blocks()
+}
+
+func TestForkChoiceTieBreakConverges(t *testing.T) {
+	c1 := buildIndependentChain(t, 2)
+	c2 := buildIndependentChain(t, 2)
+	if ChainWork(c1).Cmp(ChainWork(c2)) != 0 {
+		t.Fatal("equal-height chains should carry equal work")
+	}
+	tip1, tip2 := c1[len(c1)-1].Hash, c2[len(c2)-1].Hash
+	if tip1 == tip2 {
+		t.Fatal("independent chains unexpectedly share a tip hash")
+	}
+	// `low` has the smaller tip hash and is therefore the canonical winner.
+	low, high := c1, c2
+	if tip1 > tip2 {
+		low, high = c2, c1
+	}
+	lowTip := low[len(low)-1].Hash
+
+	// A node already on `high`, offered the equal-work `low` (smaller tip): adopts.
+	onHigh := NewBlockchain()
+	if ok, err := onHigh.ReplaceChain(high); !ok || err != nil {
+		t.Fatalf("seed high: ok=%v err=%v", ok, err)
+	}
+	if ok, err := onHigh.ReplaceChain(low); !ok || err != nil {
+		t.Fatalf("should adopt smaller-tip chain: ok=%v err=%v", ok, err)
+	}
+	if onHigh.Tip().Hash != lowTip {
+		t.Fatal("node on high did not converge to the canonical tip")
+	}
+
+	// A node already on `low`, offered the equal-work `high` (larger tip): keeps low.
+	onLow := NewBlockchain()
+	if _, err := onLow.ReplaceChain(low); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := onLow.ReplaceChain(high); ok || err != nil {
+		t.Fatalf("should keep smaller-tip chain: ok=%v err=%v", ok, err)
+	}
+	if onLow.Tip().Hash != lowTip {
+		t.Fatal("node on low should have kept the canonical tip")
+	}
+	// Both nodes ended on the same tip => the network converges deterministically.
 }
 
 func TestReplaceChainLongestWins(t *testing.T) {

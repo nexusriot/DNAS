@@ -35,8 +35,22 @@ const (
 	TargetBlockTime  int64  = 5
 	RetargetInterval uint64 = 10
 
+	// CoinbaseMaturity is how many blocks a coinbase reward must age before the
+	// miner can spend it. This protects against spending a reward that a reorg
+	// later removes. (Bitcoin uses 100; kept small here for a lively devnet.)
+	CoinbaseMaturity = 3
+
 	// MaxBlockTxs caps non-coinbase transactions per block.
 	MaxBlockTxs = 1000
+	// MaxMemoBytes caps the optional per-transaction memo.
+	MaxMemoBytes = 256
+
+	// DefaultMinRelayFee is the base per-transaction fee a node asks for before it
+	// will relay/queue a transaction. It is *relay policy*, not a consensus rule:
+	// a node with a lower floor will still accept the transaction in a mined block.
+	// The effective floor rises above this base as the mempool fills (see
+	// Mempool.MinFee). 0.0001 DNAS keeps a devnet cheap while still deterring spam.
+	DefaultMinRelayFee uint64 = Coin / 10_000
 	// MaxFutureDrift is how many seconds ahead of local time a block may claim
 	// before we reject it (loosely; late blocks are accepted once time passes).
 	MaxFutureDrift int64 = 120

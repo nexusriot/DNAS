@@ -1,8 +1,16 @@
 # runtime artifacts
 chain*.json
+chain*.db
+*.db
 wallet*.json
 w*.json
 *.log
 pid
 /dnas
 /dnas-race
+tui/dnas-tui
+tui/tui
+/bin/
+/dist/
+__pycache__/
+*.pyc

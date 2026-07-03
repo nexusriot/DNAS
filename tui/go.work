@@ -1,0 +1,6 @@
+// A nested workspace so the TUI client builds on its own (its deps —
+// bubbletea, lipgloss — are external), independent of the repo's internal
+// v0.0.0 module workspace. Build/run/test from this directory: `go build ./...`.
+go 1.26
+
+use .

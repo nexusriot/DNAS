@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DNAS explorer</title>
+<style>
+  :root {
+    --bg:#0b0f0c; --panel:#111814; --border:#1f2d25; --fg:#c9f7d8;
+    --muted:#5f8a72; --accent:#3fff9f; --accent2:#39d0ff; --warn:#ffcc66; --bad:#ff6b6b;
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; background:var(--bg); color:var(--fg);
+    font:14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  a { color:var(--accent2); }
+  header {
+    padding:14px 20px; border-bottom:1px solid var(--border);
+    display:flex; align-items:baseline; gap:14px; flex-wrap:wrap;
+  }
+  header h1 { margin:0; font-size:18px; color:var(--accent); letter-spacing:1px; }
+  header .sub { color:var(--muted); font-size:12px; }
+  .wrap { max-width:1000px; margin:0 auto; padding:20px; }
+  .chips { display:flex; flex-wrap:wrap; gap:10px; margin-bottom:22px; }
+  .chip {
+    background:var(--panel); border:1px solid var(--border); border-radius:8px;
+    padding:8px 12px; min-width:110px;
+  }
+  .chip .k { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
+  .chip .v { color:var(--accent); font-size:16px; word-break:break-all; }
+  h2 { font-size:13px; text-transform:uppercase; letter-spacing:1px; color:var(--muted);
+       border-bottom:1px solid var(--border); padding-bottom:6px; margin:26px 0 12px; }
+  .card { background:var(--panel); border:1px solid var(--border); border-radius:8px;
+          padding:10px 12px; margin-bottom:8px; }
+  .block { cursor:pointer; }
+  .block .row { display:flex; justify-content:space-between; gap:10px; flex-wrap:wrap; }
+  .idx { color:var(--accent); font-weight:bold; }
+  .mono { word-break:break-all; }
+  .muted { color:var(--muted); }
+  .txs { margin-top:8px; border-top:1px dashed var(--border); padding-top:8px; display:none; }
+  .tx { padding:4px 0; border-bottom:1px dotted var(--border); font-size:13px; }
+  .tx:last-child { border-bottom:none; }
+  .tag { display:inline-block; font-size:10px; padding:1px 6px; border-radius:4px;
+         border:1px solid var(--border); color:var(--muted); }
+  .tag.cb { color:var(--warn); border-color:var(--warn); }
+  input, button {
+    font:inherit; background:#0e150f; color:var(--fg);
+    border:1px solid var(--border); border-radius:6px; padding:7px 9px;
+  }
+  input { width:100%; }
+  button { cursor:pointer; color:var(--accent); border-color:var(--accent); background:#0e1a12; }
+  button:hover { background:#12241a; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:20px; }
+  @media (max-width:760px){ .grid { grid-template-columns:1fr; } }
+  .field { margin-bottom:8px; }
+  .field label { display:block; color:var(--muted); font-size:11px; margin-bottom:3px; }
+  .result { margin-top:10px; font-size:13px; white-space:pre-wrap; word-break:break-all; }
+  .ok { color:var(--accent); } .no { color:var(--bad); }
+  .offline { color:var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <h1>⛓ DNAS</h1>
+  <span class="sub">Definitely Not A Scam — block explorer &amp; light-client verifier</span>
+  <span class="sub" id="status" style="margin-left:auto"></span>
+</header>
+
+<div class="wrap">
+  <div class="chips" id="chips"></div>
+
+  <div class="grid">
+    <div>
+      <h2>This node's wallet</h2>
+      <div class="card">
+        <div class="muted">address</div>
+        <div class="mono" id="myaddr">…</div>
+        <div style="margin-top:6px"><span class="muted">balance</span> <span id="mybal" class="idx">…</span></div>
+      </div>
+      <div class="card">
+        <div class="field"><label>send to (address)</label><input id="sendTo" placeholder="dnas…"></div>
+        <div class="field"><label>amount (DNAS)</label><input id="sendAmt" value="1"></div>
+        <div class="field"><label>fee (DNAS)</label><input id="sendFee" value="0.1"></div>
+        <button onclick="doSend()">Send</button>
+        <div class="result" id="sendResult"></div>
+      </div>
+    </div>
+
+    <div>
+      <h2>Lookups</h2>
+      <div class="card">
+        <div class="field"><label>address balance</label><input id="lookAddr" placeholder="dnas…"></div>
+        <button onclick="lookupAddr()">Look up balance</button>
+        <div class="result" id="addrResult"></div>
+      </div>
+      <div class="card">
+        <div class="field"><label>verify a transaction (SPV, in your browser)</label>
+          <input id="lookTx" placeholder="tx hash"></div>
+        <button onclick="verifyTx()">Fetch proof &amp; verify</button>
+        <div class="result" id="txResult"></div>
+      </div>
+    </div>
+  </div>
+
+  <h2>Recent blocks</h2>
+  <div id="blocks"></div>
+
+  <h2>Mempool (<span id="mpcount">0</span>)</h2>
+  <div id="mempool"></div>
+</div>
+
+<script>
+const COIN = 100000000;
+const short = (h, n=12) => (h && h.length > n) ? h.slice(0, n) + "…" : (h || "");
+const fmt = u => (Number(u) / COIN).toFixed(8);
+const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const when = ts => new Date(Number(ts) * 1000).toLocaleString();
+
+async function j(url, opts) {
+  const r = await fetch(url, opts);
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || ("HTTP " + r.status));
+  return r.json();
+}
+
+// --- SHA-256 helpers so the browser can verify proofs like a light client ---
+async function sha256hex(str) {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(str));
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+async function foldProof(leaf, proof) {
+  let h = leaf;
+  for (const s of proof) h = s.right ? await sha256hex(h + s.hash) : await sha256hex(s.hash + h);
+  return h;
+}
+async function headerHash(hd) {
+  return sha256hex(`${hd.index}|${hd.timestamp}|${hd.prev_hash}|${hd.merkle_root}|${hd.difficulty}|${hd.nonce}`);
+}
+
+function txLine(tx) {
+  if (tx.from === "COINBASE")
+    return `<div class="tx"><span class="tag cb">coinbase</span> → ${short(tx.to)} <span class="idx">+${fmt(tx.amount)}</span></div>`;
+  const exp = tx.expiry ? ` <span class="muted">exp@${tx.expiry}</span>` : "";
+  return `<div class="tx">${short(tx.from)} → ${short(tx.to)} <span class="idx">${fmt(tx.amount)}</span>`
+    + ` <span class="muted">fee ${fmt(tx.fee)} · nonce ${tx.nonce}${exp}</span></div>`;
+}
+
+function renderBlocks(chain) {
+  const el = document.getElementById("blocks");
+  el.innerHTML = "";
+  for (const b of chain.slice().reverse().slice(0, 15)) {
+    const card = document.createElement("div");
+    card.className = "card block";
+    const txs = (b.transactions || []);
+    card.innerHTML =
+      `<div class="row"><span><span class="idx">#${b.index}</span> <span class="mono muted">${short(b.hash, 16)}</span></span>`
+      + `<span class="muted">${txs.length} tx · diff ${b.difficulty} · ${when(b.timestamp)}</span></div>`
+      + `<div class="txs">${txs.map(txLine).join("") || '<span class="muted">no transactions</span>'}</div>`;
+    card.onclick = () => {
+      const t = card.querySelector(".txs");
+      t.style.display = t.style.display === "block" ? "none" : "block";
+    };
+    el.appendChild(card);
+  }
+}
+
+function renderMempool(txs) {
+  document.getElementById("mpcount").textContent = txs.length;
+  const el = document.getElementById("mempool");
+  el.innerHTML = txs.length
+    ? txs.map(t => `<div class="card">${txLine(t)}</div>`).join("")
+    : '<div class="card muted">empty</div>';
+}
+
+async function refresh() {
+  const st = document.getElementById("status");
+  try {
+    const [info, chain, mp] = await Promise.all([j("/info"), j("/chain"), j("/mempool")]);
+    document.getElementById("chips").innerHTML = [
+      ["height", info.height],
+      ["tip", short(info.tip, 10)],
+      ["next diff", info.next_difficulty],
+      ["work", info.work],
+      ["mempool", info.mempool],
+      ["peers", (info.peers || []).length],
+    ].map(([k, v]) => `<div class="chip"><div class="k">${k}</div><div class="v">${esc(v)}</div></div>`).join("");
+    renderBlocks(chain);
+    renderMempool(mp || []);
+    st.textContent = "● live";
+    st.className = "sub ok";
+  } catch (e) {
+    st.textContent = "● offline: " + e.message;
+    st.className = "sub offline";
+  }
+}
+
+async function refreshWallet() {
+  try {
+    const { address } = await j("/address");
+    document.getElementById("myaddr").textContent = address;
+    const bal = await j("/balance/" + address);
+    document.getElementById("mybal").textContent = bal.balance_fmt;
+    if (!document.getElementById("lookAddr").value) document.getElementById("lookAddr").value = address;
+  } catch (e) {
+    document.getElementById("myaddr").textContent = "(no wallet)";
+  }
+}
+
+async function doSend() {
+  const out = document.getElementById("sendResult");
+  try {
+    const body = JSON.stringify({
+      to: document.getElementById("sendTo").value.trim(),
+      amount: Math.round(parseFloat(document.getElementById("sendAmt").value) * COIN),
+      fee: Math.round(parseFloat(document.getElementById("sendFee").value || "0") * COIN),
+    });
+    const res = await j("/send", { method: "POST", body });
+    out.innerHTML = `<span class="ok">submitted</span> ${short(res.hash, 20)} (nonce ${res.nonce})`;
+    refresh();
+  } catch (e) { out.innerHTML = `<span class="no">rejected: ${esc(e.message)}</span>`; }
+}
+
+async function lookupAddr() {
+  const out = document.getElementById("addrResult");
+  try {
+    const a = document.getElementById("lookAddr").value.trim();
+    const acc = await j("/account/" + a);
+    out.innerHTML = `balance <span class="ok">${fmt(acc.balance)} DNAS</span> · nonce ${acc.nonce}`;
+  } catch (e) { out.innerHTML = `<span class="no">${esc(e.message)}</span>`; }
+}
+
+async function verifyTx() {
+  const out = document.getElementById("txResult");
+  const txh = document.getElementById("lookTx").value.trim();
+  out.textContent = "verifying…";
+  try {
+    const pr = await j("/proof/" + txh);                 // full node supplies proof
+    const hd = await j("/header/" + pr.block_index);     // ...and the block header
+    const powOK = (await headerHash(hd)) === hd.hash && hd.hash.startsWith("0".repeat(hd.difficulty));
+    const root = await foldProof(txh, pr.proof);         // fold the proof ourselves
+    const incOK = root === hd.merkle_root;
+    out.innerHTML =
+      `block <span class="ok">#${pr.block_index}</span> · ${pr.confirmations} confirmation(s)\n`
+      + `header PoW: <span class="${powOK ? "ok" : "no"}">${powOK ? "valid ✓" : "INVALID ✗"}</span>\n`
+      + `merkle proof folds to header root: <span class="${incOK ? "ok" : "no"}">${incOK ? "yes ✓" : "NO ✗"}</span>\n`
+      + ((powOK && incOK)
+          ? `<span class="ok">⇒ transaction is provably in the chain</span>`
+          : `<span class="no">⇒ verification FAILED</span>`);
+  } catch (e) { out.innerHTML = `<span class="no">${esc(e.message)}</span>`; }
+}
+
+async function tick() { await refresh(); await refreshWallet(); }
+tick();
+setInterval(tick, 2000);
+</script>
+</body>
+</html>
