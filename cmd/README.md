@@ -10,6 +10,7 @@ dnas wallet new|address [-o F]   create / show a key file
 dnas wallet mnemonic|restore|addresses   BIP39 backup + HD addresses
 dnas wallet multisig -threshold M -pubkeys a,b,c   M-of-N multisig address
 dnas spv [-api URL] sync|verify <txhash>           light client (headers + proof)
+dnas version                     print the build version (stamped via -ldflags)
 ```
 
 Running a node with an interactive terminal also starts a REPL

@@ -30,11 +30,16 @@ dnas:
 tui:
 	cd tui && $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o ../bin/dnas-tui .
 
-## test: run all Go tests (root modules + tui) and the GUI tests
+## test: run all Go tests (root modules + tui) and the GUI tests (skipped if PyQt6 is absent)
 test:
 	$(GO) test $(GOMODS)
 	cd tui && $(GO) test ./...
-	cd gui && QT_QPA_PLATFORM=offscreen python3 -m unittest test_dnas_gui
+	@if python3 -c 'import PyQt6' >/dev/null 2>&1; then \
+		echo "cd gui && QT_QPA_PLATFORM=offscreen python3 -m unittest test_dnas_gui"; \
+		cd gui && QT_QPA_PLATFORM=offscreen python3 -m unittest test_dnas_gui; \
+	else \
+		echo "skipping GUI tests (python3 / PyQt6 not available)"; \
+	fi
 
 ## test-race: run the Go tests under the race detector
 test-race:
@@ -79,7 +84,7 @@ version:
 
 ## clean: remove build artifacts
 clean:
-	rm -rf bin dist dnas dnas-tui tui/tui
+	rm -rf bin dist dnas dnas-tui dnas-race tui/tui
 
 ## help: list targets
 help:

@@ -6,10 +6,19 @@ friendly devnet, not money.
 
 ## 0. Build
 
-The repo is a Go multi-module workspace, so build the binary by path:
+The quickest way is `make` (stamps a version from git, writes to `bin/`):
 
 ```sh
 cd ~/workspace/my/DNAS
+make build            # -> bin/dnas and bin/dnas-tui
+./bin/dnas version
+make help             # list all targets: test, dist, deb, install, …
+```
+
+The repo is a Go multi-module workspace, so you can also build the binary by
+path (a bare `go build ./...` from the root won't match the sub-modules):
+
+```sh
 go build -o dnas ./cmd/dnas
 ./dnas help
 ```

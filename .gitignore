@@ -1,4 +1,5 @@
-# runtime artifacts
+# ---- Runtime artifacts (created by a running node / wallet) ----
+# chain stores & JSON snapshots, wallet key files, logs
 chain*.json
 chain*.db
 *.db
@@ -6,11 +7,53 @@ wallet*.json
 w*.json
 *.log
 pid
+
+# ---- Go build output ----
+# root-built binaries (go build -o dnas ./cmd/dnas), race build, and the TUI
+# binaries; make writes to bin/ and dist/
 /dnas
+/dnas-tui
 /dnas-race
 tui/dnas-tui
 tui/tui
 /bin/
 /dist/
+
+# ---- Go test / coverage / profiling ----
+# NOTE: testdata/fuzz/ is intentionally NOT ignored — Go's fuzz seed/regression
+# corpus is committed; transient corpora live in GOCACHE, outside the repo.
+*.test
+coverage.out
+*.coverprofile
+*.prof
+*.pprof
+
+# ---- Python (gui/) ----
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# ---- Editor / IDE ----
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ---- OS cruft ----
+.DS_Store
+Thumbs.db
+
+# ---- Misc temp ----
+*.tmp
+*.bak
+*.orig
+
+# ---- Claude Code ----
+# keep the shared .claude/launch.json committed; ignore per-user local settings
+.claude/settings.local.json
+.claude/*.local.json
