@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "dnas",
+      "runtimeExecutable": "go",
+      "runtimeArgs": ["run", "./cmd/dnas", "node", "-listen", ":19061", "-api", ":19091", "-mine"],
+      "port": 19091
+    }
+  ]
+}

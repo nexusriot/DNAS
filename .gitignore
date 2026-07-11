@@ -64,5 +64,4 @@ Thumbs.db
 # keep the shared .claude/launch.json committed; ignore per-user local settings
 .claude/settings.local.json
 .claude/*.local.json
-.claude/launch.json
 
