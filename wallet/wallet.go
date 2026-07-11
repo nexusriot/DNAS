@@ -148,8 +148,6 @@ func Verify(pubHex, sigHex string, msg []byte) bool {
 	return ed25519.Verify(ed25519.PublicKey(pub), msg, sig)
 }
 
-// --- persistence -----------------------------------------------------------
-
 type walletFile struct {
 	Seed    string `json:"seed"`    // hex of the 32-byte Ed25519 seed
 	Address string `json:"address"` // informational only
@@ -202,8 +200,6 @@ func LoadOrCreate(path string) (*Wallet, bool, error) {
 	}
 	return w, true, nil
 }
-
-// --- encryption at rest -----------------------------------------------------
 
 const walletKDFIterations = 200_000
 

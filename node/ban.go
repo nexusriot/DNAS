@@ -49,3 +49,24 @@ func (b *banbook) scoreOf(key string) int {
 	defer b.mu.Unlock()
 	return b.score[key]
 }
+
+// snapshot returns a copy of the current ban scores, for persistence.
+func (b *banbook) snapshot() map[string]int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make(map[string]int, len(b.score))
+	for k, v := range b.score {
+		out[k] = v
+	}
+	return out
+}
+
+// restore merges persisted ban scores back in (used on startup so bans survive a
+// restart instead of resetting).
+func (b *banbook) restore(scores map[string]int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for k, v := range scores {
+		b.score[k] = v
+	}
+}

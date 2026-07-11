@@ -2,16 +2,24 @@
 
 **DNAS** (Definitely Not A Scam) — a small but *working* proof-of-work
 cryptocurrency in Go. It has real ownership (Ed25519 signatures, checksummed
-addresses, passphrase-encrypted keys), real issuance (mining rewards), an
-account+nonce ledger, most-work consensus with reorgs, a bounded mempool, an
-authenticated + encrypted peer-to-peer network with peer discovery and
-headers-first sync, append-only persistence, an HTTP API, and a built-in web
-explorer with in-browser SPV verification.
+addresses, passphrase-encrypted keys, multisig, and hash-time-locked contracts
+for atomic swaps), real issuance (mining rewards + a burned EIP-1559 base fee),
+an account+nonce ledger, most-work consensus with reorgs, coinbase maturity, a
+bounded mempool with fee estimation, an authenticated + encrypted peer-to-peer
+network with peer discovery and headers-first sync, append-only persistence
+(chain + peers/bans/mempool), and light clients that verify proof-of-work and —
+via merkle proofs, BIP158-style compact filters, and a header **state root** —
+prove transaction inclusion, *non*-inclusion, and account balances. It exposes an
+HTTP API with an optional bearer-token guard, a real-time event stream, and a
+regtest mode for on-demand mining, plus a built-in web explorer with in-browser
+SPV verification.
 
 It is a learning project, not money. Do not point it at the internet.
 
 New here? See [QUICKSTART.md](QUICKSTART.md) to build, mine, run a wallet, send a
-payment, form a network, and verify transactions.
+payment, form a network, and verify transactions. For *how and why* it works —
+the ledger model, consensus, networking, and the trade-offs behind each choice —
+see [DESIGN.md](DESIGN.md).
 
 ## What makes it a cryptocurrency (not just a hash-chain)
 
@@ -25,9 +33,18 @@ payment, form a network, and verify transactions.
 - **M-of-N multisig.** An address can be the hash of a multisig script (threshold
   M + N public keys); spending it requires M valid signatures from distinct
   members, verified in consensus.
-- **Issuance.** New coins are created only by the coinbase transaction in each
-  block, paying the miner `reward + fees`. The reward starts at 50 DNAS and
-  halves every 210 000 blocks.
+- **Hash-time-locked contracts (HTLCs).** An address can also be the hash of an
+  HTLC script: coins in it are spendable either by the recipient revealing a
+  preimage of a committed hash (the *claim* branch, at any height) or by the
+  sender after a timeout height (the *refund* branch). Revealing the preimage
+  on-chain is what enables **cross-chain atomic swaps**; `dnas htlc` builds and
+  spends them and `scripts/htlc-demo.sh` walks both branches end to end.
+- **Issuance & an EIP-1559 base fee.** New coins are created only by the coinbase
+  transaction, paying the miner `reward + tips`. The reward starts at 50 DNAS and
+  halves every 210 000 blocks. Each block also has a **consensus base fee** that
+  every transaction must pay and that is **burned** (removed from supply); the
+  miner keeps only the tip (`fee − base fee`). The base fee adjusts each block
+  toward a target fullness, so it rises under load and decays when idle.
 - **Coinbase maturity.** A freshly-mined coinbase reward cannot be spent until it
   is buried under `CoinbaseMaturity` further blocks (3 here; Bitcoin uses 100).
   Both consensus and the miner's own block builder enforce it, so a reorg that
@@ -41,11 +58,18 @@ payment, form a network, and verify transactions.
   only mineable within a window and is dropped from mempools outside it, plus an
   optional bounded `Memo`. A stuck (low-fee) transaction can be replaced by
   re-sending it at the *same nonce* with a strictly higher fee (replace-by-fee).
-- **Light-client proofs (SPV).** Block hashes commit only to header fields plus
-  a merkle root, so a client with headers alone can verify proof-of-work and the
-  hash chain, then confirm a transaction is included via a compact merkle proof
-  — without downloading block bodies. The bundled `dnas spv` command is exactly
-  such a light client.
+- **Light-client proofs (SPV) + compact filters.** Block hashes commit only to
+  header fields plus a merkle root, so a client with headers alone can verify
+  proof-of-work and the hash chain, then confirm a transaction is included via a
+  compact merkle proof — without downloading block bodies. Each block also has a
+  **BIP158-style compact filter** (a Golomb-coded set of the addresses it
+  touches): a wallet tests these to find blocks that may concern it and to prove
+  the ones that *don't* (non-inclusion). Each header also commits a **state root**
+  (a merkle root of all accounts), so a light client can *prove* an address's
+  balance and nonce — not just transaction inclusion. The bundled `dnas spv`
+  command is such a light client: `sync`, `verify <txhash>`, `scan <address>`,
+  `balance <address>` (state proof), and `history <address>` (reconstructs a
+  wallet's transfers from filters + authenticated blocks).
 - **Deterministic genesis.** Every node computes the same genesis block, so
   independent nodes can actually agree on one chain.
 - **Most-work consensus with a deterministic tie-break, MTP timestamps, and
@@ -87,6 +111,16 @@ payment, form a network, and verify transactions.
   an idle devnet, priced up under load. This is *local relay policy*, not a
   consensus base fee: a block that includes an under-floor transaction is still
   valid.
+- **Persistent soft state.** Alongside the append-only chain store, a node
+  persists its known peers, ban scores, and pending mempool beside the db file
+  and restores them on the next start, so a graceful restart resumes warm (bans
+  no longer reset). The chain itself remains authoritative and re-syncs from
+  peers regardless.
+- **Optional API auth.** Setting `DNAS_API_TOKEN` locks the mutating endpoints
+  (`/send`, `/tx`, `/mine`) behind an `Authorization: Bearer <token>` header
+  (constant-time compared); read endpoints stay open. Unset, the API is fully
+  open — the localhost/toy default. All bundled clients send the token when the
+  env var is set.
 
 ## Layout
 
@@ -162,7 +196,14 @@ go run ./cmd/dnas node -listen :3000 -api :8080 -mine
 
 # encrypt the wallet at rest (also honored by `dnas wallet new/address`)
 export DNAS_WALLET_PASSPHRASE='correct horse battery staple'
+
+# require a bearer token on write endpoints (/send, /tx, /mine); reads stay open
+export DNAS_API_TOKEN='a-long-random-secret'
 ```
+
+Peers, ban scores, and the pending mempool are persisted next to the `-db` file
+(`peers.json`, `bans.json`, `mempool.json`) and restored on the next start, so a
+graceful restart resumes warm.
 
 | Flag         | Default        | Meaning                                        |
 |--------------|----------------|------------------------------------------------|
@@ -177,6 +218,7 @@ export DNAS_WALLET_PASSPHRASE='correct horse battery staple'
 | `-mempool`   | `5000`         | max pending transactions                       |
 | `-minrelayfee` | `10000`      | base min relay fee (base units); rises with mempool load; 0 disables |
 | `-mine`      | off            | enable mining                                  |
+| `-regtest`   | off            | regtest mode: mine on demand via `POST /generate` (isolated netkey) |
 | `-config`    | —              | JSON config file (flags override its values)   |
 
 A node shuts down cleanly on `SIGINT`/`SIGTERM` (stops mining, closes peers,
@@ -200,22 +242,33 @@ go run ./cmd/dnas node -listen :3001 -api :8081 -peers localhost:3000 -mine \
 
 | Method | Path              | Purpose                                                       |
 |--------|-------------------|---------------------------------------------------------------|
-| GET    | `/info`           | height, tip, next difficulty, cumulative work, mempool, min relay fee, peers |
+| GET    | `/info`           | height, tip, next difficulty, work, mempool, min relay fee, base fee, peers |
 | GET    | `/chain`          | the full chain                                                |
 | GET    | `/balance/{addr}` | balance (raw + formatted)                                     |
 | GET    | `/account/{addr}` | balance and nonce                                             |
 | GET    | `/mempool`        | pending transactions                                          |
 | GET    | `/peers`          | connected peers                                               |
 | GET    | `/address`        | this node's wallet address                                    |
+| GET    | `/estimatefee`    | `?blocks=N` → recommended fee (base fee + estimated tip)       |
 | GET    | `/headers`        | all block headers (SPV)                                       |
 | GET    | `/header/{index}` | one block header (SPV)                                        |
+| GET    | `/block/{index}`  | one full block body (light clients fetch only flagged blocks) |
 | GET    | `/proof/{txhash}` | transaction-inclusion merkle proof (SPV)                      |
+| GET    | `/stateproof/{addr}` | proof of an address's balance/nonce vs the header state root |
+| GET    | `/cfilters`       | compact block filters for every block (light-client scan)     |
+| GET    | `/cfilter/{index}`| one block's compact filter                                    |
+| GET    | `/cfheaders`      | the filter-header chain (BIP157-style)                        |
+| GET    | `/events`         | Server-Sent Events stream of new blocks / reorgs / mempool txs |
 | GET    | `/metrics`        | Prometheus-format node metrics                                |
-| POST   | `/send`           | `{"to","amount","fee","expiry"?,"lock_until"?,"memo"?,"nonce"?}` — signed by the node wallet |
-| POST   | `/tx`             | submit a fully-signed transaction (incl. multisig)            |
-| POST   | `/mine`           | `{"on":bool}` — toggle mining at runtime                      |
+| POST   | `/send` 🔒        | `{"to","amount","fee","expiry"?,"lock_until"?,"memo"?,"nonce"?}` — signed by the node wallet |
+| POST   | `/tx` 🔒          | submit a fully-signed transaction (multisig / HTLC / plain)   |
+| POST   | `/mine` 🔒        | `{"on":bool}` — toggle mining at runtime                      |
+| POST   | `/generate` 🔒    | `{"n":N}` — regtest only: mine N blocks on demand             |
 | POST   | `/multisig/address` | `{"threshold","pubkeys":[…]}` → M-of-N multisig address (stateless helper) |
+| POST   | `/htlc/address`   | `{"hash","recipient","sender","timeout"}` → HTLC address (stateless helper) |
 | POST   | `/wallet/hd`      | `{"mnemonic"?,"count"?}` → BIP39 mnemonic + derived HD addresses (stateless helper) |
+
+🔒 = requires `Authorization: Bearer $DNAS_API_TOKEN` when that env var is set (otherwise open).
 
 `/send` validates the recipient's checksum, auto-selects the next nonce (pass an
 explicit `nonce` with a higher `fee` to fee-bump a stuck transaction), and
@@ -228,6 +281,32 @@ curl -s -X POST localhost:8080/send -d '{"to":"dnas...","amount":300000000,"fee"
 # SPV: fetch a proof and the header it commits to
 curl -s localhost:8080/proof/<txhash>
 curl -s localhost:8080/header/<index>
+
+# live event stream (blocks / reorgs / mempool txs) as Server-Sent Events
+curl -sN localhost:8080/events
+
+# if the node is locked down with DNAS_API_TOKEN, writes need the token
+curl -s -H "Authorization: Bearer $DNAS_API_TOKEN" -X POST localhost:8080/mine -d '{"on":true}'
+```
+
+### Command-line light client & contracts
+
+```sh
+dnas spv -api localhost:8080 sync              # verify the header chain (PoW only)
+dnas spv -api localhost:8080 verify <txhash>   # prove a payment is included
+dnas spv -api localhost:8080 scan    <address> # find/prove non-inclusion of an address (compact filters)
+dnas spv -api localhost:8080 balance <address> # prove an address's balance against the state root
+dnas spv -api localhost:8080 history <address> # reconstruct a wallet's history (light wallet)
+
+# a regtest node mines on demand instead of waiting on the block interval
+dnas node -regtest -api localhost:8080 &
+curl -s -X POST localhost:8080/generate -d '{"n":10}'   # mine 10 blocks instantly
+
+dnas wallet pubkey -o alice.json               # print a wallet's public key (to build multisig/HTLC)
+dnas htlc new                                  # mint a preimage + its hash for a swap
+dnas htlc address -hash H -recipient R -sender S -timeout T
+dnas htlc claim  -wallet alice.json -hash H -sender S  -timeout T -preimage P -to <addr>
+dnas htlc refund -wallet bob.json   -hash H -recipient R -timeout T           -to <addr>
 ```
 
 ## Clients
@@ -273,19 +352,30 @@ end to end:
 - **SPV** — an independent Python light client fetches a header + merkle proof
   and verifies the transfer's inclusion (header PoW + proof fold).
 
-(Edit the `190xx` ports at the top of the script if they are taken.)
+`./scripts/htlc-demo.sh` is a focused companion demo: on a single mining node it
+funds two hash-time-locked contracts and settles one via the **claim** (preimage)
+branch and the other via the **refund** (timeout) branch.
+
+(Edit the `190xx` ports at the top of either script if they are taken.)
 
 ## Known limitations (it's a toy)
 
 - Node identities aren't cost-bound, so ban scoring (keyed by identity) can be
   evaded by rotating keys — fine for a friendly devnet, not sybil-resistant.
-  There's no allow-list. Ban scores are in-memory and reset on restart.
+  There's no allow-list. Ban scores persist across a *graceful* restart but a
+  hard kill can lose the latest state (it re-syncs from peers anyway).
 - Locator sync transfers only the divergent suffix for normal forks; genuinely
   deep or losing forks still fall back to a whole-chain exchange.
 - Recipient checksums are enforced client-side (in `/send` and the REPL), not in
   consensus — a malicious client can still burn its own coins.
-- The fee market is eviction + replace-by-fee + a dynamic *relay-policy* floor;
-  there is no consensus base fee (à la EIP-1559), so the floor governs only what a
-  node will queue, not block validity. SPV proves *inclusion*, not non-inclusion
-  or full state. HD derivation is a simple HMAC-SHA512 scheme, not SLIP-0010.
+- The fee market is a burned EIP-1559 base fee (consensus) plus eviction,
+  replace-by-fee, and a dynamic relay-policy floor. HD derivation is a simple
+  HMAC-SHA512 scheme, not SLIP-0010.
+- State-root balance proofs prove *membership* (a present account's exact
+  balance/nonce); they do not prove *absence* of an account (that would need a
+  sorted-tree non-membership proof).
+- Merkle SPV proves *inclusion*; compact filters add *non-inclusion*, but the
+  filters aren't committed in the PoW header, so (like BIP157/158) their
+  correctness rests on the honest-node / multi-peer assumption rather than being
+  trustless. Committing a filter root in the header would be a consensus change.
 - Difficulty bounds are tiny so a laptop can mine instantly.

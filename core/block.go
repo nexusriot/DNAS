@@ -16,6 +16,8 @@ type Block struct {
 	Transactions []Transaction `json:"transactions"`
 	PrevHash     string        `json:"prev_hash"`
 	MerkleRoot   string        `json:"merkle_root"`
+	StateRoot    string        `json:"state_root"` // merkle root of account state after this block
+	BaseFee      uint64        `json:"base_fee"`   // EIP-1559 base fee (burned), fixed per block
 	Difficulty   int           `json:"difficulty"`
 	Nonce        uint64        `json:"nonce"`
 	Hash         string        `json:"hash"`
@@ -29,25 +31,7 @@ func hashBytes(b []byte) string {
 // MerkleRoot computes a binary merkle root over the transaction hashes,
 // duplicating the last node on odd layers (Bitcoin-style).
 func MerkleRoot(txs []Transaction) string {
-	if len(txs) == 0 {
-		return hashBytes([]byte("empty"))
-	}
-	layer := make([]string, len(txs))
-	for i, tx := range txs {
-		layer[i] = tx.Hash()
-	}
-	for len(layer) > 1 {
-		next := make([]string, 0, (len(layer)+1)/2)
-		for i := 0; i < len(layer); i += 2 {
-			if i+1 < len(layer) {
-				next = append(next, hashBytes([]byte(layer[i]+layer[i+1])))
-			} else {
-				next = append(next, hashBytes([]byte(layer[i]+layer[i])))
-			}
-		}
-		layer = next
-	}
-	return layer[0]
+	return merkleRootOf(txHashes(txs))
 }
 
 // Header is a block stripped of its transactions. It is all a light (SPV)
@@ -59,6 +43,8 @@ type Header struct {
 	Timestamp  int64  `json:"timestamp"`
 	PrevHash   string `json:"prev_hash"`
 	MerkleRoot string `json:"merkle_root"`
+	StateRoot  string `json:"state_root"`
+	BaseFee    uint64 `json:"base_fee"`
 	Difficulty int    `json:"difficulty"`
 	Nonce      uint64 `json:"nonce"`
 	Hash       string `json:"hash"`
@@ -71,6 +57,8 @@ func (b Block) Header() Header {
 		Timestamp:  b.Timestamp,
 		PrevHash:   b.PrevHash,
 		MerkleRoot: b.MerkleRoot,
+		StateRoot:  b.StateRoot,
+		BaseFee:    b.BaseFee,
 		Difficulty: b.Difficulty,
 		Nonce:      b.Nonce,
 		Hash:       b.Hash,
@@ -78,10 +66,12 @@ func (b Block) Header() Header {
 }
 
 // headerString is everything the proof-of-work hash commits to (all fields
-// except Hash itself). Transactions are covered indirectly via MerkleRoot.
+// except Hash itself). Transactions are covered indirectly via MerkleRoot; the
+// post-block account state is committed via StateRoot, so a light client can
+// verify balances against a PoW-verified header.
 func (h Header) headerString() string {
-	return fmt.Sprintf("%d|%d|%s|%s|%d|%d",
-		h.Index, h.Timestamp, h.PrevHash, h.MerkleRoot, h.Difficulty, h.Nonce)
+	return fmt.Sprintf("%d|%d|%s|%s|%s|%d|%d|%d",
+		h.Index, h.Timestamp, h.PrevHash, h.MerkleRoot, h.StateRoot, h.BaseFee, h.Difficulty, h.Nonce)
 }
 
 // ComputeHash returns the hash the header should have.

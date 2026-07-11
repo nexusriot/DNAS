@@ -32,6 +32,8 @@ type Config struct {
 	NetKey        string   // pre-shared network key (defaults to DefaultNetKey)
 	MaxPeers      int      // outbound dial cap (defaults to DefaultMaxPeers)
 	Mine          bool     // whether to run the miner
+	StateDir      string   // directory for persisted peer/ban/mempool state ("" = in-memory only)
+	Regtest       bool     // regtest mode: enable on-demand block generation (POST /generate)
 }
 
 type peer struct {
@@ -65,6 +67,7 @@ type Node struct {
 	seenTx  *seenSet
 	book    *peerbook
 	bans    *banbook
+	events  *eventBus
 
 	mining atomic.Bool // whether the miner is currently active (toggle at runtime)
 	tipGen int64       // atomic; bumped whenever the tip changes to interrupt mining
@@ -98,6 +101,7 @@ func New(cfg Config, chain *core.Blockchain, mp *core.Mempool, w *wallet.Wallet)
 		seenTx:   newSeenSet(seenCapacity),
 		book:     newPeerbook(cfg.AdvertiseAddr, cfg.MaxPeers),
 		bans:     newBanbook(banThreshold),
+		events:   newEventBus(),
 	}
 	n.mining.Store(cfg.Mine)
 	return n
@@ -115,6 +119,10 @@ func (n *Node) SetMining(on bool) {
 
 func (n *Node) Mining() bool { return n.mining.Load() }
 
+// Regtest reports whether the node is in regtest mode (on-demand block
+// generation via Generate / POST /generate is available).
+func (n *Node) Regtest() bool { return n.cfg.Regtest }
+
 // Shutdown stops mining and closes all peer connections. The chain's store is
 // closed separately by the owner (Blockchain.Close).
 func (n *Node) Shutdown() {
@@ -128,13 +136,18 @@ func (n *Node) Shutdown() {
 	for _, p := range ps {
 		_ = p.conn.Close()
 	}
+	n.saveState() // persist peers/bans/mempool so a restart resumes warm
 }
 
-// Start begins listening, dials the seed peers, and starts mining if enabled.
+// Start begins listening, dials the seed and persisted peers, and starts mining
+// if enabled.
 func (n *Node) Start() {
+	n.loadState() // restore persisted peers/bans/mempool before dialing
 	go n.listen()
 	for _, a := range n.cfg.Peers {
 		n.book.note(a)
+	}
+	for _, a := range n.book.all() { // seed peers + any restored from disk
 		n.maybeDial(a)
 	}
 	// The miner runs whenever the node has a wallet; the atomic flag gates
@@ -146,11 +159,30 @@ func (n *Node) Start() {
 	}
 }
 
-// --- accessors used by the API/CLI -----------------------------------------
-
 func (n *Node) Chain() *core.Blockchain { return n.chain }
 func (n *Node) Mempool() *core.Mempool  { return n.mempool }
 func (n *Node) Wallet() *wallet.Wallet  { return n.wallet }
+
+// Subscribe registers for real-time node events (new blocks, reorgs, mempool
+// transactions). It returns a receive channel and a function that unsubscribes
+// and closes it; callers must invoke the latter when done. Slow consumers miss
+// events rather than slowing the node.
+func (n *Node) Subscribe() (<-chan Event, func()) { return n.events.subscribe() }
+
+// publishBlock emits a block/reorg event describing the current tip.
+func (n *Node) publishBlock(reorg bool) {
+	tip := n.chain.Tip()
+	typ := "block"
+	if reorg {
+		typ = "reorg"
+	}
+	n.events.publish(Event{Type: typ, Height: tip.Index, Hash: tip.Hash, Txs: len(tip.Transactions)})
+}
+
+// publishTx emits a mempool-transaction event.
+func (n *Node) publishTx(tx core.Transaction) {
+	n.events.publish(Event{Type: "tx", Hash: tx.Hash(), From: tx.From, To: tx.To, Amount: tx.Amount, Fee: tx.Fee})
+}
 
 // PeerAddrs returns the distinct advertised addresses of connected peers.
 func (n *Node) PeerAddrs() []string {
@@ -203,11 +235,10 @@ func (n *Node) SubmitTx(tx core.Transaction) error {
 	if added {
 		n.markSeenTx(tx.Hash())
 		n.broadcast(Message{Type: MsgTx, Tx: &tx})
+		n.publishTx(tx)
 	}
 	return nil
 }
-
-// --- networking -------------------------------------------------------------
 
 func (n *Node) listen() {
 	ln, err := net.Listen("tcp", n.cfg.ListenAddr)
@@ -307,7 +338,10 @@ func (n *Node) handleConn(rawConn net.Conn) {
 func (n *Node) handleMessage(p *peer, m Message) {
 	switch m.Type {
 	case MsgHello:
+		// p.addr is read under peersMu (connectedTo, PeerAddrs), so guard the write.
+		n.peersMu.Lock()
 		p.addr = m.Addr
+		n.peersMu.Unlock()
 		n.book.note(m.Addr)
 
 	case MsgGetPeers:
@@ -333,8 +367,9 @@ func (n *Node) handleMessage(p *peer, m Message) {
 			return
 		}
 		n.broadcastExcept(Message{Type: MsgTx, Tx: m.Tx}, p)
+		n.publishTx(*m.Tx)
 
-	// --- block propagation: announce a hash, pull the body we lack ---
+	// block propagation: announce a hash, pull the body we lack
 	case MsgInv:
 		switch {
 		case m.Index == n.chain.Height()+1:
@@ -358,10 +393,10 @@ func (n *Node) handleMessage(p *peer, m Message) {
 			return
 		}
 		log.Printf("accepted block %d %s", m.Block.Index, short(m.Block.Hash))
-		n.afterNewBlock()
+		n.afterNewBlock(false)
 		n.broadcastExcept(Message{Type: MsgInv, Index: m.Block.Index, Hash: m.Block.Hash}, p)
 
-	// --- headers-first ranged sync ---
+	// headers-first ranged sync
 	case MsgGetHeaders:
 		from := m.From
 		if len(m.Locator) > 0 { // locator-based: reply from just after the fork point
@@ -382,14 +417,14 @@ func (n *Node) handleMessage(p *peer, m Message) {
 	case MsgBlocks:
 		n.onBlocks(p, m.Blocks)
 
-	// --- whole-chain exchange, used only as a fork/bootstrap fallback ---
+	// whole-chain exchange, used only as a fork/bootstrap fallback
 	case MsgGetChain:
 		p.send(Message{Type: MsgChain, Chain: n.chain.Blocks()})
 
 	case MsgChain:
 		if replaced, err := n.chain.ReplaceChain(m.Chain); err == nil && replaced {
 			log.Printf("adopted chain via fallback (height=%d)", n.chain.Height())
-			n.afterNewBlock()
+			n.afterNewBlock(true)
 		}
 	}
 }
@@ -436,7 +471,7 @@ func (n *Node) onBlocks(p *peer, blocks []core.Block) {
 		for _, b := range blocks {
 			n.markSeenBlock(b.Hash)
 		}
-		n.afterNewBlock()
+		n.afterNewBlock(true)
 		tip := n.chain.Tip()
 		log.Printf("reorged onto fork, height=%d %s", tip.Index, short(tip.Hash))
 		n.broadcastExcept(Message{Type: MsgInv, Index: tip.Index, Hash: tip.Hash}, p)
@@ -459,7 +494,7 @@ func (n *Node) onBlocks(p *peer, blocks []core.Block) {
 		p.send(n.getHeadersMsg()) // our tip moved under us; re-sync
 		return
 	}
-	n.afterNewBlock()
+	n.afterNewBlock(false)
 	tip := n.chain.Tip()
 	log.Printf("synced %d block(s), height=%d", applied, tip.Index)
 	n.broadcastExcept(Message{Type: MsgInv, Index: tip.Index, Hash: tip.Hash}, p)
@@ -505,15 +540,63 @@ func (n *Node) broadcastExcept(m Message, except *peer) {
 func (n *Node) markSeenBlock(h string) bool { return n.seenBlk.seen(h) }
 func (n *Node) markSeenTx(h string) bool    { return n.seenTx.seen(h) }
 
-// --- mining -----------------------------------------------------------------
-
 func (n *Node) onTipChanged() { atomic.AddInt64(&n.tipGen, 1) }
 
-// afterNewBlock runs the bookkeeping common to accepting/adopting new blocks.
+// afterNewBlock runs the bookkeeping common to accepting/adopting new blocks and
+// emits a real-time event (reorg=true when the tip changed via a reorg).
 // (Persistence is automatic in the chain's append-only store.)
-func (n *Node) afterNewBlock() {
+func (n *Node) afterNewBlock(reorg bool) {
 	n.onTipChanged()
 	n.reconcileMempool()
+	n.publishBlock(reorg)
+}
+
+// buildBlock assembles the next candidate block on the current tip: a coinbase to
+// the node wallet plus mempool-selected transactions. It returns the candidate
+// and the selected (non-coinbase) transactions so the caller can drop them from
+// the mempool once the block is committed.
+func (n *Node) buildBlock() (core.Block, []core.Transaction) {
+	tip := n.chain.Tip()
+	height := tip.Index + 1
+	baseFee := n.chain.NextBaseFee()
+	txs := n.mempool.Select(n.chain, core.MaxBlockTxs) // already excludes fee < baseFee
+	// Miner is paid the subsidy plus tips (fees above the base fee); the base-fee
+	// portion is burned.
+	coinbase := core.NewCoinbase(n.wallet.Address(), core.CoinbaseAmount(height, txs, baseFee))
+	ts := time.Now().Unix()
+	if ts <= tip.Timestamp {
+		ts = tip.Timestamp + 1
+	}
+	candidate := core.Block{
+		Index:        height,
+		Timestamp:    ts,
+		Transactions: append([]core.Transaction{coinbase}, txs...),
+		PrevHash:     tip.Hash,
+		BaseFee:      baseFee,
+		Difficulty:   n.chain.NextDifficulty(),
+	}
+	// Commit the post-block account state root (part of the PoW-hashed header).
+	// On error the candidate keeps an empty root and AddBlock will reject it, so
+	// the miner simply rebuilds — no invalid block escapes.
+	candidate.StateRoot, _ = n.chain.NextStateRoot(candidate)
+	return candidate, txs
+}
+
+// commitMined records a freshly mined block: append it, dedup, drop its
+// transactions from the mempool, announce it by inventory, and emit an event.
+func (n *Node) commitMined(mined core.Block, txs []core.Transaction) error {
+	if err := n.chain.AddBlock(mined); err != nil {
+		return err
+	}
+	n.markSeenBlock(mined.Hash)
+	log.Printf("mined block %d diff=%d txs=%d reward=%s %s",
+		mined.Index, mined.Difficulty, len(txs), core.FormatAmount(core.BlockReward(mined.Index)), short(mined.Hash))
+	n.mempool.Remove(txs)
+	n.onTipChanged()
+	// Announce the new block by inventory; peers pull the body if they lack it.
+	n.broadcast(Message{Type: MsgInv, Index: mined.Index, Hash: mined.Hash})
+	n.publishBlock(false)
+	return nil
 }
 
 func (n *Node) mineLoop() {
@@ -523,35 +606,13 @@ func (n *Node) mineLoop() {
 			time.Sleep(200 * time.Millisecond) // paused; poll for the toggle
 			continue
 		}
-		tip := n.chain.Tip()
-		height := tip.Index + 1
-		difficulty := n.chain.NextDifficulty()
-		txs := n.mempool.Select(n.chain, core.MaxBlockTxs)
+		candidate, txs := n.buildBlock()
 
 		// When idle, wait roughly one target interval before minting an empty
 		// (coinbase-only) block, so we don't spam the network. Interruptible if
 		// a new tip arrives meanwhile.
 		if len(txs) == 0 && !n.sleepInterruptible(time.Duration(core.TargetBlockTime)*time.Second) {
 			continue
-		}
-
-		var fees uint64
-		for _, tx := range txs {
-			fees += tx.Fee
-		}
-		coinbase := core.NewCoinbase(n.wallet.Address(), core.BlockReward(height)+fees)
-		blockTxs := append([]core.Transaction{coinbase}, txs...)
-
-		ts := time.Now().Unix()
-		if ts <= tip.Timestamp {
-			ts = tip.Timestamp + 1
-		}
-		candidate := core.Block{
-			Index:        height,
-			Timestamp:    ts,
-			Transactions: blockTxs,
-			PrevHash:     tip.Hash,
-			Difficulty:   difficulty,
 		}
 
 		startGen := atomic.LoadInt64(&n.tipGen)
@@ -561,18 +622,41 @@ func (n *Node) mineLoop() {
 		if !ok {
 			continue // tip changed; rebuild on the new tip
 		}
-		if err := n.chain.AddBlock(mined); err != nil {
+		if err := n.commitMined(mined, txs); err != nil {
 			log.Printf("discarded our block %d (lost the race): %v", mined.Index, err)
-			continue
 		}
-		n.markSeenBlock(mined.Hash)
-		log.Printf("mined block %d diff=%d txs=%d reward=%s %s",
-			mined.Index, mined.Difficulty, len(txs), core.FormatAmount(core.BlockReward(height)), short(mined.Hash))
-		n.mempool.Remove(txs)
-		n.onTipChanged()
-		// Announce the new block by inventory; peers pull the body if they lack it.
-		n.broadcast(Message{Type: MsgInv, Index: mined.Index, Hash: mined.Hash})
 	}
+}
+
+// Generate mines count blocks immediately to the node wallet, bypassing the idle
+// interval and the mining toggle. It is the regtest primitive for producing
+// blocks on demand (like Bitcoin's generatetoaddress), returning the mined block
+// hashes. Each block is rebuilt on the current tip and retried a few times if a
+// concurrent miner moves the tip underneath it.
+func (n *Node) Generate(count int) ([]string, error) {
+	if n.wallet == nil {
+		return nil, fmt.Errorf("node has no wallet to mine to")
+	}
+	hashes := make([]string, 0, count)
+	for i := 0; i < count; i++ {
+		committed := false
+		for attempt := 0; attempt < 5 && !committed; attempt++ {
+			candidate, txs := n.buildBlock()
+			mined, ok := core.Mine(candidate, nil)
+			if !ok {
+				continue
+			}
+			if err := n.commitMined(mined, txs); err != nil {
+				continue // tip moved under us; rebuild and retry
+			}
+			hashes = append(hashes, mined.Hash)
+			committed = true
+		}
+		if !committed {
+			return hashes, fmt.Errorf("failed to mine block %d after retries", i+1)
+		}
+	}
+	return hashes, nil
 }
 
 // sleepInterruptible sleeps up to d, returning false early if the tip changes.
@@ -587,8 +671,6 @@ func (n *Node) sleepInterruptible(d time.Duration) bool {
 	}
 	return true
 }
-
-// --- misc -------------------------------------------------------------------
 
 // reconcileMempool drops transactions that a new block made unmineable: those
 // whose nonce is already confirmed, and those that have expired.

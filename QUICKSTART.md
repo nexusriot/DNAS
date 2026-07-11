@@ -59,6 +59,7 @@ the HTTP API below.
 ```sh
 dnas wallet new -o alice.json          # create a key file, prints the address
 dnas wallet address -o alice.json      # print an existing wallet's address
+dnas wallet pubkey -o alice.json       # print its public key (to build multisig/HTLC scripts)
 ```
 
 Encrypt the key file at rest (PBKDF2 + AES-256-GCM). Set the passphrase in the
@@ -123,10 +124,17 @@ Optional fields on `/send`:
 - `"nonce": <n>` — override the auto nonce; **fee-bump** a stuck tx by resending
   at its nonce with a higher fee (replace-by-fee).
 
-The `fee` must clear the node's **dynamic minimum relay fee** — a base floor
-(`-minrelayfee`, default 10 000 base units) that rises as the mempool fills. Check
-the current floor in `/info` (`min_relay_fee`). This is relay policy only; it does
-not affect the validity of a block that already includes the transaction.
+Fees have two layers. Every block carries a **consensus base fee** (EIP-1559 style)
+that each transaction must pay and that is **burned** (removed from supply); the
+miner keeps only the tip (`fee − base fee`). The base fee rises when blocks fill
+and decays when idle. Separately, a node won't *relay* a transaction paying below
+its **dynamic minimum relay fee** (`-minrelayfee`, default 10 000 base units, which
+also rises with mempool load). See both in `/info` (`base_fee`, `min_relay_fee`),
+or ask for a recommended total:
+
+```sh
+curl -s 'localhost:8080/estimatefee?blocks=3'   # -> {base_fee, tip, fee}
+```
 
 The transfer is signed, gossiped to peers, and confirmed when a miner includes
 it in a block.
@@ -140,6 +148,9 @@ curl -s localhost:8080/account/dnas...          # balance + nonce
 curl -s localhost:8080/chain                    # full chain
 curl -s localhost:8080/mempool                  # pending txs
 curl -s localhost:8080/peers                    # connected peers
+curl -s localhost:8080/estimatefee              # recommended fee (base fee + tip)
+curl -s localhost:8080/stateproof/dnas...       # proof of an address's balance vs the state root
+curl -sN localhost:8080/events                  # live stream (SSE): new blocks / reorgs / txs
 ```
 
 ## 5. Form a network
@@ -198,16 +209,23 @@ shows this end to end with a small Python verifier.
 Spins up a three-node network and demonstrates: rejecting a wrong-`netkey` node,
 peer discovery, a signed transfer converging on every node, transaction expiry,
 the dynamic fee floor, deriving a multisig address, generating an HD wallet, and
-light-client SPV verification.
+light-client SPV verification. `./scripts/htlc-demo.sh` is a focused companion
+that settles one hash-time-locked contract via the claim (preimage) path and one
+via the refund (timeout) path.
 
 ## 8b. Verify a payment from the command line (light client)
 
-The bundled light client trusts only headers (which it PoW-verifies) and a
-compact proof — no full node:
+The bundled light client trusts only headers (which it PoW-verifies) — no full
+node. Beyond proving a payment is *included*, it can prove *non*-inclusion (via
+BIP158 compact filters) and prove an address's *balance* (via the header state
+root):
 
 ```sh
-dnas spv -api localhost:8080 sync            # verify the header chain, print tip + work
-dnas spv -api localhost:8080 verify <txhash> # prove a payment is in the chain
+dnas spv -api localhost:8080 sync             # verify the header chain, print tip + work
+dnas spv -api localhost:8080 verify <txhash>  # prove a payment IS in the chain
+dnas spv -api localhost:8080 scan <address>   # which blocks touch it (+ prove the rest don't)
+dnas spv -api localhost:8080 balance <address># PROVE its balance against the state root
+dnas spv -api localhost:8080 history <address># reconstruct its transactions (a real light wallet)
 ```
 
 ## 8c. Ops: config file, metrics, clean shutdown
@@ -219,6 +237,46 @@ curl -s localhost:8080/metrics         # Prometheus-format node metrics
 ```
 
 `node.json` keys mirror the flags, e.g. `{"listen":":3000","api":":8080","mine":true,"maxpeers":8}`.
+
+## 8d. Regtest: mine blocks on demand
+
+Waiting ~5 s per block is tedious for testing. `-regtest` mines only when asked
+(and defaults to an isolated network key so it won't peer with a devnet):
+
+```sh
+dnas node -regtest -api :8080 &
+curl -s -X POST localhost:8080/generate -d '{"n":10}'   # mine 10 blocks instantly
+```
+
+## 8e. Hash-time-locked contracts (atomic swaps)
+
+An HTLC address is spendable two ways: by the recipient revealing a preimage
+(claim, any time) or by the sender after a timeout height (refund) — the building
+block of cross-chain atomic swaps. Revealing the preimage on-chain is what lets a
+counterparty claim the mirror on another chain.
+
+```sh
+dnas htlc new                                                 # mint a preimage + its hash
+dnas htlc address -hash H -recipient R -sender S -timeout T   # derive the contract address
+# fund the address with a normal /send, then spend one branch:
+dnas htlc claim  -wallet alice.json -hash H -sender S    -timeout T -preimage P -to <addr>
+dnas htlc refund -wallet bob.json   -hash H -recipient R -timeout T            -to <addr>
+```
+
+Run `./scripts/htlc-demo.sh` to watch both branches settle.
+
+## 8f. Lock down the API
+
+By default the API is fully open (a localhost toy). Set a token to require it on
+the **write** endpoints (`/send`, `/tx`, `/mine`, `/generate`); reads stay open,
+and all bundled clients send it automatically from the same env var:
+
+```sh
+export DNAS_API_TOKEN='a-long-random-secret'
+dnas node -api :8080 -mine
+curl -s -H "Authorization: Bearer $DNAS_API_TOKEN" \
+  -X POST localhost:8080/mine -d '{"on":false}'
+```
 
 ## 9. Desktop / terminal clients
 
@@ -243,6 +301,11 @@ Both surface the multisig and HD/BIP39 wallet helpers (previously CLI/API-only).
 - `wallet.json` — your Ed25519 keys (encrypt with `DNAS_WALLET_PASSPHRASE`).
 - `chain.db` — the append-only chain; it survives restarts, and a node re-syncs
   anything it's missing from peers.
+- `peers.json`, `bans.json`, `mempool.json` — soft state written beside `chain.db`
+  on graceful shutdown and reloaded on start, so a restart resumes warm. The chain
+  stays authoritative; these are conveniences (re-learned from peers if lost).
 
 To start clean, stop the node and delete `chain.db` (keep `wallet.json` to keep
-your address). Different networks are separated by `-netkey`.
+your address). Different networks are separated by `-netkey`. Note: the block
+header format evolves as the project gains features, so a `chain.db` from an older
+build may be rejected as incompatible — delete it to start a fresh chain.

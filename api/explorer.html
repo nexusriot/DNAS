@@ -134,7 +134,7 @@ async function foldProof(leaf, proof) {
   return h;
 }
 async function headerHash(hd) {
-  return sha256hex(`${hd.index}|${hd.timestamp}|${hd.prev_hash}|${hd.merkle_root}|${hd.difficulty}|${hd.nonce}`);
+  return sha256hex(`${hd.index}|${hd.timestamp}|${hd.prev_hash}|${hd.merkle_root}|${hd.state_root}|${hd.base_fee}|${hd.difficulty}|${hd.nonce}`);
 }
 
 function txLine(tx) {
@@ -182,6 +182,7 @@ async function refresh() {
       ["next diff", info.next_difficulty],
       ["work", info.work],
       ["mempool", info.mempool],
+      ["base fee", fmt(info.base_fee)],
       ["peers", (info.peers || []).length],
     ].map(([k, v]) => `<div class="chip"><div class="k">${k}</div><div class="v">${esc(v)}</div></div>`).join("");
     renderBlocks(chain);
@@ -251,7 +252,15 @@ async function verifyTx() {
 
 async function tick() { await refresh(); await refreshWallet(); }
 tick();
-setInterval(tick, 2000);
+
+// Live push via Server-Sent Events: refresh immediately on every block, reorg,
+// or mempool transaction. A slow interval remains as a safety net (and covers
+// browsers without EventSource or a briefly dropped stream).
+if (window.EventSource) {
+  const es = new EventSource("/events");
+  for (const ev of ["block", "reorg", "tx"]) es.addEventListener(ev, tick);
+}
+setInterval(tick, window.EventSource ? 10000 : 2000);
 </script>
 </body>
 </html>

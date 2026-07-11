@@ -16,7 +16,7 @@ func TestLockUntilEnforced(t *testing.T) {
 	}
 
 	// Locked until height 5: invalid at height 2.
-	tx := Transaction{From: alice.Address(), To: bob.Address(), Amount: Coin, Nonce: 0, LockUntil: 5}
+	tx := Transaction{From: alice.Address(), To: bob.Address(), Amount: Coin, Fee: testFee, Nonce: 0, LockUntil: 5}
 	if err := tx.Sign(alice); err != nil {
 		t.Fatal(err)
 	}
@@ -46,14 +46,14 @@ func TestMemoBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 	matureCoinbase(t, bc)
-	big := Transaction{From: alice.Address(), To: bob.Address(), Amount: Coin, Nonce: 0, Memo: strings.Repeat("x", MaxMemoBytes+1)}
+	big := Transaction{From: alice.Address(), To: bob.Address(), Amount: Coin, Fee: testFee, Nonce: 0, Memo: strings.Repeat("x", MaxMemoBytes+1)}
 	if err := big.Sign(alice); err != nil {
 		t.Fatal(err)
 	}
 	if err := bc.AddBlock(mineOn(t, bc, alice.Address(), []Transaction{big})); err == nil {
 		t.Fatal("an oversized memo should be rejected")
 	}
-	ok := Transaction{From: alice.Address(), To: bob.Address(), Amount: Coin, Nonce: 0, Memo: "gm"}
+	ok := Transaction{From: alice.Address(), To: bob.Address(), Amount: Coin, Fee: testFee, Nonce: 0, Memo: "gm"}
 	if err := ok.Sign(alice); err != nil {
 		t.Fatal(err)
 	}

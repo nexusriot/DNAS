@@ -14,6 +14,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,6 +48,8 @@ func main() {
 		runWallet(args[1:])
 	case "spv":
 		runSPV(args[1:])
+	case "htlc":
+		runHTLC(args[1:])
 	case "help", "-h", "--help":
 		usage()
 	case "version", "-v", "--version":
@@ -66,6 +69,11 @@ Usage:
   dnas wallet address [-o FILE]
   dnas spv [-api URL] sync            verify the header chain (light client)
   dnas spv [-api URL] verify <txhash> prove a payment is in the chain
+  dnas spv [-api URL] scan <address>  find/prove non-inclusion of an address
+  dnas spv [-api URL] balance <addr>  prove an address's balance (state proof)
+  dnas spv [-api URL] history <addr>  reconstruct an address's history (light wallet)
+  dnas htlc new                       mint a preimage + hash for an atomic swap
+  dnas htlc <address|claim|refund>    build hash-time-locked contract spends
   dnas version                        print the build version
 
 Node flags:
@@ -78,7 +86,8 @@ Node flags:
   -netkey KEY     pre-shared network key; peers must match (default "dnas-devnet")
   -maxpeers N     maximum outbound peer connections (default 8)
   -mempool N      max pending transactions (default 5000)
-  -mine           enable mining`)
+  -mine           enable mining
+  -regtest        regtest mode: mine blocks on demand via POST /generate`)
 }
 
 // walletPassphrase reads the optional at-rest encryption passphrase from the
@@ -90,6 +99,7 @@ func runWallet(args []string) {
 		fmt.Println(`usage: dnas wallet <cmd> [-o FILE] [flags]   (set DNAS_WALLET_PASSPHRASE to encrypt at rest)
   new                       create a random wallet
   address                   print a wallet file's address
+  pubkey                    print a wallet file's public key (for multisig/HTLC)
   mnemonic                  create an HD wallet, print its BIP39 backup phrase
   restore   [-index N]      rebuild a wallet file from a mnemonic (read from stdin)
   addresses [-n N]          print the first N HD addresses for a mnemonic (stdin)
@@ -104,6 +114,23 @@ func runWallet(args []string) {
 	pubkeys := fs.String("pubkeys", "", "comma-separated member public keys (hex) for multisig")
 	_ = fs.Parse(args[1:])
 	pass := walletPassphrase()
+
+	// loadFile opens the existing wallet key file, honouring the passphrase.
+	loadFile := func() *wallet.Wallet {
+		var (
+			w   *wallet.Wallet
+			err error
+		)
+		if pass != "" {
+			w, err = wallet.LoadEncrypted(*out, pass)
+		} else {
+			w, err = wallet.Load(*out)
+		}
+		if err != nil {
+			log.Fatal(err)
+		}
+		return w
+	}
 
 	save := func(w *wallet.Wallet) {
 		var err error
@@ -131,19 +158,12 @@ func runWallet(args []string) {
 		fmt.Printf("wrote %s%s\naddress: %s\n", *out, suffix, w.Address())
 
 	case "address":
-		var (
-			w   *wallet.Wallet
-			err error
-		)
-		if pass != "" {
-			w, err = wallet.LoadEncrypted(*out, pass)
-		} else {
-			w, err = wallet.Load(*out)
-		}
-		if err != nil {
-			log.Fatal(err)
-		}
-		fmt.Println(w.Address())
+		fmt.Println(loadFile().Address())
+
+	case "pubkey":
+		// The public key is shared with counterparties to build multisig and HTLC
+		// scripts (which are addressed by a hash of the member public keys).
+		fmt.Println(loadFile().PublicKeyHex())
 
 	case "mnemonic":
 		m, hd, err := wallet.NewHD(128, "")
@@ -274,7 +294,15 @@ func runNode(args []string) {
 	mempoolMax := fs.Int("mempool", cfg.integer("mempool", core.DefaultMempoolSize), "max pending transactions")
 	minRelayFee := fs.Int("minrelayfee", cfg.integer("minrelayfee", int(core.DefaultMinRelayFee)), "base minimum relay fee in base units (rises with mempool load; 0 disables)")
 	mine := fs.Bool("mine", cfg.boolean("mine", false), "enable mining")
+	regtest := fs.Bool("regtest", cfg.boolean("regtest", false), "regtest mode: enable on-demand block generation (POST /generate)")
 	_ = fs.Parse(args)
+
+	// In regtest, isolate the network by default (a distinct pre-shared key) so a
+	// local test node can't accidentally peer with a devnet, unless the operator
+	// set -netkey explicitly.
+	if *regtest && *netKey == node.DefaultNetKey {
+		*netKey = "dnas-regtest"
+	}
 
 	var relayFloor uint64
 	if *minRelayFee > 0 {
@@ -307,10 +335,16 @@ func runNode(args []string) {
 		NetKey:        *netKey,
 		MaxPeers:      *maxPeers,
 		Mine:          *mine,
+		StateDir:      filepath.Dir(*dbPath), // persist peers/bans/mempool beside the chain
+		Regtest:       *regtest,
 	}, chain, mp, w)
 	n.Start()
 
-	go api.New(n).Start(*apiAddr)
+	srv := api.New(n)
+	if srv.AuthEnabled() {
+		log.Print("API write endpoints require a bearer token (DNAS_API_TOKEN)")
+	}
+	go srv.Start(*apiAddr)
 
 	// Clean shutdown: stop mining, close peers, flush the chain store.
 	var once sync.Once

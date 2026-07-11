@@ -12,6 +12,13 @@ node, transaction expiry, the dynamic fee floor, a derived multisig address, a
 generated HD wallet, and a Python light-client SPV verification. Edit the `190xx`
 ports at the top if they are taken.
 
+## htlc-demo.sh
+
+`./scripts/htlc-demo.sh` is a focused companion to `demo.sh`: on a single mining
+node it funds two hash-time-locked contracts and settles one via the **claim**
+(preimage) branch and the other via the **refund** (timeout) branch. Edit the
+`190xx` ports at the top if they are taken.
+
 ## build.sh
 
 Cross-compiles static (CGO-free) `dnas` + `dnas-tui` binaries for one or more

@@ -38,6 +38,12 @@ type Transaction struct {
 	// M-of-N multisig authorization (mutually exclusive with PubKey/Signature).
 	Multisig   *MultisigScript `json:"multisig,omitempty"`
 	Signatures []string        `json:"signatures,omitempty"`
+
+	// Hash-time-locked contract authorization: when set, From is the hash of this
+	// script and the spend is either a claim (Preimage revealed + recipient's
+	// Signature) or a refund (sender's Signature, valid only from Timeout on).
+	HTLC     *HTLCScript `json:"htlc,omitempty"`
+	Preimage string      `json:"preimage,omitempty"` // hex; present on the claim path
 }
 
 // MultisigScript defines an M-of-N multisig account: any Threshold of the listed
@@ -47,8 +53,37 @@ type MultisigScript struct {
 	PubKeys   []string `json:"pubkeys"`
 }
 
+// HTLCScript defines a hash-time-locked contract account. Coins sent to its
+// address (derived from the whole script) can be spent two ways:
+//
+//   - claim:  anyone revealing a preimage P where sha256(P) == Hash, together
+//     with a valid signature by Recipient, may spend it — at any height. The
+//     preimage is published on-chain, which is what makes cross-chain atomic
+//     swaps work (revealing it on one chain unlocks the mirror on the other).
+//   - refund: a valid signature by Sender may spend it, but only once the chain
+//     reaches Timeout, letting the sender reclaim coins the recipient never
+//     claimed.
+type HTLCScript struct {
+	Hash      string `json:"hash"`      // sha256(preimage), hex
+	Recipient string `json:"recipient"` // public key that can claim with the preimage
+	Sender    string `json:"sender"`    // public key that can refund after Timeout
+	Timeout   uint64 `json:"timeout"`   // height at/after which the refund path opens
+}
+
 // IsMultisig reports whether the transaction is authorized by a multisig script.
 func (t Transaction) IsMultisig() bool { return t.Multisig != nil }
+
+// IsHTLC reports whether the transaction spends a hash-time-locked contract.
+func (t Transaction) IsHTLC() bool { return t.HTLC != nil }
+
+// HTLCRefundNotReady reports whether this is an HTLC refund (no preimage) that is
+// not yet spendable at the given height: the refund path opens only once the
+// chain reaches the script's Timeout. The claim path (preimage revealed) has no
+// such restriction. Enforced in block application and honoured during mempool
+// selection so the miner never builds a block its own rules would reject.
+func (t Transaction) HTLCRefundNotReady(height uint64) bool {
+	return t.HTLC != nil && t.Preimage == "" && height < t.HTLC.Timeout
+}
 
 // IsCoinbase reports whether this is a coinbase (issuance) transaction.
 func (t Transaction) IsCoinbase() bool { return t.From == CoinbaseSender }
@@ -113,6 +148,9 @@ func (t Transaction) VerifySignature() error {
 	if t.IsMultisig() {
 		return t.verifyMultisig()
 	}
+	if t.IsHTLC() {
+		return t.verifyHTLC()
+	}
 	derived, err := wallet.AddressFromPubKeyHex(t.PubKey)
 	if err != nil {
 		return fmt.Errorf("bad public key: %w", err)
@@ -159,4 +197,56 @@ func (t Transaction) verifyMultisig() error {
 		return fmt.Errorf("only %d of %d required signatures are valid", valid, ms.Threshold)
 	}
 	return nil
+}
+
+// verifyHTLC checks that the script hashes to From and that the spend satisfies
+// one of the two branches. The claim branch requires a preimage hashing to the
+// script's Hash plus a valid signature by Recipient; the refund branch requires
+// a valid signature by Sender. The refund's Timeout is a height rule enforced at
+// block-application time (see Transaction.HTLCRefundNotReady), not here, because
+// signature verification has no height context.
+func (t Transaction) verifyHTLC() error {
+	s := t.HTLC
+	addr, err := wallet.HTLCAddress(s.Hash, s.Recipient, s.Sender, s.Timeout)
+	if err != nil {
+		return fmt.Errorf("invalid htlc script: %w", err)
+	}
+	if addr != t.From {
+		return errors.New("htlc script does not match sender address")
+	}
+	msg := t.signingBytes()
+	if t.Preimage != "" { // claim branch
+		raw, err := hex.DecodeString(t.Preimage)
+		if err != nil {
+			return errors.New("preimage is not valid hex")
+		}
+		sum := sha256.Sum256(raw)
+		if hex.EncodeToString(sum[:]) != s.Hash {
+			return errors.New("preimage does not hash to the contract hash")
+		}
+		if !wallet.Verify(s.Recipient, t.Signature, msg) {
+			return errors.New("invalid recipient signature on htlc claim")
+		}
+		return nil
+	}
+	// refund branch (timeout checked separately at apply time)
+	if !wallet.Verify(s.Sender, t.Signature, msg) {
+		return errors.New("invalid sender signature on htlc refund")
+	}
+	return nil
+}
+
+// SignHTLCClaim authorizes spending an HTLC via the claim branch: it records the
+// preimage and signs with w, which must be the script's Recipient key.
+func (t *Transaction) SignHTLCClaim(w *wallet.Wallet, preimage []byte) {
+	t.Preimage = hex.EncodeToString(preimage)
+	t.Signature = w.Sign(t.signingBytes())
+}
+
+// SignHTLCRefund authorizes spending an HTLC via the refund branch: it signs with
+// w, which must be the script's Sender key. The spend is only valid once the
+// chain reaches the script's Timeout.
+func (t *Transaction) SignHTLCRefund(w *wallet.Wallet) {
+	t.Preimage = ""
+	t.Signature = w.Sign(t.signingBytes())
 }

@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -33,6 +36,7 @@ type Info struct {
 	Work           string   `json:"work"`
 	Mempool        int      `json:"mempool"`
 	MinRelayFee    uint64   `json:"min_relay_fee"`
+	BaseFee        uint64   `json:"base_fee"`
 	Peers          []string `json:"peers"`
 	Mining         bool     `json:"mining"`
 }
@@ -61,6 +65,8 @@ type header struct {
 	Timestamp  int64  `json:"timestamp"`
 	PrevHash   string `json:"prev_hash"`
 	MerkleRoot string `json:"merkle_root"`
+	StateRoot  string `json:"state_root"`
+	BaseFee    uint64 `json:"base_fee"`
 	Difficulty int    `json:"difficulty"`
 	Nonce      uint64 `json:"nonce"`
 	Hash       string `json:"hash"`
@@ -94,7 +100,15 @@ func (c *Client) getJSON(path string, v any) error {
 
 func (c *Client) postJSON(path string, body, v any) error {
 	data, _ := json.Marshal(body)
-	resp, err := c.http.Post(c.base+path, "application/json", bytes.NewReader(data))
+	req, err := http.NewRequest(http.MethodPost, c.base+path, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if tok := os.Getenv("DNAS_API_TOKEN"); tok != "" { // attach token if the node requires one
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return err
 	}
@@ -130,6 +144,48 @@ func (c *Client) BalanceFmt(addr string) (string, error) {
 	}
 	s, _ := m["balance_fmt"].(string)
 	return s, nil
+}
+
+// Subscribe opens the node's Server-Sent Events stream and returns a channel that
+// receives the type of each event ("block", "reorg", "tx") plus a cancel func.
+// The channel closes when the stream ends or cancel is called. It uses its own
+// client with no timeout, since the stream is long-lived. This lets the UI
+// refresh the instant something changes instead of only polling.
+func (c *Client) Subscribe() (<-chan string, func(), error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/events", nil)
+	if err != nil {
+		cancel()
+		return nil, nil, err
+	}
+	resp, err := (&http.Client{}).Do(req)
+	if err != nil {
+		cancel()
+		return nil, nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		cancel()
+		return nil, nil, fmt.Errorf("events: %s", resp.Status)
+	}
+	ch := make(chan string, 16)
+	go func() {
+		defer close(ch)
+		defer resp.Body.Close()
+		sc := bufio.NewScanner(resp.Body)
+		for sc.Scan() {
+			line := sc.Text()
+			if !strings.HasPrefix(line, "event:") {
+				continue
+			}
+			select {
+			case ch <- strings.TrimSpace(strings.TrimPrefix(line, "event:")):
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return ch, cancel, nil
 }
 
 func (c *Client) Chain() ([]Block, error) { var b []Block; return b, c.getJSON("/chain", &b) }
@@ -184,7 +240,7 @@ func (c *Client) VerifyTx(txHash string) (string, error) {
 	if err := c.getJSON(fmt.Sprintf("/header/%d", pr.BlockIndex), &hdr); err != nil {
 		return "", err
 	}
-	hs := fmt.Sprintf("%d|%d|%s|%s|%d|%d", hdr.Index, hdr.Timestamp, hdr.PrevHash, hdr.MerkleRoot, hdr.Difficulty, hdr.Nonce)
+	hs := fmt.Sprintf("%d|%d|%s|%s|%s|%d|%d|%d", hdr.Index, hdr.Timestamp, hdr.PrevHash, hdr.MerkleRoot, hdr.StateRoot, hdr.BaseFee, hdr.Difficulty, hdr.Nonce)
 	powOK := sha(hs) == hdr.Hash && strings.HasPrefix(hdr.Hash, strings.Repeat("0", hdr.Difficulty))
 	h := txHash
 	for _, s := range pr.Proof {

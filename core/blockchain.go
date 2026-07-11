@@ -48,6 +48,8 @@ func GenesisBlock() Block {
 		Difficulty: GenesisDifficulty,
 	}
 	b.MerkleRoot = MerkleRoot(b.Transactions)
+	b.StateRoot = stateRoot(map[string]Account{}) // empty state at genesis
+	b.BaseFee = InitialBaseFee
 	b.Hash = b.ComputeHash()
 	return b
 }
@@ -62,8 +64,6 @@ func NewBlockchain() *Blockchain {
 		undos:  [][]undoEntry{nil}, // genesis has no undo (it is never rolled back)
 	}
 }
-
-// --- read accessors (locked) ----------------------------------------------
 
 func (bc *Blockchain) Tip() Block {
 	bc.mu.RLock()
@@ -238,8 +238,6 @@ func (bc *Blockchain) FindTxProof(txHash string) (TxProof, bool) {
 	}
 	return TxProof{Found: false}, false
 }
-
-// --- mutation (locked) ------------------------------------------------------
 
 // AddBlock validates a block against the current tip and, if valid, appends it
 // and updates account state in place. Application is incremental (no full-state
@@ -434,8 +432,6 @@ func ValidateHeaderChain(headers []Header, prevHash string, prevIndex uint64) er
 	return nil
 }
 
-// --- persistence ------------------------------------------------------------
-
 // Save writes the chain to a JSON file.
 func (bc *Blockchain) Save(path string) error {
 	bc.mu.RLock()
@@ -525,8 +521,6 @@ func Load(path string) (*Blockchain, error) {
 	return bc, nil
 }
 
-// --- validation core --------------------------------------------------------
-
 // expectedDifficulty deterministically derives the required difficulty for the
 // block at `height`, given the chain up to height-1. Difficulty only changes on
 // RetargetInterval boundaries, adjusting toward TargetBlockTime.
@@ -556,6 +550,50 @@ func expectedDifficulty(blocks []Block, height uint64) int {
 		diff = MaxDifficulty
 	}
 	return diff
+}
+
+// expectedBaseFee deterministically derives the base fee for the block at
+// `height` from its parent's fullness (EIP-1559 style): if the parent held more
+// than BaseFeeTargetTxs transactions the fee rises, if fewer it falls, each by at
+// most 1/BaseFeeMaxChangeDenominator. It is clamped to MinBaseFee so it can never
+// reach zero and can always recover. Every node derives the same value.
+func expectedBaseFee(blocks []Block, height uint64) uint64 {
+	if height == 0 {
+		return InitialBaseFee
+	}
+	parent := blocks[height-1]
+	base := parent.BaseFee
+	if base < MinBaseFee {
+		base = MinBaseFee
+	}
+	parentTxs := 0
+	if len(parent.Transactions) > 0 {
+		parentTxs = len(parent.Transactions) - 1 // exclude the coinbase
+	}
+	target := BaseFeeTargetTxs
+	switch {
+	case parentTxs == target:
+		return base
+	case parentTxs > target:
+		delta := base * uint64(parentTxs-target) / uint64(target) / BaseFeeMaxChangeDenominator
+		if delta == 0 {
+			delta = 1 // always move at least one unit when off-target
+		}
+		return base + delta
+	default: // parentTxs < target
+		delta := base * uint64(target-parentTxs) / uint64(target) / BaseFeeMaxChangeDenominator
+		if delta >= base || base-delta < MinBaseFee {
+			return MinBaseFee
+		}
+		return base - delta
+	}
+}
+
+// NextBaseFee is the base fee the next mined block must commit to.
+func (bc *Blockchain) NextBaseFee() uint64 {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+	return expectedBaseFee(bc.blocks, uint64(len(bc.blocks)))
 }
 
 // immatureCoinbase sums the coinbase amounts paid to addr in blocks that have
@@ -596,45 +634,78 @@ func medianTimePast(blocks []Block) int64 {
 
 // applyBlock fully validates `block` as the successor to blocks[len-1] and, if
 // valid, applies it to `state` in place, returning an undo log that reverses it.
-// On any error the state is rolled back so it is left exactly as it was.
+// On any error the state is rolled back so it is left exactly as it was. It also
+// verifies the committed state root: the post-block account state must hash to
+// block.StateRoot.
 func applyBlock(state map[string]Account, blocks []Block, block Block) ([]undoEntry, error) {
-	prev := blocks[len(blocks)-1]
-	height := block.Index
+	if err := validateBlockStructure(blocks, block); err != nil {
+		return nil, err
+	}
+	undo, err := applyTxsAndCoinbase(state, blocks, block)
+	if err != nil {
+		return nil, err
+	}
+	if root := stateRoot(state); block.StateRoot != root {
+		applyUndo(state, undo)
+		return nil, fmt.Errorf("state root mismatch: got %q, want %q", block.StateRoot, root)
+	}
+	return undo, nil
+}
 
+// validateBlockStructure checks everything about a block that does not depend on
+// account state: linkage, timestamps, difficulty, proof of work, the merkle root,
+// and the coinbase's shape. It is separated from state application so the miner
+// can compute the resulting state root (NextStateRoot) before a block is mined.
+func validateBlockStructure(blocks []Block, block Block) error {
+	prev := blocks[len(blocks)-1]
 	if block.Index != prev.Index+1 {
-		return nil, fmt.Errorf("bad index %d after %d", block.Index, prev.Index)
+		return fmt.Errorf("bad index %d after %d", block.Index, prev.Index)
 	}
 	if block.PrevHash != prev.Hash {
-		return nil, errors.New("prev hash mismatch")
+		return errors.New("prev hash mismatch")
 	}
 	if block.Timestamp <= medianTimePast(blocks) {
-		return nil, errors.New("timestamp not after median-time-past")
+		return errors.New("timestamp not after median-time-past")
 	}
 	if block.Timestamp > time.Now().Unix()+MaxFutureDrift {
-		return nil, errors.New("timestamp too far in the future")
+		return errors.New("timestamp too far in the future")
 	}
-	if block.Difficulty != expectedDifficulty(blocks, height) {
-		return nil, fmt.Errorf("wrong difficulty %d", block.Difficulty)
+	if block.Difficulty != expectedDifficulty(blocks, block.Index) {
+		return fmt.Errorf("wrong difficulty %d", block.Difficulty)
+	}
+	if block.BaseFee != expectedBaseFee(blocks, block.Index) {
+		return fmt.Errorf("wrong base fee %d, want %d", block.BaseFee, expectedBaseFee(blocks, block.Index))
 	}
 	if !block.HasValidPoW() {
-		return nil, errors.New("invalid proof of work")
+		return errors.New("invalid proof of work")
 	}
 	if MerkleRoot(block.Transactions) != block.MerkleRoot {
-		return nil, errors.New("merkle root mismatch")
+		return errors.New("merkle root mismatch")
 	}
 	if len(block.Transactions) == 0 {
-		return nil, errors.New("block has no coinbase transaction")
+		return errors.New("block has no coinbase transaction")
 	}
 	if len(block.Transactions) > MaxBlockTxs+1 {
-		return nil, errors.New("too many transactions")
+		return errors.New("too many transactions")
 	}
 	coinbase := block.Transactions[0]
 	if !coinbase.IsCoinbase() {
-		return nil, errors.New("first transaction must be coinbase")
+		return errors.New("first transaction must be coinbase")
 	}
 	if coinbase.To == "" {
-		return nil, errors.New("coinbase has no recipient")
+		return errors.New("coinbase has no recipient")
 	}
+	return nil
+}
+
+// applyTxsAndCoinbase applies a structurally-valid block's transactions and
+// coinbase to `state` in place, returning an undo log. It performs the
+// state-dependent checks (nonces, balances, coinbase amount) but NOT the
+// structural ones (see validateBlockStructure) — so it can also be run on a
+// state copy to compute a candidate block's resulting state root before mining.
+func applyTxsAndCoinbase(state map[string]Account, blocks []Block, block Block) ([]undoEntry, error) {
+	height := block.Index
+	coinbase := block.Transactions[0]
 
 	// set records the pre-change value before every mutation, so the undo log
 	// (applied in reverse) restores the exact pre-block state.
@@ -649,8 +720,9 @@ func applyBlock(state map[string]Account, blocks []Block, block Block) ([]undoEn
 		return nil, err
 	}
 
+	baseFee := block.BaseFee
 	seen := make(map[string]bool)
-	var fees uint64
+	var tips uint64
 	for i := 1; i < len(block.Transactions); i++ {
 		tx := block.Transactions[i]
 		if tx.IsCoinbase() {
@@ -661,6 +733,12 @@ func applyBlock(state map[string]Account, blocks []Block, block Block) ([]undoEn
 		}
 		if tx.IsLockedAt(height) {
 			return fail(fmt.Errorf("tx %d not yet valid (lock_until %d > height %d)", i, tx.LockUntil, height))
+		}
+		if tx.HTLCRefundNotReady(height) {
+			return fail(fmt.Errorf("tx %d htlc refund before timeout (timeout %d > height %d)", i, tx.HTLC.Timeout, height))
+		}
+		if tx.Fee < baseFee {
+			return fail(fmt.Errorf("tx %d fee %d below base fee %d", i, tx.Fee, baseFee))
 		}
 		if len(tx.Memo) > MaxMemoBytes {
 			return fail(fmt.Errorf("tx %d memo too long (%d > %d)", i, len(tx.Memo), MaxMemoBytes))
@@ -674,13 +752,15 @@ func applyBlock(state map[string]Account, blocks []Block, block Block) ([]undoEn
 		if err := applyTxTo(state, tx, reserve, set); err != nil {
 			return fail(fmt.Errorf("tx %d: %w", i, err))
 		}
-		fees += tx.Fee
+		tips += tx.Fee - baseFee // base fee is burned; miner keeps only the tip
 	}
 
+	// Miner is paid the subsidy plus tips; the base-fee portion of every fee is
+	// burned (never credited), permanently reducing the money supply.
 	reward := BlockReward(height)
-	if coinbase.Amount != reward+fees {
-		return fail(fmt.Errorf("bad coinbase amount: got %d, want %d (reward %d + fees %d)",
-			coinbase.Amount, reward+fees, reward, fees))
+	if coinbase.Amount != reward+tips {
+		return fail(fmt.Errorf("bad coinbase amount: got %d, want %d (reward %d + tips %d)",
+			coinbase.Amount, reward+tips, reward, tips))
 	}
 	acc := state[coinbase.To]
 	if acc.Balance+coinbase.Amount < acc.Balance {
@@ -689,6 +769,20 @@ func applyBlock(state map[string]Account, blocks []Block, block Block) ([]undoEn
 	acc.Balance += coinbase.Amount
 	set(coinbase.To, acc)
 	return undo, nil
+}
+
+// NextStateRoot computes the state root a candidate block would commit to, by
+// applying its transactions to a copy of current state. The miner calls it to
+// fill block.StateRoot before mining (the root is part of the proof-of-work
+// commitment). Errors if the candidate's transactions don't apply cleanly.
+func (bc *Blockchain) NextStateRoot(candidate Block) (string, error) {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+	s := cloneState(bc.state)
+	if _, err := applyTxsAndCoinbase(s, bc.blocks, candidate); err != nil {
+		return "", err
+	}
+	return stateRoot(s), nil
 }
 
 // applyTxTo validates a single signed transfer against state and applies it via

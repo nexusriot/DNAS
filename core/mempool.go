@@ -192,6 +192,33 @@ func (m *Mempool) Size() int {
 	return len(m.txs)
 }
 
+// EstimateTip estimates the tip (the fee above baseFee, which is what the miner
+// actually earns) a new transaction should pay to land within the next
+// `capacity` transactions by fee priority — a simple analog of Bitcoin's
+// estimatesmartfee. It returns 0 when the pool has room for everyone (no bidding
+// needed), otherwise the marginal tip at the cutoff, so a transaction paying just
+// above it displaces the queue's tail.
+func (m *Mempool) EstimateTip(baseFee uint64, capacity int) uint64 {
+	if capacity <= 0 {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.txs) < capacity {
+		return 0 // uncongested: room for all pending txs in the target window
+	}
+	tips := make([]uint64, 0, len(m.txs))
+	for _, tx := range m.txs {
+		if tx.Fee > baseFee {
+			tips = append(tips, tx.Fee-baseFee)
+		} else {
+			tips = append(tips, 0)
+		}
+	}
+	sort.Slice(tips, func(i, j int) bool { return tips[i] > tips[j] })
+	return tips[capacity-1]
+}
+
 // Select greedily chooses up to max transactions that form a valid sequence on
 // top of the current chain state: each must have the sender's next nonce and be
 // affordable. Among ready candidates it prefers higher fees. Recipients are
@@ -199,6 +226,7 @@ func (m *Mempool) Size() int {
 func (m *Mempool) Select(bc *Blockchain, max int) []Transaction {
 	all := m.All()
 	mineHeight := bc.Height() + 1 // the block we're selecting for
+	baseFee := bc.NextBaseFee()   // the next block's base fee; txs must cover it
 
 	type sim struct {
 		balance uint64
@@ -221,7 +249,7 @@ func (m *Mempool) Select(bc *Blockchain, max int) []Transaction {
 	for len(selected) < max {
 		var ready []Transaction
 		for _, tx := range all {
-			if used[tx.Hash()] || tx.IsExpiredAt(mineHeight) || tx.IsLockedAt(mineHeight) {
+			if used[tx.Hash()] || tx.IsExpiredAt(mineHeight) || tx.IsLockedAt(mineHeight) || tx.HTLCRefundNotReady(mineHeight) || tx.Fee < baseFee {
 				continue
 			}
 			s := get(tx.From)

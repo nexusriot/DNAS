@@ -58,7 +58,9 @@ type (
 		s   snapshot
 		err error
 	}
-	actionMsg string
+	sseMsg     string   // a live event arrived (its type); triggers an immediate refresh
+	sseDownMsg struct{} // the event stream ended; fall back to polling
+	actionMsg  string
 	// detailMsg carries a one-line status plus a multi-line panel body (used by
 	// the multisig and HD-wallet helpers, whose output spans several lines).
 	detailMsg struct {
@@ -74,7 +76,8 @@ type model struct {
 	mode    mode
 	input   string
 	status  string
-	detail  string // multi-line result panel (multisig address, HD backup, …)
+	detail  string        // multi-line result panel (multisig address, HD backup, …)
+	events  <-chan string // live SSE events (nil once the stream is unavailable)
 	w, h    int
 }
 
@@ -95,18 +98,45 @@ func fetch(c *Client) tea.Cmd {
 	}
 }
 
-func tick() tea.Cmd {
-	return tea.Tick(1500*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg(t) })
+// tick schedules the next poll. When a live event stream is connected the poll
+// is only a slow safety net; without one it is the primary refresh.
+func (m model) tick() tea.Cmd {
+	d := 1500 * time.Millisecond
+	if m.events != nil {
+		d = 5 * time.Second
+	}
+	return tea.Tick(d, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
-func (m model) Init() tea.Cmd { return tea.Batch(fetch(m.c), tick()) }
+// listen waits for the next SSE event (or the stream closing), if one is open.
+func (m model) listen() tea.Cmd {
+	ch := m.events
+	if ch == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		ev, ok := <-ch
+		if !ok {
+			return sseDownMsg{}
+		}
+		return sseMsg(ev)
+	}
+}
+
+func (m model) Init() tea.Cmd { return tea.Batch(fetch(m.c), m.tick(), m.listen()) }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.w, m.h = msg.Width, msg.Height
 	case tickMsg:
-		return m, tea.Batch(fetch(m.c), tick())
+		return m, tea.Batch(fetch(m.c), m.tick())
+	case sseMsg:
+		// A block/tx/reorg happened: refresh now and keep listening.
+		return m, tea.Batch(fetch(m.c), m.listen())
+	case sseDownMsg:
+		m.events = nil // stream ended; the poll loop takes over
+		return m, nil
 	case stateMsg:
 		if msg.err != nil {
 			m.connErr = msg.err.Error()
@@ -263,8 +293,8 @@ func (m model) View() string {
 		if i.Mining {
 			mining = okStyle.Render("ON")
 		}
-		fmt.Fprintf(&b, "%s live  height %s  diff %d  work %s  mempool %d  minfee %s  peers %d  mining %s\n",
-			okStyle.Render("●"), okStyle.Render(fmt.Sprint(i.Height)), i.NextDifficulty, i.Work, i.Mempool, fmtAmt(i.MinRelayFee), len(i.Peers), mining)
+		fmt.Fprintf(&b, "%s live  height %s  diff %d  work %s  mempool %d  basefee %s  minfee %s  peers %d  mining %s\n",
+			okStyle.Render("●"), okStyle.Render(fmt.Sprint(i.Height)), i.NextDifficulty, i.Work, i.Mempool, fmtAmt(i.BaseFee), fmtAmt(i.MinRelayFee), len(i.Peers), mining)
 	}
 
 	fmt.Fprintf(&b, "\n%s %s\n%s %s\n", dimStyle.Render("wallet "), m.st.addr, dimStyle.Render("balance"), okStyle.Render(m.st.balance))
@@ -348,7 +378,16 @@ func main() {
 		defer stop()
 	}
 
-	p := tea.NewProgram(model{c: NewClient(*api)}, tea.WithAltScreen())
+	cl := NewClient(*api)
+	m := model{c: cl}
+	// Subscribe to the live event stream if the node supports it; fall back to
+	// polling otherwise. The stream is cancelled when the program exits.
+	if ch, cancel, err := cl.Subscribe(); err == nil {
+		m.events = ch
+		defer cancel()
+	}
+
+	p := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

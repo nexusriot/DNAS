@@ -19,9 +19,11 @@ func TestSelectFeeOrderAndNonceOrder(t *testing.T) {
 	matureCoinbase(t, bc) // both coinbases must mature before they're spendable
 
 	mp := NewMempool()
-	a0 := signedTx(t, alice, bob.Address(), Coin, 5, 0)
-	a1 := signedTx(t, alice, bob.Address(), Coin, 1, 1)
-	b0 := signedTx(t, bob, alice.Address(), Coin, 9, 0)
+	// Fees are well above the base fee (so they're mineable) and distinct, so the
+	// ordering assertions below still exercise fee-priority selection.
+	a0 := signedTx(t, alice, bob.Address(), Coin, 3*testFee, 0)
+	a1 := signedTx(t, alice, bob.Address(), Coin, 1*testFee, 1)
+	b0 := signedTx(t, bob, alice.Address(), Coin, 9*testFee, 0)
 	for _, tx := range []Transaction{a0, a1, b0} {
 		if ok, err := mp.Add(tx); !ok || err != nil {
 			t.Fatalf("add: ok=%v err=%v", ok, err)
@@ -32,9 +34,9 @@ func TestSelectFeeOrderAndNonceOrder(t *testing.T) {
 	if len(sel) != 3 {
 		t.Fatalf("selected %d, want 3", len(sel))
 	}
-	// The highest-fee ready transaction (bob's, fee 9) is chosen first.
-	if sel[0].From != bob.Address() || sel[0].Fee != 9 {
-		t.Fatalf("first pick = %+v, want bob fee 9", sel[0])
+	// The highest-fee ready transaction (bob's) is chosen first.
+	if sel[0].From != bob.Address() || sel[0].Fee != 9*testFee {
+		t.Fatalf("first pick = %+v, want bob fee %d", sel[0], 9*testFee)
 	}
 	// Alice's two transactions must appear in nonce order.
 	var aliceNonces []uint64
@@ -94,7 +96,7 @@ func TestSelectRespectsMax(t *testing.T) {
 	matureCoinbase(t, bc)
 	mp := NewMempool()
 	for n := uint64(0); n < 3; n++ {
-		if _, err := mp.Add(signedTx(t, alice, "dnasx", Coin, 1, n)); err != nil {
+		if _, err := mp.Add(signedTx(t, alice, "dnasx", Coin, testFee, n)); err != nil {
 			t.Fatal(err)
 		}
 	}

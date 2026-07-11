@@ -18,16 +18,14 @@ func buildChain(t *testing.T) ([]core.Header, core.TxProof, string) {
 
 	mine := func(miner string, txs []core.Transaction) {
 		tip := bc.Tip()
-		var fees uint64
-		for _, x := range txs {
-			fees += x.Fee
-		}
-		cb := core.NewCoinbase(miner, core.BlockReward(tip.Index+1)+fees)
+		baseFee := bc.NextBaseFee()
+		cb := core.NewCoinbase(miner, core.CoinbaseAmount(tip.Index+1, txs, baseFee))
 		b := core.Block{
 			Index: tip.Index + 1, Timestamp: tip.Timestamp + 1,
 			Transactions: append([]core.Transaction{cb}, txs...),
-			PrevHash:     tip.Hash, Difficulty: bc.NextDifficulty(),
+			PrevHash:     tip.Hash, BaseFee: baseFee, Difficulty: bc.NextDifficulty(),
 		}
+		b.StateRoot, _ = bc.NextStateRoot(b)
 		mined, ok := core.Mine(b, nil)
 		if !ok {
 			t.Fatal("mine aborted")

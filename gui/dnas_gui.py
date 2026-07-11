@@ -42,15 +42,20 @@ class Api:
         if not base.startswith("http"):
             base = "http://" + base
         self.base = base.rstrip("/")
+        # Bearer token for a locked-down node (write endpoints); reads stay open.
+        self.token = os.environ.get("DNAS_API_TOKEN", "")
 
     def _get(self, path):
         with urllib.request.urlopen(self.base + path, timeout=2) as r:
             return json.load(r)
 
     def _post(self, path, body):
+        headers = {"Content-Type": "application/json"}
+        if self.token:
+            headers["Authorization"] = "Bearer " + self.token
         req = urllib.request.Request(
             self.base + path, data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"}, method="POST")
+            headers=headers, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=3) as r:
                 return json.load(r)
@@ -151,7 +156,6 @@ class Main(QWidget):
         self._build()
         self._connect(api_addr)
 
-    # --- layout -------------------------------------------------------------
     def _build(self):
         root = QVBoxLayout(self)
 
@@ -261,7 +265,6 @@ class Main(QWidget):
         t.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         return t
 
-    # --- connection / polling ----------------------------------------------
     def _connect(self, addr):
         addr = addr.strip() or "localhost:8080"
         self.api = Api(addr)
@@ -310,7 +313,6 @@ class Main(QWidget):
             for c, v in enumerate(vals):
                 self.mp.setItem(r, c, QTableWidgetItem(v))
 
-    # --- actions ------------------------------------------------------------
     def _toggle_mining(self):
         try:
             self.api.set_mining(not self.mining)

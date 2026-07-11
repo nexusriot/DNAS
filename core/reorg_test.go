@@ -32,7 +32,7 @@ func TestReorgRollsBackState(t *testing.T) {
 	forkHeight := uint64(len(shared) - 1)
 
 	// Our branch X extends the shared prefix with a transfer alice -> bob.
-	tx := signedTx(t, alice, bob.Address(), 5*Coin, 0, 0)
+	tx := signedTx(t, alice, bob.Address(), 5*Coin, testFee, 0)
 	if err := bc.AddBlock(mineOn(t, bc, alice.Address(), []Transaction{tx})); err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +87,7 @@ func TestReorgRejectsInvalidSuffixLeavesChainIntact(t *testing.T) {
 	}
 	matureCoinbase(t, bc)
 	shared := bc.Blocks()
-	tx := signedTx(t, alice, bob.Address(), 5*Coin, 0, 0)
+	tx := signedTx(t, alice, bob.Address(), 5*Coin, testFee, 0)
 	if err := bc.AddBlock(mineOn(t, bc, alice.Address(), []Transaction{tx})); err != nil {
 		t.Fatal(err)
 	}
@@ -111,6 +111,7 @@ func TestReorgRejectsInvalidSuffixLeavesChainIntact(t *testing.T) {
 		Timestamp:    ytip.Timestamp + 1,
 		Transactions: []Transaction{NewCoinbase(carol.Address(), BlockReward(ytip.Index+1)+Coin)},
 		PrevHash:     ytip.Hash,
+		BaseFee:      y.NextBaseFee(), // structurally valid so it's rejected for the coinbase overpay
 		Difficulty:   y.NextDifficulty(),
 	}
 	bad, _ = Mine(bad, nil)

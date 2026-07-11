@@ -55,6 +55,20 @@ const (
 	// before we reject it (loosely; late blocks are accepted once time passes).
 	MaxFutureDrift int64 = 120
 
+	// EIP-1559-style base fee. Unlike the mempool's relay floor (policy), the base
+	// fee is *consensus*: every non-coinbase transaction must pay at least the
+	// block's base fee, that portion is BURNED (never minted to anyone), and the
+	// miner keeps only the tip (fee − base fee). The base fee adjusts each block
+	// toward a target block fullness, so fees rise under load and fall when idle.
+	InitialBaseFee uint64 = 1_000 // base fee committed at genesis
+	MinBaseFee     uint64 = 100   // floor, so the fee can always recover upward
+	// BaseFeeTargetTxs is the per-block non-coinbase transaction count the base fee
+	// targets: above it the next base fee rises, below it falls.
+	BaseFeeTargetTxs = MaxBlockTxs / 2
+	// BaseFeeMaxChangeDenominator caps the per-block change to 1/8 (12.5%), as in
+	// Ethereum, so the base fee moves smoothly rather than in jumps.
+	BaseFeeMaxChangeDenominator = 8
+
 	// The genesis block is fixed so every node computes an identical hash and
 	// can therefore agree on the same chain. 2025-01-01T00:00:00Z.
 	GenesisTimestamp int64  = 1735689600
@@ -69,6 +83,26 @@ func BlockReward(height uint64) uint64 {
 		return 0
 	}
 	return InitialBlockReward >> halvings
+}
+
+// Tips is the miner's take from a block's transactions under the base-fee rule:
+// the sum of each transaction's fee above baseFee (the base-fee portion is
+// burned). Transactions paying below baseFee are invalid, so they contribute 0.
+func Tips(txs []Transaction, baseFee uint64) uint64 {
+	var tips uint64
+	for _, tx := range txs {
+		if tx.Fee > baseFee {
+			tips += tx.Fee - baseFee
+		}
+	}
+	return tips
+}
+
+// CoinbaseAmount is the total a block's coinbase may pay: the block subsidy plus
+// the tips (fees above the base fee). The base-fee portion of every fee is burned
+// and never appears here, so it permanently leaves the money supply.
+func CoinbaseAmount(height uint64, txs []Transaction, baseFee uint64) uint64 {
+	return BlockReward(height) + Tips(txs, baseFee)
 }
 
 // FormatAmount renders base units as a decimal DNAS string with the ticker.

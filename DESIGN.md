@@ -114,6 +114,8 @@ type Transaction struct {
     Signature        []byte          // single-key authorization
     Multisig         *MultisigScript // OR multisig authorization
     Signatures       [][]byte
+    HTLC             *HTLCScript     // OR hash-time-locked-contract authorization
+    Preimage         []byte          // revealed on the HTLC claim branch
 }
 ```
 
@@ -130,6 +132,17 @@ the two authorization paths sign the same bytes.
   (so the script is bound to the address it spends), and at least `Threshold`
   signatures from *distinct* listed members must verify. `verifyMultisig`
   enforces distinctness so one member can't satisfy a 2-of-N alone.
+- **Hash-time-locked contract (HTLC):** `From` must equal the hash of the
+  `HTLCScript{Hash, Recipient, Sender, Timeout}`. Two spend branches unlock it:
+  the *claim* branch needs a `Preimage` where `sha256(Preimage) == Hash` plus a
+  signature by `Recipient` (valid at any height); the *refund* branch needs a
+  signature by `Sender` and is only valid once the chain reaches `Timeout`. The
+  timeout is a height rule enforced at block application (like `LockUntil`), since
+  signature verification has no height context. Because the claim publishes the
+  preimage on-chain, HTLCs compose into **cross-chain atomic swaps**: revealing
+  the secret to claim on one chain lets the counterparty claim the mirror on the
+  other. Same address format as any account, so it is funded by an ordinary
+  transfer.
 
 **Time windows.** `Expiry` (upper bound) and `LockUntil` (lower bound) constrain
 the height range in which a transaction is valid; both are signed. Expired
@@ -148,18 +161,22 @@ and has no signature (`IsCoinbase`).
 ## 6. Blocks, headers, and Merkle proofs
 
 ```go
-type Block  struct { Index, Timestamp, Nonce; PrevHash; Difficulty; Transactions; Hash }
-type Header struct { Index, Timestamp, Nonce; PrevHash; MerkleRoot; Difficulty; Hash }
+type Block  struct { Index, Timestamp, Nonce; PrevHash; MerkleRoot; StateRoot; BaseFee; Difficulty; Transactions; Hash }
+type Header struct { Index, Timestamp, Nonce; PrevHash; MerkleRoot; StateRoot; BaseFee; Difficulty; Hash }
 ```
 
-A block hash commits to header fields **plus a Merkle root** of its transactions.
-A `Header` hashes *identically* to its block — so a client holding only headers
-can verify proof-of-work and the hash chain without block bodies. This is what
-makes SPV (§14) possible.
+A block hash commits to header fields **plus two merkle roots** — a `MerkleRoot`
+of its transactions and a `StateRoot` of the account set *after* the block — and
+the block's `BaseFee` (§9). A `Header` hashes *identically* to its block, so a
+client holding only headers can verify proof-of-work, the hash chain, that a
+transaction is included (via `MerkleRoot`), and that an account holds a given
+balance (via `StateRoot`) — all without block bodies. This is what makes SPV
+(§14) possible.
 
-`core/merkle.go` builds `MerkleRoot`, `MerkleProof`, and `VerifyMerkleProof`. An
-odd level duplicates its last node (Bitcoin's rule); the proof and root use the
-same rule so they agree.
+`core/merkle.go` builds the shared merkle fold (`MerkleProof`, `VerifyMerkleProof`);
+an odd level duplicates its last node (Bitcoin's rule), and proof and root use the
+same rule so they agree. `core/state.go` reuses that fold over the sorted account
+set to produce the `StateRoot` and account-membership proofs.
 
 ---
 
@@ -223,9 +240,22 @@ reward that has since vanished.
 
 New coins are created **only** by the coinbase. The subsidy starts at
 `InitialBlockReward` (50 DNAS) and halves every `HalvingInterval` (210 000)
-blocks until it reaches zero; miners also collect transaction fees. Genesis is
-fixed (`GenesisTimestamp`, `GenesisPrevHash`) so every node computes an identical
-genesis hash and can agree on the same chain.
+blocks until it reaches zero. Genesis is fixed (`GenesisTimestamp`,
+`GenesisPrevHash`) so every node computes an identical genesis hash and can agree
+on the same chain.
+
+**EIP-1559 base fee (consensus, burned).** Each block commits a `BaseFee` in its
+header, derived deterministically from the parent's fullness (`expectedBaseFee`):
+it rises up to 1/`BaseFeeMaxChangeDenominator` (12.5%) when the parent held more
+than `BaseFeeTargetTxs` transactions and falls when fewer, clamped to
+`MinBaseFee`. Every non-coinbase transaction must pay a fee ≥ the base fee; that
+base-fee portion is **burned** (never credited to anyone, so it leaves the money
+supply), and the miner's coinbase may pay only `reward + tips`, where a tip is a
+transaction's fee above the base fee. This is a genuine consensus fee market — a
+block whose transactions underpay the base fee, or whose coinbase over-pays, is
+invalid — distinct from the mempool's *relay* floor (§10), which only governs
+what a node queues. Because the base fee is in the header, light clients see it
+and it is covered by proof of work.
 
 ---
 
@@ -321,6 +351,15 @@ a foreign-file guard). `Blockchain.Open(path)` backs a chain with it so:
 `Save`/`Load` remain as a JSON import/export snapshot. On restart a node loads its
 store and re-syncs anything missing from peers.
 
+**Soft state.** Beside the authoritative chain, a node also persists three
+*conveniences* to the same directory (`peers.json`, `bans.json`, `mempool.json`),
+loading them on start and rewriting them on graceful shutdown. This lets a
+restart resume warm — known peers, accrued ban scores, and pending transactions
+survive instead of resetting — while the chain stays the single source of truth
+that re-syncs from peers regardless. A hard kill may lose the latest soft state
+(re-learned from the network), so it is written via temp-file+rename to avoid
+torn files.
+
 ---
 
 ## 13. Wallet
@@ -362,8 +401,43 @@ a client with headers alone can:
 `Blockchain.FindTxProof` serves a `TxProof` (block index, confirmations, Merkle
 root, proof steps). The API exposes `/headers`, `/header/{index}`,
 `/proof/{txhash}`; `dnas spv` is a real light client that trusts only headers;
-and the web explorer does the same fold in-browser with the Web Crypto API. SPV
-proves *inclusion*, not non-inclusion or full state.
+and the web explorer does the same fold in-browser with the Web Crypto API.
+
+**Compact block filters (BIP158-style) — non-inclusion.** A merkle proof shows a
+transaction *is* in a block; it says nothing about a block a client didn't ask
+about. To let a wallet learn which blocks concern it — and prove which do *not* —
+each block also has a **Golomb-Coded Set** filter (`core/cfilter.go`) over the
+addresses it touches. Items are placed with SipHash-2-4 (keyed by the block hash,
+so the filter is bound to a PoW-verifiable block) and delta-encoded with
+Golomb-Rice coding (P=19, M=784931). Testing the filter for an address gives no
+false negatives: a non-match is a **proof of non-inclusion** for that block; a
+match is "probably present, download to confirm" (≈1/M false positives). The API
+serves `/cfilter/{index}`, `/cfilters`, and a BIP157-style filter-header chain at
+`/cfheaders`; `dnas spv scan <addr>` PoW-verifies the headers, checks each filter
+is bound to its header and consistent with the filter-header chain, then reports
+matches and how many blocks the address is provably absent from.
+
+Because the filters are not committed in the PoW header (that would be a
+consensus change), their correctness rests on the honest-node / multi-peer
+assumption, exactly as in BIP157/158 — a client cross-checks peers or falls back
+to downloading the block.
+
+**State proofs (balances).** Inclusion and non-inclusion are about
+*transactions*; the header's `StateRoot` (§6, §9) lets a client prove *state*.
+`Blockchain.ProveAccount` serves an `AccountProof` — the account's balance and
+nonce plus a merkle path to the tip's `StateRoot` — and `VerifyAccountProof`
+folds it. `dnas spv balance <addr>` PoW-verifies the headers, then checks the
+proof folds to the verified header's state root, proving the balance
+trustlessly (`GET /stateproof/{addr}`). `dnas spv history <addr>` combines all
+three: it uses the filters to find the (few) blocks touching an address,
+downloads *only* those bodies (`GET /block/{index}`), authenticates each against
+its PoW-verified header, reconstructs the transfers, and cross-checks the
+resulting net against a state proof. This is a real light wallet — it never
+trusts a served balance or downloads the whole chain.
+
+So this SPV layer proves transaction *inclusion* trustlessly, *non-inclusion*
+under the filter honest-node assumption, and account *balances* (membership)
+against the PoW-committed state root.
 
 ---
 
@@ -372,17 +446,35 @@ proves *inclusion*, not non-inclusion or full state.
 `api/` exposes a small HTTP interface (`Handler()` is extracted so tests drive it
 with `httptest`). Highlights:
 
-- **Read:** `/info` (height, tip, work, mempool, `min_relay_fee`, peers, mining),
-  `/chain`, `/balance/{addr}`, `/account/{addr}`, `/mempool`, `/peers`,
-  `/address`, `/metrics` (Prometheus text).
-- **SPV:** `/headers`, `/header/{index}`, `/proof/{txhash}`.
-- **Write:** `POST /send` (built + signed by the node wallet; optional
-  nonce/expiry/lock_until/memo), `POST /tx` (a fully-signed tx incl. multisig),
-  `POST /mine` (`{on}` toggles mining at runtime).
-- **Stateless wallet helpers:** `POST /multisig/address` and `POST /wallet/hd`
-  compute an address or derive HD addresses without touching node state or
-  holding a secret. They exist so the thin clients (§16) share one crypto
-  implementation instead of re-deriving it.
+- **Read:** `/info` (height, tip, work, mempool, `min_relay_fee`, `base_fee`,
+  peers, mining), `/chain`, `/balance/{addr}`, `/account/{addr}`, `/mempool`,
+  `/peers`, `/address`, `/estimatefee?blocks=N` (recommended fee = base fee +
+  estimated tip), `/metrics` (Prometheus text).
+- **SPV / filters / state:** `/headers`, `/header/{index}`, `/block/{index}`,
+  `/proof/{txhash}`, `/cfilters`, `/cfilter/{index}`, `/cfheaders`, and
+  `/stateproof/{addr}` (a balance proof against the header state root).
+- **Events:** `GET /events` is a **Server-Sent Events** stream that pushes a
+  small JSON envelope on every new block, reorg, and mempool transaction, so a
+  browser (`EventSource`) or any HTTP client refreshes the instant something
+  changes instead of polling. SSE was chosen over WebSockets deliberately: it is
+  one-directional server→client (exactly the need), plain HTTP with no framing or
+  extra dependency (keeping the `api` module self-contained), and drops straight
+  into the explorer. Internally a node has a tiny publish/subscribe bus
+  (`node/events.go`) whose subscribers get a buffered channel; a slow consumer
+  drops events rather than stalling the node's hot paths.
+- **Write (guarded):** `POST /send` (built + signed by the node wallet; optional
+  nonce/expiry/lock_until/memo), `POST /tx` (a fully-signed tx incl. multisig or
+  HTLC), `POST /mine` (`{on}` toggles mining at runtime), and `POST /generate`
+  (`{n}`, regtest only: mine N blocks on demand so tests/demos don't wait on the
+  block interval). When `DNAS_API_TOKEN`
+  is set these require an `Authorization: Bearer <token>` header
+  (constant-time compared); read endpoints stay open, and an unset token leaves
+  the whole API open (the localhost/toy default). The token is read from the
+  environment, not a flag, so it doesn't leak into `ps`.
+- **Stateless wallet helpers:** `POST /multisig/address`, `POST /htlc/address`,
+  and `POST /wallet/hd` compute an address or derive HD addresses without
+  touching node state or holding a secret. They exist so the thin clients (§16)
+  share one crypto implementation instead of re-deriving it.
 
 The web explorer (`api/explorer.html`, embedded via `//go:embed`) is served at
 `/`: live status, expandable blocks, mempool, a send form, and an in-browser SPV
@@ -402,9 +494,15 @@ out of the box.
   a background thread and updates the UI via a Qt signal so a slow node never
   freezes the window.
 
-Neither client can import the Go `wallet` package (the TUI is out of the
-workspace; the GUI is Python), which is exactly why multisig/HD are exposed as
-**stateless API endpoints** — one source of truth for the crypto.
+The web explorer and the TUI subscribe to the `/events` SSE stream and refresh
+the instant a block or transaction arrives, keeping only a slow poll as a
+fallback (for a dropped stream or a node without the endpoint); the GUI polls.
+
+Neither standalone client can import the Go `wallet` package (the TUI is out of
+the workspace; the GUI is Python), which is exactly why multisig/HD/HTLC address
+derivation is exposed as **stateless API endpoints** — one source of truth for
+the crypto. All of them attach `DNAS_API_TOKEN` to write requests when it is set,
+so a locked-down node still works from the same host.
 
 ---
 
@@ -426,6 +524,10 @@ All in [`core/params.go`](core/params.go). Every node must agree on these.
 | `MaxMemoBytes`        | 256              | per-tx memo cap                           |
 | `MaxFutureDrift`      | 120 s            | how far ahead a timestamp may be          |
 | `DefaultMinRelayFee`  | Coin / 10 000    | base of the dynamic fee floor (policy)    |
+| `InitialBaseFee`      | 1 000            | EIP-1559 base fee at genesis (consensus)  |
+| `MinBaseFee`          | 100              | base-fee floor                            |
+| `BaseFeeTargetTxs`    | MaxBlockTxs / 2  | per-block tx count the base fee targets    |
+| `BaseFeeMaxChangeDenominator` | 8        | max base-fee change per block (1/8 = 12.5%) |
 | `GenesisTimestamp`    | 1735689600       | fixed genesis time (2025-01-01Z)          |
 
 ---
@@ -437,11 +539,19 @@ All in [`core/params.go`](core/params.go). Every node must agree on these.
 | Account+nonce, not UTXO | Simpler state & replay logic to read | Coinbase maturity needs a history scan instead of per-coin locks |
 | Smaller-tip-hash tie-break | Deterministic → all nodes converge; monotonic → no flapping | Not first-seen; a heavier/smaller-hash block always wins |
 | Coinbase maturity by history scan | No new state, reverses on reorg for free | O(maturity) scan per spend check (tiny here) |
-| Fee floor is relay policy | Avoids header/SPV/supply changes an EIP-1559 base fee needs | Doesn't affect block validity; a low-floor node still accepts the tx in a block |
+| Two-layer fees: consensus base fee + relay-policy floor | Base fee (burned, in-header) is a real fee market; the relay floor tunes what a node queues | Two knobs to understand; the relay floor doesn't affect block validity |
+| Base fee committed in the header | Light clients see it; it's covered by PoW; supply drop is verifiable | Changing the header format invalidates old chains (fine for a dev chain) |
+| State root in the header (balance proofs) | Light clients prove balances, not just inclusion | Another header field; proves membership only, not account absence |
+| Regtest = on-demand `/generate`, not fast continuous mining | Deterministic, controlled block production; no runaway chain | A separate mode; isolated by netkey rather than a distinct genesis |
 | Checksums client-side only | Avoids a consensus validation cascade | A malicious client can still burn its own coins |
 | HMAC-SHA512 HD, not SLIP-0010 | Small and self-contained | Not interoperable with standard wallets |
 | TUI as its own module | Keeps external deps' `go.sum` off the internal v0.0.0 modules | It can't import `wallet`; multisig/HD go through API helpers |
 | Static (CGO-free) binaries | One binary runs on any matching kernel | lintian flags "statically-linked" (acknowledged via an overrides file) |
+| HTLC as a script-bound address (not a new UTXO type) | Reuses the multisig pattern; account model unchanged | The claim/refund timeout is enforced at apply-time, not in signature checks |
+| Compact filters *not* committed in the header | Non-inclusion without a consensus change | Trust rests on honest-node / multi-peer, not proof-of-work (BIP157/158 model) |
+| SSE for the event stream, not WebSockets | One-directional, plain HTTP, zero deps, native `EventSource` | No client→server messaging over it (not needed) |
+| API auth as relay-style policy (token on writes only) | Locks spending/mining without breaking public reads or the explorer | Not per-user auth; a shared bearer token, reads unauthenticated |
+| Soft state persisted, chain authoritative | Warm restart (bans/peers/mempool survive) without trusting them | A hard kill can lose the latest soft state (re-synced from peers) |
 
 ---
 
@@ -481,12 +591,22 @@ See [scripts/README.md](scripts/README.md) for the script details.
 
 ## 21. Known limitations
 
-- Not sybil-resistant; identities aren't cost-bound and bans reset on restart.
+- Not sybil-resistant; identities aren't cost-bound. Bans now persist across a
+  graceful restart, but a hard kill can lose them (re-learned from peers).
 - Recipient checksums are client-side, not consensus.
+- API auth is a single shared bearer token on write endpoints, not per-user
+  authentication; reads are unauthenticated.
 - Locator sync transfers only the divergent suffix for normal forks; deep/losing
   forks fall back to whole-chain exchange.
-- The fee market is eviction + replace-by-fee + a relay-policy floor — no
-  consensus base fee.
-- SPV proves inclusion only; HD is not SLIP-0010; difficulty bounds are tiny.
+- The fee market is a burned EIP-1559 base fee (consensus) plus eviction,
+  replace-by-fee, and a relay-policy floor.
+- Merkle SPV proves inclusion trustlessly; compact filters add non-inclusion but
+  under the honest-node/multi-peer assumption (they aren't header-committed).
+  State proofs prove account *membership* (a present balance/nonce) against the
+  header state root, not account *absence*.
+- HTLC refund timing and coinbase maturity are enforced at block application, not
+  in signature verification. HD is not SLIP-0010; difficulty bounds are tiny.
+- Regtest is isolated from a devnet by its network key, not a distinct genesis;
+  point it at a separate data directory.
 
 It is a toy. Do not point it at the internet.

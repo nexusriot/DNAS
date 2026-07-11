@@ -134,7 +134,8 @@ func TestClientVerifyTx(t *testing.T) {
 	// leaf itself. Use difficulty 0 so the PoW prefix check is trivially met, and
 	// set the header hash to its own computed hash.
 	txh := "abc123"
-	hs := fmt.Sprintf("%d|%d|%s|%s|%d|%d", 1, 0, "p", txh, 0, 0)
+	// Header fields in the PoW-committed order: index|ts|prev|merkle|state|basefee|diff|nonce.
+	hs := fmt.Sprintf("%d|%d|%s|%s|%s|%d|%d|%d", 1, 0, "p", txh, "", 0, 0, 0)
 	hdrHash := sha(hs)
 
 	mux := http.NewServeMux()
@@ -142,7 +143,7 @@ func TestClientVerifyTx(t *testing.T) {
 		fmt.Fprintf(w, `{"found":true,"block_index":1,"confirmations":2,"merkle_root":%q,"proof":[]}`, txh)
 	})
 	mux.HandleFunc("/header/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, `{"index":1,"timestamp":0,"prev_hash":"p","merkle_root":%q,"difficulty":0,"nonce":0,"hash":%q}`, txh, hdrHash)
+		fmt.Fprintf(w, `{"index":1,"timestamp":0,"prev_hash":"p","merkle_root":%q,"state_root":"","base_fee":0,"difficulty":0,"nonce":0,"hash":%q}`, txh, hdrHash)
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()

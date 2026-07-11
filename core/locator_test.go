@@ -68,7 +68,7 @@ func TestReorgFromSuffix(t *testing.T) {
 	matureCoinbase(t, bc)
 	shared := bc.Blocks()
 	forkHeight := uint64(len(shared) - 1)
-	tx := signedTx(t, alice, bob.Address(), 5*Coin, 0, 0)
+	tx := signedTx(t, alice, bob.Address(), 5*Coin, testFee, 0)
 	if err := bc.AddBlock(mineOn(t, bc, alice.Address(), []Transaction{tx})); err != nil { // branch X
 		t.Fatal(err)
 	}

@@ -1,10 +1,18 @@
 # ---- Runtime artifacts (created by a running node / wallet) ----
-# chain stores & JSON snapshots, wallet key files, logs
+# chain stores & JSON snapshots, wallet key files, persisted soft state (peers /
+# bans / mempool), a node config, and logs. The demos use temp dirs, but the
+# README/QUICKSTART examples write these into the working dir.
 chain*.json
 chain*.db
 *.db
 wallet*.json
 w*.json
+alice.json
+bob.json
+peers.json
+bans.json
+mempool.json
+node.json
 *.log
 pid
 
@@ -43,7 +51,6 @@ venv/
 *.swp
 *.swo
 *~
-
 # ---- OS cruft ----
 .DS_Store
 Thumbs.db
@@ -57,3 +64,5 @@ Thumbs.db
 # keep the shared .claude/launch.json committed; ignore per-user local settings
 .claude/settings.local.json
 .claude/*.local.json
+.claude/launch.json
+

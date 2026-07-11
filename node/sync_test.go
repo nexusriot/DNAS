@@ -42,8 +42,10 @@ func mineBlocks(t *testing.T, bc *core.Blockchain, w *wallet.Wallet, n int) []co
 			Timestamp:    tip.Timestamp + 1,
 			Transactions: []core.Transaction{cb},
 			PrevHash:     tip.Hash,
+			BaseFee:      bc.NextBaseFee(),
 			Difficulty:   bc.NextDifficulty(),
 		}
+		b.StateRoot, _ = bc.NextStateRoot(b)
 		mined, ok := core.Mine(b, nil)
 		if !ok {
 			t.Fatal("mining aborted")

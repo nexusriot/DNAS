@@ -5,16 +5,33 @@ package lives in `cmd/dnas`.
 
 ```sh
 dnas node   [flags]              run a full node (default; -config for a JSON file)
-                                 (-minrelayfee sets the base dynamic relay fee)
+                                 (-minrelayfee sets the base dynamic relay fee;
+                                  -regtest mines on demand via POST /generate)
 dnas wallet new|address [-o F]   create / show a key file
+dnas wallet pubkey [-o F]        print a wallet's public key (for multisig/HTLC)
 dnas wallet mnemonic|restore|addresses   BIP39 backup + HD addresses
 dnas wallet multisig -threshold M -pubkeys a,b,c   M-of-N multisig address
-dnas spv [-api URL] sync|verify <txhash>           light client (headers + proof)
+dnas htlc new|address|claim|refund                 hash-time-locked contracts
+dnas spv [-api URL] sync|verify <txhash>|scan|balance|history <address>   light client (headers/proof/filters/state)
 dnas version                     print the build version (stamped via -ldflags)
 ```
 
 Running a node with an interactive terminal also starts a REPL
 (`send`, `balance`, `address`, `info`, `peers`, `mempool`); it shuts down cleanly
 on SIGINT/SIGTERM. The `spv` subcommand (`spv.go`) is a standalone light client
-that verifies proof-of-work headers and merkle proofs — it trusts no full node.
-See the root README for the full flag list. Depends on all other modules.
+that verifies proof-of-work headers and merkle proofs — it trusts no full node;
+`spv scan <address>` adds compact-filter scanning that reports matching blocks and
+proves non-inclusion for the rest; `spv balance <address>` proves an address's
+balance against the header state root; and `spv history <address>` is a light
+wallet that uses the compact filters to find the blocks touching an address,
+downloads only those (`GET /block`), authenticates each against its PoW-verified
+header, reconstructs the transfers, and cross-checks the net against a state
+proof. `dnas htlc` (`new`, `address`, `claim`,
+`refund`) mints a preimage+hash and builds, signs, and submits HTLC spends —
+`claim` reveals the preimage, `refund` is valid only past the timeout height —
+sweeping the contract balance minus fee to `-to`. `dnas node -regtest` mines on
+demand via `POST /generate` and defaults its network key to an isolated value so
+a regtest node doesn't peer with a devnet. A node now persists its peers,
+bans, and mempool beside the `-db` file and honors `DNAS_API_TOKEN`; the spend
+tools send that token automatically when the env var is set. See the root README
+for the full flag list. Depends on all other modules.

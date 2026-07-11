@@ -6,22 +6,26 @@ import (
 	"github.com/nexusriot/DNAS/wallet"
 )
 
+// testFee is a per-transaction fee comfortably above the EIP-1559 base fee at
+// any height reached in the tests (the base fee starts at InitialBaseFee and only
+// decays on the near-empty test chains), so transactions are always mineable.
+const testFee = uint64(1_000_000)
+
 // mineOn builds and mines a valid block (coinbase to minerAddr + txs) on the tip.
 func mineOn(t *testing.T, bc *Blockchain, minerAddr string, txs []Transaction) Block {
 	t.Helper()
 	tip := bc.Tip()
-	var fees uint64
-	for _, tx := range txs {
-		fees += tx.Fee
-	}
-	cb := NewCoinbase(minerAddr, BlockReward(tip.Index+1)+fees)
+	baseFee := bc.NextBaseFee()
+	cb := NewCoinbase(minerAddr, CoinbaseAmount(tip.Index+1, txs, baseFee))
 	block := Block{
 		Index:        tip.Index + 1,
 		Timestamp:    tip.Timestamp + 1,
 		Transactions: append([]Transaction{cb}, txs...),
 		PrevHash:     tip.Hash,
+		BaseFee:      baseFee,
 		Difficulty:   bc.NextDifficulty(),
 	}
+	block.StateRoot, _ = bc.NextStateRoot(block) // commit post-block state (err ignored: invalid blocks are meant to be rejected)
 	mined, ok := Mine(block, nil)
 	if !ok {
 		t.Fatal("mining aborted unexpectedly")
@@ -99,7 +103,9 @@ func TestTransferAndFee(t *testing.T) {
 		t.Errorf("bob = %d, want %d", got, amount)
 	}
 	_ = reward2
-	if got, want := bc.Balance(carol.Address()), BlockReward(bc.Height())+fee; got != want {
+	// The miner keeps only the tip: fee minus the burned base fee of that block.
+	baseFee := bc.Tip().BaseFee
+	if got, want := bc.Balance(carol.Address()), BlockReward(bc.Height())+fee-baseFee; got != want {
 		t.Errorf("carol (miner) = %d, want %d", got, want)
 	}
 	if got := bc.Account(alice.Address()).Nonce; got != 1 {
@@ -115,7 +121,7 @@ func TestReplayRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	matureCoinbase(t, bc)
-	tx := signedTx(t, alice, bob.Address(), 5*Coin, 0, 0)
+	tx := signedTx(t, alice, bob.Address(), 5*Coin, testFee, 0)
 	if err := bc.AddBlock(mineOn(t, bc, alice.Address(), []Transaction{tx})); err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +138,7 @@ func TestOverspendRejected(t *testing.T) {
 	if err := bc.AddBlock(mineOn(t, bc, alice.Address(), nil)); err != nil {
 		t.Fatal(err)
 	}
-	tx := signedTx(t, alice, bob.Address(), BlockReward(1)+Coin, 0, 0) // more than she has
+	tx := signedTx(t, alice, bob.Address(), BlockReward(1)+Coin, testFee, 0) // more than she has
 	if err := bc.AddBlock(mineOn(t, bc, alice.Address(), []Transaction{tx})); err == nil {
 		t.Fatal("expected overspend to be rejected")
 	}
@@ -145,7 +151,7 @@ func TestTamperedSignatureRejected(t *testing.T) {
 	if err := bc.AddBlock(mineOn(t, bc, alice.Address(), nil)); err != nil {
 		t.Fatal(err)
 	}
-	tx := signedTx(t, alice, bob.Address(), 1*Coin, 0, 0)
+	tx := signedTx(t, alice, bob.Address(), 1*Coin, testFee, 0)
 	tx.Amount = 1000 * Coin // tamper after signing
 	if err := bc.AddBlock(mineOn(t, bc, alice.Address(), []Transaction{tx})); err == nil {
 		t.Fatal("expected tampered tx to be rejected")
@@ -160,7 +166,7 @@ func TestForgedFromRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Mallory tries to spend from Alice's address using his own key.
-	tx := Transaction{From: alice.Address(), To: mallory.Address(), Amount: Coin, Nonce: 0}
+	tx := Transaction{From: alice.Address(), To: mallory.Address(), Amount: Coin, Fee: testFee, Nonce: 0}
 	tx.PubKey = mallory.PublicKeyHex()
 	tx.Signature = mallory.Sign(tx.signingBytes())
 	if err := bc.AddBlock(mineOn(t, bc, mallory.Address(), []Transaction{tx})); err == nil {
@@ -207,7 +213,7 @@ func TestExpiryEnforcedInBlock(t *testing.T) {
 	}
 
 	// The same transfer expiring at exactly `next` is still valid at `next`.
-	ok := Transaction{From: alice.Address(), To: bob.Address(), Amount: Coin, Nonce: 0, Expiry: next}
+	ok := Transaction{From: alice.Address(), To: bob.Address(), Amount: Coin, Fee: testFee, Nonce: 0, Expiry: next}
 	if err := ok.Sign(alice); err != nil {
 		t.Fatal(err)
 	}
