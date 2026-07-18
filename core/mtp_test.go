@@ -18,7 +18,7 @@ func mineAt(t *testing.T, bc *Blockchain, miner string, txs []Transaction, ts in
 		Transactions: append([]Transaction{cb}, txs...),
 		PrevHash:     tip.Hash,
 		BaseFee:      baseFee,
-		Difficulty:   bc.NextDifficulty(),
+		Bits:         bc.NextBits(),
 	}
 	b.StateRoot, _ = bc.NextStateRoot(b)
 	mined, ok := Mine(b, nil)

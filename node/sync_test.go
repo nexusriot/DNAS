@@ -43,7 +43,7 @@ func mineBlocks(t *testing.T, bc *core.Blockchain, w *wallet.Wallet, n int) []co
 			Transactions: []core.Transaction{cb},
 			PrevHash:     tip.Hash,
 			BaseFee:      bc.NextBaseFee(),
-			Difficulty:   bc.NextDifficulty(),
+			Bits:         bc.NextBits(),
 		}
 		b.StateRoot, _ = bc.NextStateRoot(b)
 		mined, ok := core.Mine(b, nil)

@@ -182,18 +182,27 @@ set to produce the `StateRoot` and account-membership proofs.
 
 ## 7. Proof of work and difficulty
 
-Proof of work is a **leading-zero-hex** target: a block hash must begin with
-`Difficulty` `0` nibbles. Cumulative work is defined so it can be compared across
-forks:
+Proof of work uses a **256-bit target in compact form** (`Block.Bits`, like
+Bitcoin's nBits — see [`core/target.go`](core/target.go)): a block hash, read
+big-endian as an integer, must be ≤ the target the block commits to. A smaller
+target is exponentially harder. This replaces the older leading-zero-nibble
+difficulty (a coarse integer 3–5) with a *continuous* target. Cumulative work,
+comparable across forks, is:
 
 ```
-BlockWork = 16 ^ difficulty        ChainWork = Σ BlockWork
+BlockWork = 2^256 / (target + 1)        ChainWork = Σ BlockWork
 ```
 
-Difficulty is **retargeted deterministically** every `RetargetInterval` blocks
-toward `TargetBlockTime`, clamped to `[MinDifficulty, MaxDifficulty]`. Bounds are
-tiny by design (3–5) so a devnet never stalls on an unreachable target or spins
-uselessly on a trivial one, and every node derives the same next difficulty.
+Difficulty is retargeted **every block** by an **LWMA** (linearly-weighted moving
+average, [`expectedBits`](core/blockchain.go)) over the last `lwmaWindow` blocks,
+weighting recent blocks more so it tracks `TargetBlockTime` smoothly rather than
+in ±1 steps. Per-block solve times are clamped to `[1, 6·TargetBlockTime]`, which
+also neutralises the enormous first gap from the far-past genesis timestamp — the
+old step retarget collapsed to the floor on the first window; the LWMA does not.
+The target is clamped to `[MinTarget, PowLimit]` (a band ≈ the old difficulty
+3–5) so a devnet never stalls on an unreachable target or spins on a trivial one,
+and every node derives the same next target deterministically. `TargetDifficulty`
+renders a target as a human ratio (`PowLimit ÷ target`) for display only.
 
 ---
 
@@ -218,6 +227,17 @@ reverse it — no full-state clone per block. `ReplaceChain` / `ReorgFrom` find 
 common ancestor (`commonPrefix`), roll a *copy* of state back to that point via
 the undo logs, then apply only the new suffix. Validation happens on the copy, so
 a bad suffix leaves the live chain and state untouched (atomic switch).
+
+**Finality guards.** Before fork choice even runs, a reorg is refused if it would
+discard more than `MaxReorgDepth` already-committed blocks — settled history is
+treated as final, so a deep-reorg attack can't rewrite it — or if it would fork
+below a **checkpoint**. Checkpoints (`core/checkpoint.go`) pin known-good block
+hashes at given heights: a block at a checkpointed height must carry the pinned
+hash, and no reorg may cross one. Genesis is always an implicit checkpoint;
+operators add more with `-checkpoints height:hash,…` (e.g. hashes of
+deeply-buried blocks from a trusted release) so a fresh or lagging node can't be
+fed a bogus deep history. Both guards leave initial sync and forward extension
+untouched — they only bound rolling *back* committed blocks.
 
 **Coinbase maturity.** A coinbase mined at height `C` is spendable only once the
 chain reaches `C + CoinbaseMaturity`. In an account model there are no coins to
@@ -244,18 +264,24 @@ blocks until it reaches zero. Genesis is fixed (`GenesisTimestamp`,
 `GenesisPrevHash`) so every node computes an identical genesis hash and can agree
 on the same chain.
 
-**EIP-1559 base fee (consensus, burned).** Each block commits a `BaseFee` in its
-header, derived deterministically from the parent's fullness (`expectedBaseFee`):
-it rises up to 1/`BaseFeeMaxChangeDenominator` (12.5%) when the parent held more
-than `BaseFeeTargetTxs` transactions and falls when fewer, clamped to
-`MinBaseFee`. Every non-coinbase transaction must pay a fee ≥ the base fee; that
-base-fee portion is **burned** (never credited to anyone, so it leaves the money
-supply), and the miner's coinbase may pay only `reward + tips`, where a tip is a
-transaction's fee above the base fee. This is a genuine consensus fee market — a
-block whose transactions underpay the base fee, or whose coinbase over-pays, is
-invalid — distinct from the mempool's *relay* floor (§10), which only governs
-what a node queues. Because the base fee is in the header, light clients see it
-and it is covered by proof of work.
+**EIP-1559 base fee (consensus, burned, priced per byte).** Each block commits a
+`BaseFee` in its header, derived deterministically from the parent's fullness
+(`expectedBaseFee`): it rises up to 1/`BaseFeeMaxChangeDenominator` (12.5%) when
+the parent held more than `BaseFeeTargetTxs` transactions and falls when fewer,
+clamped to `MinBaseFee`. The base fee is a **price per byte**: every non-coinbase
+transaction must pay a fee ≥ `BaseFee × its serialized size` (`Transaction.Size`),
+so a larger transaction owes proportionally more. That base-fee portion is
+**burned** (never credited to anyone, so it leaves the money supply), and the
+miner's coinbase may pay only `reward + tips`, where a tip is a transaction's fee
+above `BaseFee × size`. A block is additionally bounded by `MaxBlockBytes` of
+transaction data, making block space a metered, priced resource. This is a genuine
+consensus fee market — a block whose transactions underpay per byte, whose
+coinbase over-pays, or which exceeds the byte budget is invalid — distinct from
+the mempool's *relay* floor (§10), which only governs what a node queues. Because
+the base fee is in the header, light clients see it and it is covered by proof of
+work. (The *congestion signal* that moves the base fee is transaction count, not
+bytes — a deliberate simplification that keeps the retarget cheap to reason about
+and test; the *payment* is per byte.)
 
 ---
 
@@ -263,14 +289,17 @@ and it is covered by proof of work.
 
 `core/mempool.go` is a bounded pool of validated, unmined transactions.
 
-- **Bounded with lowest-fee eviction.** Capped at `DefaultMempoolSize` (5000);
-  once full, a new transaction is admitted only by out-bidding the cheapest
-  queued one, which it evicts.
+- **Bounded with lowest-*rate* eviction.** Capped at `DefaultMempoolSize` (5000);
+  once full, a new transaction is admitted only by out-bidding the queued
+  transaction paying the least per byte (fee *rate*), which it evicts — so scarce
+  block space, a per-byte resource, goes to the highest-paying bytes.
 - **Replace-by-fee.** A conflicting `(From, Nonce)` may be replaced only by a
   strictly higher fee.
-- **Dynamic minimum relay fee — *policy, not consensus*.** `MinFee()` starts at a
-  configurable base (`NewMempoolWithPolicy`, `-minrelayfee`, default
-  `DefaultMinRelayFee = Coin/10000`) and rises quadratically with occupancy:
+- **Dynamic minimum relay fee — *policy, not consensus*, priced per byte.**
+  `MinFee()` is a *rate* (base units per byte): it starts at a configurable base
+  (`NewMempoolWithPolicy`, `-minrelayfee`, default `DefaultMinRelayFee = 10`/byte)
+  and rises quadratically with occupancy, and a transaction is admitted only when
+  its fee ≥ `MinFee() × its size`:
 
   ```
   floor = base · (1 + (feeFloorMaxMultiplier−1) · fill² / 100²)      fill = %full, 0..100
@@ -281,11 +310,13 @@ and it is covered by proof of work.
   what *this* node queues and gossips — a block that includes an under-floor
   transaction is still valid. This is intentionally **not** an EIP-1559 consensus
   base fee (which would need header/SPV/supply surgery).
-- **Nonce-aware selection.** `Select` greedily builds a valid sequence for the
-  next block: each transaction must have its sender's next nonce and be
-  affordable *from spendable balance* (so immature coinbase is never spent);
-  recipients are credited within the simulation so chained spends can share a
-  block; higher fees win among ready candidates.
+- **Nonce-aware, rate-ordered, byte-bounded selection.** `Select` greedily builds
+  a valid sequence for the next block: each transaction must have its sender's next
+  nonce, cover its per-byte base fee, and be affordable *from spendable balance*
+  (so immature coinbase is never spent); recipients are credited within the
+  simulation so chained spends can share a block; the highest fee *rate* wins among
+  ready candidates, and selection stops at `MaxBlockBytes` of total size as well as
+  the transaction-count cap.
 - **Expiry pruning** drops transactions that can no longer be mined.
 
 ---
@@ -305,11 +336,41 @@ over `net.Pipe` (used in tests).
 then signs it with its **Ed25519 node identity** (`MsgIdentity`), so peers are
 cryptographically identified, not merely "knows the key".
 
-**Ban scoring (`banbook`).** Peers that serve internally-invalid data (e.g. a bad
-header chain) accrue ban points *by identity* and are cut off past a threshold. A
-plain fork is not penalised. Keyed by identity, not IP, so localhost demo peers
-aren't all banned together — but this means bans are evadable by key rotation
-(accepted for a friendly devnet).
+**Ban scoring (`banbook`).** Misbehaving peers accrue points and are cut off past
+a threshold. The key depends on when the misbehaviour is detectable: a **failed
+handshake** happens before a peer proves an identity, so it is scored *by IP*
+(loopback exempt, so many local nodes on 127.0.0.1 don't ban one another);
+**protocol-level fraud after authentication** — a bad header chain, or a block
+that fails its own proof-of-work / merkle root (`Block.SelfValid`) — is scored *by
+identity*. A plain fork (a well-formed block that just doesn't link to our tip) is
+never penalised. Identity keying is evadable by key rotation and IP keying by
+changing address; both are accepted for a friendly devnet.
+
+**Keepalive.** An established connection is pinged every `pingInterval` and
+dropped if it sends nothing for `peerIdleTimeout` (a read deadline is reset on
+every message). This detects a half-open connection — a peer that died without
+closing — instead of leaking a goroutine and peer slot forever.
+
+**Protocol version & capabilities.** Right after the identity exchange each side
+sends a `MsgVersion` carrying its `ProtocolVersion` and a list of capability
+strings. A peer below `MinProtocolVersion` is dropped, so the wire format can
+evolve; capabilities (e.g. `dand` for Dandelion++) let optional features be
+negotiated per-connection without a version bump.
+
+**Dandelion++ transaction relay (origin privacy).** A newly submitted transaction
+is not broadcast to every peer immediately — that would let a network observer
+pinpoint its source. Instead it travels along a **stem**: the node forwards it to
+a single, *epoch-stable* successor peer (re-chosen every `dandEpochDuration`, and
+only among peers advertising the `dand` capability). At each hop the transaction
+either continues down the stem or, with probability `1/dandFluffDenom`,
+transitions to the **fluff** phase — an ordinary broadcast to all peers. Because a
+relaying node and the originator behave identically on the stem, an observer can't
+distinguish them. Two safety nets prevent a transaction getting stuck: a node with
+no stem successor fluffs immediately, and every stem-forward arms an **embargo**
+timer (`dandEmbargo`) that fluffs the transaction itself if it isn't seen fluffing
+on the network first (defeating a peer that black-holes stem transactions). It is
+enabled by default (`-dandelion`) and degrades to plain broadcast when off or when
+no peer supports it. (`node/dandelion.go`.)
 
 **Discovery (`peerbook`).** Nodes gossip known addresses (`MsgGetPeers` /
 `MsgPeers`) and auto-dial discovered peers up to `-maxpeers`, excluding
@@ -435,6 +496,44 @@ its PoW-verified header, reconstructs the transfers, and cross-checks the
 resulting net against a state proof. This is a real light wallet — it never
 trusts a served balance or downloads the whole chain.
 
+**Persistent SPV wallet.** `dnas spv wallet` turns those one-shot commands into a
+stateful light wallet (`cmd/dnas/spvwallet.go`). It watches a set of addresses and
+stores, in a small JSON file, the height it has scanned to and each address's
+reconstructed balance and history. Each `update` fetches and PoW-verifies the
+header chain and filters, then folds in *only* the new blocks a filter flags for a
+watched address (authenticating each body against its header) — so a resumed
+wallet downloads just the handful of blocks since last time, not the chain. If the
+block at the last-scanned height no longer carries the hash it recorded, a reorg
+happened below it and the wallet rescans from scratch. With `-watch` it follows
+the `/events` SSE stream and re-syncs the instant a block or reorg arrives. The
+sync core is a pure function over (headers, filters, fetch), so it is unit-tested
+without a node.
+
+**Self-custodial sending.** Given a key file (`-key`, encrypted via
+`DNAS_WALLET_PASSPHRASE`), `dnas spv wallet send` becomes a real wallet, not just
+a viewer: it proves the sender's balance and nonce trustlessly (a state proof
+against a PoW-verified header, `provenAccount`), **signs the transaction locally**
+— the private key never leaves the client — and submits only the signed
+transaction (`POST /tx`). A local next-nonce counter lets several sends queue
+before a confirming block without colliding, catching up to the proven nonce as
+they confirm.
+
+**Snapshot fast-sync (`core/snapshot.go`).** Because a header commits a
+`StateRoot`, the entire account set at a height can be verified in one shot:
+recompute `stateRoot(accounts)` and check it equals the (PoW-verified, ideally
+checkpointed) header's committed root. `SnapshotAt` serves such a `Snapshot`
+(rolling state back through the undo logs), the API exposes it at
+`/snapshot/{height}`, and `dnas fastsync` bootstraps from it — PoW-verifying the
+header chain, verifying the snapshot against the header's state root and an
+optional pinned `-checkpoint`, seeding a chain with `NewFromSnapshot` (header-only
+placeholders below the snapshot, real state at it), then downloading and *fully*
+validating only the block bodies above it. It reaches the full chain's cumulative
+work without replaying settled history — the balances proven, never trusted.
+Reorgs below the snapshot are impossible by the finality guards (§8), so the
+pruned bodies are never needed. (The fast-synced chain currently runs in memory;
+persisting a pruned chain through the append-only, index-based block store would
+need a base-offset store format and is left as future work.)
+
 So this SPV layer proves transaction *inclusion* trustlessly, *non-inclusion*
 under the filter honest-node assumption, and account *balances* (membership)
 against the PoW-committed state root.
@@ -451,8 +550,9 @@ with `httptest`). Highlights:
   `/peers`, `/address`, `/estimatefee?blocks=N` (recommended fee = base fee +
   estimated tip), `/metrics` (Prometheus text).
 - **SPV / filters / state:** `/headers`, `/header/{index}`, `/block/{index}`,
-  `/proof/{txhash}`, `/cfilters`, `/cfilter/{index}`, `/cfheaders`, and
-  `/stateproof/{addr}` (a balance proof against the header state root).
+  `/proof/{txhash}`, `/cfilters`, `/cfilter/{index}`, `/cfheaders`,
+  `/stateproof/{addr}` (a balance proof against the header state root), and
+  `/snapshot/{height}` (the full account state at a height, for fast-sync).
 - **Events:** `GET /events` is a **Server-Sent Events** stream that pushes a
   small JSON envelope on every new block, reorg, and mempool transaction, so a
   browser (`EventSource`) or any HTTP client refreshes the instant something
@@ -515,17 +615,20 @@ All in [`core/params.go`](core/params.go). Every node must agree on these.
 | `Coin`                | 100 000 000      | base units per DNAS                       |
 | `InitialBlockReward`  | 50 · Coin        | first-epoch coinbase subsidy              |
 | `HalvingInterval`     | 210 000          | blocks between reward halvings            |
-| `GenesisDifficulty`   | 4                | leading-zero nibbles at genesis           |
-| `MinDifficulty`/`Max` | 3 / 5            | retarget clamp                            |
-| `TargetBlockTime`     | 5 s              | desired spacing                           |
-| `RetargetInterval`    | 10               | blocks between retargets                  |
+| `GenesisBits`         | ~2^240 target    | compact PoW target at genesis (nBits)     |
+| `PowLimit`/`MinTarget`| ~2^244 / ~2^236  | easiest / hardest target (retarget clamp) |
+| `TargetBlockTime`     | 5 s              | desired spacing (LWMA retarget target)    |
+| `lwmaWindow`          | 20               | blocks the LWMA retarget averages over    |
+| `ProtocolVersion`     | 1                | P2P wire version (peers below are dropped) |
 | `CoinbaseMaturity`    | 3                | blocks before a reward is spendable       |
+| `MaxReorgDepth`       | 100              | deepest reorg allowed (finality guard)    |
 | `MaxBlockTxs`         | 1000             | non-coinbase txs per block                |
+| `MaxBlockBytes`       | 1 000 000        | total non-coinbase tx bytes per block     |
 | `MaxMemoBytes`        | 256              | per-tx memo cap                           |
 | `MaxFutureDrift`      | 120 s            | how far ahead a timestamp may be          |
-| `DefaultMinRelayFee`  | Coin / 10 000    | base of the dynamic fee floor (policy)    |
-| `InitialBaseFee`      | 1 000            | EIP-1559 base fee at genesis (consensus)  |
-| `MinBaseFee`          | 100              | base-fee floor                            |
+| `DefaultMinRelayFee`  | 10 /byte         | base of the dynamic fee floor (policy, per byte) |
+| `InitialBaseFee`      | 10 /byte         | EIP-1559 base fee at genesis (consensus, per byte) |
+| `MinBaseFee`          | 1 /byte          | base-fee floor (per byte)                 |
 | `BaseFeeTargetTxs`    | MaxBlockTxs / 2  | per-block tx count the base fee targets    |
 | `BaseFeeMaxChangeDenominator` | 8        | max base-fee change per block (1/8 = 12.5%) |
 | `GenesisTimestamp`    | 1735689600       | fixed genesis time (2025-01-01Z)          |
@@ -541,6 +644,13 @@ All in [`core/params.go`](core/params.go). Every node must agree on these.
 | Coinbase maturity by history scan | No new state, reverses on reorg for free | O(maturity) scan per spend check (tiny here) |
 | Two-layer fees: consensus base fee + relay-policy floor | Base fee (burned, in-header) is a real fee market; the relay floor tunes what a node queues | Two knobs to understand; the relay floor doesn't affect block validity |
 | Base fee committed in the header | Light clients see it; it's covered by PoW; supply drop is verifiable | Changing the header format invalidates old chains (fine for a dev chain) |
+| Fees priced per byte; blocks bounded by bytes | Block space is a metered, priced resource; a big tx pays its share; the mempool ranks by fee rate | A cheap `Size()` (JSON length) approximates real serialized weight |
+| Base fee *congestion signal* stays tx-count, not weight | Keeps the retarget cheap to reason about and test | Slightly inconsistent with per-byte pricing; documented in §9 |
+| Finality: max-reorg-depth + checkpoints | Settled history can't be rewritten; a fresh/lagging node can't be fed a bogus deep chain | A genuinely longer fork past the depth is also refused (a node stuck offline too long must resync from a trusted store) |
+| 256-bit compact target (nBits) + LWMA retarget | Continuous difficulty, smooth per-block retargeting, and fixes the genesis-timestamp collapse | Header change (genesis hash changed); compact encoding is lossy in the low bits |
+| Snapshot fast-sync, verified against the state root | Trustless bootstrap without replaying settled history — composes checkpoints + state roots | The fast-synced (pruned) chain runs in memory; persisting it needs a base-offset store format (future work) |
+| Dandelion++ on by default | Transaction-origin privacy | Adds relay latency, bounded by the embargo; a small devnet fluffs within a few hops |
+| Light wallet signs locally | A real self-custodial wallet — the key never leaves the client | The next nonce is tracked locally between confirmations |
 | State root in the header (balance proofs) | Light clients prove balances, not just inclusion | Another header field; proves membership only, not account absence |
 | Regtest = on-demand `/generate`, not fast continuous mining | Deterministic, controlled block production; no runaway chain | A separate mode; isolated by netkey rather than a distinct genesis |
 | Checksums client-side only | Avoids a consensus validation cascade | A malicious client can still burn its own coins |
@@ -597,15 +707,25 @@ See [scripts/README.md](scripts/README.md) for the script details.
 - API auth is a single shared bearer token on write endpoints, not per-user
   authentication; reads are unauthenticated.
 - Locator sync transfers only the divergent suffix for normal forks; deep/losing
-  forks fall back to whole-chain exchange.
-- The fee market is a burned EIP-1559 base fee (consensus) plus eviction,
-  replace-by-fee, and a relay-policy floor.
+  forks fall back to whole-chain exchange. Reorgs deeper than `MaxReorgDepth`, or
+  crossing a checkpoint, are refused (finality) — a node offline past that depth
+  must resync from a trusted store rather than over the wire.
+- The fee market is a burned, **per-byte** EIP-1559 base fee (consensus) plus
+  rate-based eviction, replace-by-fee, and a per-byte relay-policy floor; its
+  congestion signal is transaction count, not weight (§9).
 - Merkle SPV proves inclusion trustlessly; compact filters add non-inclusion but
   under the honest-node/multi-peer assumption (they aren't header-committed).
   State proofs prove account *membership* (a present balance/nonce) against the
   header state root, not account *absence*.
 - HTLC refund timing and coinbase maturity are enforced at block application, not
-  in signature verification. HD is not SLIP-0010; difficulty bounds are tiny.
+  in signature verification. HD is not SLIP-0010. Proof of work is a continuous
+  256-bit target (nBits) retargeted by an LWMA, but the target band is kept tiny
+  by design so a laptop mines instantly.
+- Snapshot fast-sync bootstraps trustlessly (state verified against the header
+  state root, anchored by a checkpoint) but the resulting pruned chain runs in
+  memory — persisting it through the index-based block store is future work.
+- Dandelion++ hides a transaction's origin along the stem, but on a tiny devnet
+  with few peers the anonymity set is small; it is a demonstration of the scheme.
 - Regtest is isolated from a devnet by its network key, not a distinct genesis;
   point it at a separate data directory.
 

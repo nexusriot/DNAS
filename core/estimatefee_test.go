@@ -6,33 +6,39 @@ import (
 	"github.com/nexusriot/DNAS/wallet"
 )
 
+// TestEstimateTip checks the per-byte tip estimator: zero when block space isn't
+// scarce, and a rate that rises as the target window tightens.
 func TestEstimateTip(t *testing.T) {
 	mp := NewMempool()
-	baseFee := uint64(100)
+	baseFee := uint64(1)
 
-	// Empty pool: no tip needed to get in.
-	if got := mp.EstimateTip(baseFee, 10); got != 0 {
+	// Empty pool: no tip needed regardless of capacity.
+	if got := mp.EstimateTip(baseFee, 1000); got != 0 {
 		t.Errorf("empty-pool tip = %d, want 0", got)
 	}
 
-	// Five transactions with tips 10..50 (fee = baseFee + tip).
 	alice, _ := wallet.New()
-	for i, tip := range []uint64{10, 20, 30, 40, 50} {
-		tx := signedTx(t, alice, "dnasx", Coin, baseFee+tip, uint64(i))
+	total := 0
+	for i := 0; i < 5; i++ {
+		tip := uint64((i + 1) * 1000) // increasing tips 1000..5000
+		tx := signedTx(t, alice, "dnasx", Coin, baseFee*2000+tip, uint64(i))
+		total += tx.Size()
 		if ok, err := mp.Add(tx); !ok || err != nil {
 			t.Fatalf("add: ok=%v err=%v", ok, err)
 		}
 	}
 
-	// Room for everyone (capacity > pool) → still 0.
-	if got := mp.EstimateTip(baseFee, 10); got != 0 {
+	// Room for everyone (capacity beyond the total pending bytes): no tip needed.
+	if got := mp.EstimateTip(baseFee, total+1000); got != 0 {
 		t.Errorf("uncongested tip = %d, want 0", got)
 	}
-	// Congested: only the top `capacity` get in, so bid just above the cutoff.
-	if got := mp.EstimateTip(baseFee, 2); got != 40 {
-		t.Errorf("tip for capacity 2 = %d, want 40 (2nd highest)", got)
+	// Tight capacity (room for ~1 tx) requires a positive tip rate to get in.
+	tight := mp.EstimateTip(baseFee, total/5)
+	if tight == 0 {
+		t.Error("a congested pool should require a positive tip rate")
 	}
-	if got := mp.EstimateTip(baseFee, 1); got != 50 {
-		t.Errorf("tip for capacity 1 = %d, want 50 (highest)", got)
+	// Looser capacity (room for ~4) requires a lower-or-equal tip rate than tight.
+	if looser := mp.EstimateTip(baseFee, total*4/5); looser > tight {
+		t.Errorf("looser capacity should need a lower tip rate: tight=%d looser=%d", tight, looser)
 	}
 }

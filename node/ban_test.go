@@ -33,10 +33,10 @@ func TestInvalidHeaderChainBansPeer(t *testing.T) {
 	p, _ := bufPeer()      // p.id == "peer-id"
 	genesis := core.GenesisBlock()
 	badBatch := []core.Header{{
-		Index:      1,
-		PrevHash:   genesis.Hash, // links correctly...
-		Hash:       "not-a-valid-proof-of-work",
-		Difficulty: core.GenesisDifficulty, // ...but the hash fails PoW
+		Index:    1,
+		PrevHash: genesis.Hash, // links correctly...
+		Hash:     "not-a-valid-proof-of-work",
+		Bits:     core.GenesisBits, // ...but the hash fails PoW
 	}}
 
 	rounds := (banThreshold + banBadHeaders - 1) / banBadHeaders
@@ -54,7 +54,7 @@ func TestForkHeadersNotPenalised(t *testing.T) {
 	n, _, _ := testNode(t)
 	p, buf := bufPeer()
 	// A header claiming a parent we don't have -> treated as a fork, not misbehaviour.
-	batch := []core.Header{{Index: 1, PrevHash: "some-other-genesis", Hash: "x", Difficulty: core.GenesisDifficulty}}
+	batch := []core.Header{{Index: 1, PrevHash: "some-other-genesis", Hash: "x", Bits: core.GenesisBits}}
 	n.onHeaders(p, batch)
 	if n.bans.scoreOf(p.id) != 0 {
 		t.Fatalf("a non-linking (fork) header batch should not be penalised, score = %d", n.bans.scoreOf(p.id))

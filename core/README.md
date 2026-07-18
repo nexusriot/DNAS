@@ -21,12 +21,17 @@ Module `github.com/nexusriot/DNAS/core` — the ledger and consensus rules.
   blocks.
 - `Header` — a block without its transactions; it hashes identically, so a light
   client can verify PoW and the hash chain from headers alone.
-- **EIP-1559 base fee** (consensus) — each block commits a `BaseFee` in its
-  header, derived from the parent's fullness by `expectedBaseFee` (rising above
-  `BaseFeeTargetTxs` txs, falling below, ±1/`BaseFeeMaxChangeDenominator` = 12.5%,
-  clamped to `MinBaseFee`); `Blockchain.NextBaseFee` exposes the next block's
-  value. Every non-coinbase tx must pay a fee ≥ the base fee, and that portion is
-  **burned** — the coinbase may pay only `reward + tips`.
+- **EIP-1559 base fee, priced per byte** (consensus) — each block commits a
+  `BaseFee` in its header, derived from the parent's fullness by `expectedBaseFee`
+  (rising above `BaseFeeTargetTxs` txs, falling below, ±1/`BaseFeeMaxChangeDenominator`
+  = 12.5%, clamped to `MinBaseFee`); `Blockchain.NextBaseFee` exposes the next
+  block's value. Every non-coinbase tx must pay a fee ≥ `BaseFee × Size()`
+  (`BaseFeeFor`), that portion is **burned** — the coinbase may pay only
+  `reward + tips` — and a block is bounded by `MaxBlockBytes` of transaction data.
+- **Finality** — `MaxReorgDepth` bounds how many committed blocks a reorg may
+  discard, and `checkpoint.go` pins known-good hashes at heights (genesis is
+  implicit; `AddCheckpoint`); a block at a checkpointed height must match, and no
+  reorg may fork below one.
 - `merkle.go` — a shared `merkleRootOf` / `merkleProofOf` fold used by both the
   transaction tree and the state tree; `MerkleProof` / `VerifyMerkleProof` give
   compact inclusion proofs (unchanged, and used for both).
@@ -58,21 +63,30 @@ Module `github.com/nexusriot/DNAS/core` — the ledger and consensus rules.
 - `store.go` — an append-only, length-framed block log. `Open` backs a chain with
   it so `AddBlock` persists in O(1) and reorgs truncate+append (no whole-file
   rewrite); `Save`/`Load` remain as a JSON import/export snapshot.
-- `work.go` — cumulative proof-of-work (`BlockWork`, `ChainWork`). Fork choice is
-  greatest cumulative work, with equal-work ties broken deterministically by the
-  smaller tip hash so every node converges on the same chain.
-- `Mempool` — bounded pool of pending transactions with lowest-fee eviction,
-  replace-by-fee (fee-bumping), expiry pruning, and nonce-aware block selection
-  (`Select`). Enforces a **dynamic minimum relay fee** (`MinFee`): a configurable
-  base (`NewMempoolWithPolicy`) that rises quadratically with occupancy toward
-  `feeFloorMaxMultiplier×base` when full. This is relay policy, not consensus —
-  block validation ignores it. `Select` also skips transactions paying below the
-  next block's base fee, and `EstimateTip(baseFee, capacity)` estimates the tip
-  needed to land within the next `capacity` transactions (0 when uncongested).
+- `target.go` — proof of work is a **256-bit compact target** (`Bits`, nBits-style
+  `CompactToBig`/`BigToCompact`); a hash must be ≤ the target. `expectedBits`
+  (in `blockchain.go`) retargets **every block** with an LWMA toward
+  `TargetBlockTime`, clamped to `[MinTarget, PowLimit]`.
+- `work.go` — cumulative proof-of-work (`BlockWork = 2^256/(target+1)`,
+  `ChainWork`). Fork choice is greatest cumulative work, with equal-work ties
+  broken deterministically by the smaller tip hash so every node converges.
+- `snapshot.go` — `Snapshot` (account state + header at a height), `SnapshotAt`,
+  `VerifySnapshot` (accounts hash to the header's state root), and
+  `NewFromSnapshot` (seed a chain from a verified snapshot for fast-sync).
+- `Mempool` — bounded pool of pending transactions with lowest-*rate* eviction
+  (fee per byte), replace-by-fee (fee-bumping), expiry pruning, and nonce-aware,
+  rate-ordered, byte-bounded block selection (`Select`, capped at `MaxBlockBytes`).
+  Enforces a **dynamic minimum relay fee** (`MinFee`, a per-byte rate): a
+  configurable base (`NewMempoolWithPolicy`) that rises quadratically with
+  occupancy toward `feeFloorMaxMultiplier×base` when full; a tx is admitted when
+  `fee ≥ MinFee() × size`. This is relay policy, not consensus — block validation
+  ignores it. `Select` skips transactions below their per-byte base fee, and
+  `EstimateTip(baseFee, capacityBytes)` estimates the tip *rate* to land within the
+  next `capacityBytes` of block space (0 when uncongested).
 - `params.go` — monetary and consensus constants (coin, reward/halving,
-  difficulty bounds and retarget, `CoinbaseMaturity`, `DefaultMinRelayFee`, the
-  base-fee params `InitialBaseFee`/`MinBaseFee`/`BaseFeeTargetTxs`/
-  `BaseFeeMaxChangeDenominator`, genesis) plus the `Tips` and `CoinbaseAmount`
-  fee-split helpers.
+  difficulty bounds and retarget, `CoinbaseMaturity`, `MaxReorgDepth`,
+  `MaxBlockBytes`, `DefaultMinRelayFee`, the per-byte base-fee params
+  `InitialBaseFee`/`MinBaseFee`/`BaseFeeTargetTxs`/`BaseFeeMaxChangeDenominator`,
+  genesis) plus the `BaseFeeFor`, `Tips`, and `CoinbaseAmount` fee helpers.
 
 Depends on `wallet` for signature verification and address derivation.

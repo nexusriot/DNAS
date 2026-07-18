@@ -23,7 +23,7 @@ func mineOn(t *testing.T, bc *Blockchain, minerAddr string, txs []Transaction) B
 		Transactions: append([]Transaction{cb}, txs...),
 		PrevHash:     tip.Hash,
 		BaseFee:      baseFee,
-		Difficulty:   bc.NextDifficulty(),
+		Bits:         bc.NextBits(),
 	}
 	block.StateRoot, _ = bc.NextStateRoot(block) // commit post-block state (err ignored: invalid blocks are meant to be rejected)
 	mined, ok := Mine(block, nil)
@@ -103,9 +103,10 @@ func TestTransferAndFee(t *testing.T) {
 		t.Errorf("bob = %d, want %d", got, amount)
 	}
 	_ = reward2
-	// The miner keeps only the tip: fee minus the burned base fee of that block.
-	baseFee := bc.Tip().BaseFee
-	if got, want := bc.Balance(carol.Address()), BlockReward(bc.Height())+fee-baseFee; got != want {
+	// The miner keeps only the tip: fee minus the burned per-byte base fee (base
+	// fee × the transaction's size) of that block.
+	burned := BaseFeeFor(tx, bc.Tip().BaseFee)
+	if got, want := bc.Balance(carol.Address()), BlockReward(bc.Height())+fee-burned; got != want {
 		t.Errorf("carol (miner) = %d, want %d", got, want)
 	}
 	if got := bc.Account(alice.Address()).Nonce; got != 1 {
@@ -184,7 +185,7 @@ func TestInvalidPoWRejected(t *testing.T) {
 		Timestamp:    tip.Timestamp + 1,
 		Transactions: []Transaction{cb},
 		PrevHash:     tip.Hash,
-		Difficulty:   bc.NextDifficulty(),
+		Bits:         bc.NextBits(),
 	}
 	block.MerkleRoot = MerkleRoot(block.Transactions)
 	block.Hash = block.ComputeHash() // computed but not mined -> almost certainly fails difficulty
@@ -236,7 +237,7 @@ func TestBadCoinbaseAmountRejected(t *testing.T) {
 		Timestamp:    tip.Timestamp + 1,
 		Transactions: []Transaction{cb},
 		PrevHash:     tip.Hash,
-		Difficulty:   bc.NextDifficulty(),
+		Bits:         bc.NextBits(),
 	}
 	mined, _ := Mine(block, nil)
 	if err := bc.AddBlock(mined); err == nil {
@@ -254,7 +255,7 @@ func TestFirstTxMustBeCoinbase(t *testing.T) {
 		Timestamp:    tip.Timestamp + 1,
 		Transactions: []Transaction{tx},
 		PrevHash:     tip.Hash,
-		Difficulty:   bc.NextDifficulty(),
+		Bits:         bc.NextBits(),
 	}
 	mined, _ := Mine(block, nil)
 	if err := bc.AddBlock(mined); err == nil {
@@ -272,7 +273,7 @@ func TestNonIncreasingTimestampRejected(t *testing.T) {
 		Timestamp:    tip.Timestamp, // equal to parent -> not increasing
 		Transactions: []Transaction{cb},
 		PrevHash:     tip.Hash,
-		Difficulty:   bc.NextDifficulty(),
+		Bits:         bc.NextBits(),
 	}
 	mined, _ := Mine(block, nil)
 	if err := bc.AddBlock(mined); err == nil {
@@ -282,10 +283,10 @@ func TestNonIncreasingTimestampRejected(t *testing.T) {
 
 func TestReplaceChainRejectsForeignGenesis(t *testing.T) {
 	bc := NewBlockchain()
-	// A single block claiming huge difficulty (so it out-weighs our genesis on
+	// A single block claiming the hardest target (so it out-weighs our genesis on
 	// the work check) but with a genesis hash that isn't ours.
 	foreign := GenesisBlock()
-	foreign.Difficulty = 12
+	foreign.Bits = MinTargetBits
 	foreign.Hash = "not-our-genesis"
 	adopted, err := bc.ReplaceChain([]Block{foreign})
 	if adopted || err == nil {

@@ -51,7 +51,7 @@ func TestTwoNodeSync(t *testing.T) {
 		t.Skip("networked integration test")
 	}
 	addrA := freeAddr(t)
-	nodeA := startTestNode(t, addrA, nil, true)             // miner
+	nodeA := startTestNode(t, addrA, nil, true)                    // miner
 	nodeB := startTestNode(t, freeAddr(t), []string{addrA}, false) // syncs from A
 
 	if !waitFor(20*time.Second, func() bool { return nodeA.chain.Height() >= 3 }) {

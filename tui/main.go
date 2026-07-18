@@ -293,7 +293,7 @@ func (m model) View() string {
 		if i.Mining {
 			mining = okStyle.Render("ON")
 		}
-		fmt.Fprintf(&b, "%s live  height %s  diff %d  work %s  mempool %d  basefee %s  minfee %s  peers %d  mining %s\n",
+		fmt.Fprintf(&b, "%s live  height %s  diff %.2f  work %s  mempool %d  basefee %s  minfee %s  peers %d  mining %s\n",
 			okStyle.Render("●"), okStyle.Render(fmt.Sprint(i.Height)), i.NextDifficulty, i.Work, i.Mempool, fmtAmt(i.BaseFee), fmtAmt(i.MinRelayFee), len(i.Peers), mining)
 	}
 
@@ -304,8 +304,8 @@ func (m model) View() string {
 	blocks := m.st.blocks
 	for i := len(blocks) - 1; i >= 0 && i > len(blocks)-9; i-- {
 		bl := blocks[i]
-		fmt.Fprintf(&b, "  %s %s  %d tx  diff %d\n",
-			keyStyle.Render(fmt.Sprintf("#%d", bl.Index)), dimStyle.Render(shortHash(bl.Hash)), len(bl.Transactions), bl.Difficulty)
+		fmt.Fprintf(&b, "  %s %s  %d tx  diff %.2f\n",
+			keyStyle.Render(fmt.Sprintf("#%d", bl.Index)), dimStyle.Render(shortHash(bl.Hash)), len(bl.Transactions), difficultyOf(bl.Bits))
 	}
 
 	// Mempool.

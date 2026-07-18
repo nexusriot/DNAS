@@ -21,18 +21,22 @@ import (
 //	dnas spv [-api URL] scan <address>  find (and prove non-inclusion of) an address
 //	dnas spv [-api URL] balance <addr>  prove an address's balance against the state root
 //	dnas spv [-api URL] history <addr>  reconstruct an address's transaction history (light wallet)
+//	dnas spv [-api URL] wallet ...      persistent light wallet (add/update/status/list/forget)
 func runSPV(args []string) {
 	fs := flag.NewFlagSet("spv", flag.ExitOnError)
 	api := fs.String("api", "localhost:8080", "node HTTP API address")
 	_ = fs.Parse(args)
 	rest := fs.Args()
 	if len(rest) == 0 {
-		fmt.Println("usage: dnas spv [-api URL] <sync | verify <txhash> | scan <addr> | balance <addr> | history <addr>>")
+		fmt.Println("usage: dnas spv [-api URL] <sync | verify <txhash> | scan <addr> | balance <addr> | history <addr> | wallet ...>")
 		return
 	}
 	base := ensureHTTP(*api)
 
 	switch rest[0] {
+	case "wallet":
+		runSPVWallet(base, rest[1:])
+		return
 	case "scan":
 		if len(rest) < 2 {
 			fmt.Println("usage: dnas spv [-api URL] scan <address>")
@@ -114,7 +118,7 @@ func verifyHeaderChain(headers []core.Header) (uint64, *big.Int, error) {
 	}
 	work := new(big.Int)
 	for _, h := range headers {
-		work.Add(work, core.BlockWork(h.Difficulty))
+		work.Add(work, core.BlockWork(h.Bits))
 	}
 	return headers[len(headers)-1].Index, work, nil
 }

@@ -22,6 +22,13 @@ const (
 	DefaultNetKey   = "dnas-devnet" // shared secret authenticating the network
 	DefaultMaxPeers = 8             // maximum outbound dials
 	seenCapacity    = 100_000       // bounded gossip de-dup memory per kind
+
+	// Liveness: an established peer is pinged every pingInterval and must send
+	// something (a pong counts) within peerIdleTimeout or the connection is
+	// dropped. The timeout is comfortably larger than the interval so a single
+	// missed ping doesn't disconnect a healthy but briefly slow peer.
+	pingInterval    = 30 * time.Second
+	peerIdleTimeout = 90 * time.Second
 )
 
 // Config holds a node's network and mining settings.
@@ -34,16 +41,22 @@ type Config struct {
 	Mine          bool     // whether to run the miner
 	StateDir      string   // directory for persisted peer/ban/mempool state ("" = in-memory only)
 	Regtest       bool     // regtest mode: enable on-demand block generation (POST /generate)
+	Dandelion     bool     // relay new transactions via Dandelion++ stem/fluff (origin privacy)
 }
 
 type peer struct {
-	conn *secureConn
-	enc  *json.Encoder
-	mu   sync.Mutex // serializes writes to enc
-	addr string     // peer's advertised address (from hello)
-	id   string     // peer's authenticated identity public key
-	ip   string     // remote IP, for ban scoring
+	conn    *secureConn
+	enc     *json.Encoder
+	mu      sync.Mutex      // serializes writes to enc
+	addr    string          // peer's advertised address (from hello)
+	id      string          // peer's authenticated identity public key
+	ip      string          // remote IP, for ban scoring
+	version int             // negotiated protocol version
+	caps    map[string]bool // advertised capabilities (e.g. Dandelion++)
 }
+
+// supports reports whether the peer advertised a capability.
+func (p *peer) supports(cap string) bool { return p.caps[cap] }
 
 func (p *peer) send(m Message) {
 	p.mu.Lock()
@@ -68,9 +81,11 @@ type Node struct {
 	book    *peerbook
 	bans    *banbook
 	events  *eventBus
+	dand    *dandelion
 
 	mining atomic.Bool // whether the miner is currently active (toggle at runtime)
 	tipGen int64       // atomic; bumped whenever the tip changes to interrupt mining
+	txGen  int64       // atomic; bumped when a new tx enters the mempool, to wake an idle miner
 }
 
 // New constructs a Node. The wallet enables mining and API-side signing; if it
@@ -102,6 +117,7 @@ func New(cfg Config, chain *core.Blockchain, mp *core.Mempool, w *wallet.Wallet)
 		book:     newPeerbook(cfg.AdvertiseAddr, cfg.MaxPeers),
 		bans:     newBanbook(banThreshold),
 		events:   newEventBus(),
+		dand:     newDandelion(),
 	}
 	n.mining.Store(cfg.Mine)
 	return n
@@ -127,6 +143,7 @@ func (n *Node) Regtest() bool { return n.cfg.Regtest }
 // closed separately by the owner (Blockchain.Close).
 func (n *Node) Shutdown() {
 	n.mining.Store(false)
+	n.dand.stopAll() // cancel any pending Dandelion++ embargo timers
 	n.peersMu.Lock()
 	ps := make([]*peer, 0, len(n.peers))
 	for p := range n.peers {
@@ -234,7 +251,8 @@ func (n *Node) SubmitTx(tx core.Transaction) error {
 	}
 	if added {
 		n.markSeenTx(tx.Hash())
-		n.broadcast(Message{Type: MsgTx, Tx: &tx})
+		n.onNewTx()              // wake an idle miner so the tx isn't stuck behind the block interval
+		n.relayTx(tx, nil, true) // originate on the Dandelion++ stem (origin privacy)
 		n.publishTx(tx)
 	}
 	return nil
@@ -286,10 +304,16 @@ func (n *Node) handleConn(rawConn net.Conn) {
 		return
 	}
 
-	// Establish the encrypted, PSK-authenticated channel.
+	// Establish the encrypted, PSK-authenticated channel. A peer that fails the
+	// handshake doesn't know the network key (or is probing it); score it by IP
+	// so a persistent prober is eventually cut off. Loopback is exempt so many
+	// local nodes sharing 127.0.0.1 (tests, demos) never ban one another.
 	sc, sid, err := secureHandshake(rawConn, n.psk)
 	if err != nil {
 		log.Printf("rejected peer %s: handshake failed: %v", ip, err)
+		if bannableIP(ip) && n.bans.add(ip, banHandshake) {
+			log.Printf("banning ip %s: repeated handshake failures", ip)
+		}
 		_ = rawConn.Close()
 		return
 	}
@@ -300,6 +324,7 @@ func (n *Node) handleConn(rawConn net.Conn) {
 	// Authenticated identity exchange: each side proves it holds its identity
 	// key by signing the session id, binding the identity to this session.
 	p.send(Message{Type: MsgIdentity, PubKey: n.identity.PublicKeyHex(), Sig: n.identity.Sign(sid)})
+	_ = sc.SetReadDeadline(time.Now().Add(handshakeTimeout))
 	var idm Message
 	if err := dec.Decode(&idm); err != nil {
 		_ = sc.Close()
@@ -307,6 +332,9 @@ func (n *Node) handleConn(rawConn net.Conn) {
 	}
 	if idm.Type != MsgIdentity || !wallet.Verify(idm.PubKey, idm.Sig, sid) {
 		log.Printf("rejected peer %s: identity authentication failed", ip)
+		if bannableIP(ip) {
+			n.bans.add(ip, banHandshake)
+		}
 		_ = sc.Close()
 		return
 	}
@@ -316,9 +344,36 @@ func (n *Node) handleConn(rawConn net.Conn) {
 		return
 	}
 
+	// Protocol version + capability negotiation: drop peers speaking an
+	// incompatible version, and record capabilities (e.g. Dandelion++) for feature
+	// gating.
+	p.send(Message{Type: MsgVersion, Version: ProtocolVersion, Caps: n.caps()})
+	_ = sc.SetReadDeadline(time.Now().Add(handshakeTimeout))
+	var vm Message
+	if err := dec.Decode(&vm); err != nil {
+		_ = sc.Close()
+		return
+	}
+	if vm.Type != MsgVersion || vm.Version < MinProtocolVersion {
+		log.Printf("rejected peer %s: incompatible protocol version %d", ip, vm.Version)
+		_ = sc.Close()
+		return
+	}
+	p.version = vm.Version
+	p.caps = make(map[string]bool, len(vm.Caps))
+	for _, c := range vm.Caps {
+		p.caps[c] = true
+	}
+
 	n.addPeer(p)
 	defer n.removePeer(p)
 	log.Printf("peer connected %s id=%s", ip, short(p.id))
+
+	// Keep the connection alive: ping the peer periodically and drop it if it
+	// falls silent past the idle timeout (a half-open/dead connection).
+	stopPing := make(chan struct{})
+	defer close(stopPing)
+	go n.pingLoop(p, stopPing)
 
 	// Introduce ourselves, request peers, and start headers-first catch-up
 	// (a block locator lets the peer find our fork point cheaply).
@@ -327,11 +382,27 @@ func (n *Node) handleConn(rawConn net.Conn) {
 	p.send(n.getHeadersMsg())
 
 	for {
+		_ = sc.SetReadDeadline(time.Now().Add(peerIdleTimeout))
 		var m Message
 		if err := dec.Decode(&m); err != nil {
 			return
 		}
 		n.handleMessage(p, m)
+	}
+}
+
+// pingLoop sends a keepalive ping to p at a fixed interval until the connection
+// closes (stop is closed by handleConn's defer).
+func (n *Node) pingLoop(p *peer, stop <-chan struct{}) {
+	t := time.NewTicker(pingInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+			p.send(Message{Type: MsgPing})
+		}
 	}
 }
 
@@ -357,7 +428,14 @@ func (n *Node) handleMessage(p *peer, m Message) {
 		}
 
 	case MsgTx:
-		if m.Tx == nil || n.markSeenTx(m.Tx.Hash()) {
+		if m.Tx == nil {
+			return
+		}
+		h := m.Tx.Hash()
+		if !m.Stem {
+			n.dand.cancelEmbargo(h) // it's fluffing on the network; stop our embargo
+		}
+		if n.markSeenTx(h) {
 			return
 		}
 		if m.Tx.IsExpiredAt(n.chain.Height() + 1) {
@@ -366,7 +444,8 @@ func (n *Node) handleMessage(p *peer, m Message) {
 		if added, err := n.mempool.Add(*m.Tx); err != nil || !added {
 			return
 		}
-		n.broadcastExcept(Message{Type: MsgTx, Tx: m.Tx}, p)
+		n.onNewTx() // wake an idle miner
+		n.relayTx(*m.Tx, p, m.Stem)
 		n.publishTx(*m.Tx)
 
 	// block propagation: announce a hash, pull the body we lack
@@ -385,6 +464,15 @@ func (n *Node) handleMessage(p *peer, m Message) {
 
 	case MsgBlock:
 		if m.Block == nil || n.markSeenBlock(m.Block.Hash) {
+			return
+		}
+		// A block that is malformed on its own terms (bad PoW or merkle root) is
+		// peer misbehaviour and earns ban points; one that is well-formed but
+		// doesn't link to our tip is just a fork, handled below with a re-sync.
+		if err := m.Block.SelfValid(); err != nil {
+			if n.bans.add(p.id, banInvalidBlock) {
+				log.Printf("banning peer id=%s: invalid block: %v", short(p.id), err)
+			}
 			return
 		}
 		if err := n.chain.AddBlock(*m.Block); err != nil {
@@ -426,6 +514,12 @@ func (n *Node) handleMessage(p *peer, m Message) {
 			log.Printf("adopted chain via fallback (height=%d)", n.chain.Height())
 			n.afterNewBlock(true)
 		}
+
+	case MsgPing:
+		p.send(Message{Type: MsgPong})
+
+	case MsgPong:
+		// Liveness only: receiving anything already reset the read deadline.
 	}
 }
 
@@ -537,10 +631,62 @@ func (n *Node) broadcastExcept(m Message, except *peer) {
 	}
 }
 
+// caps returns this node's advertised protocol capabilities.
+func (n *Node) caps() []string {
+	var c []string
+	if n.cfg.Dandelion {
+		c = append(c, CapDandelion)
+	}
+	return c
+}
+
+// relayTx propagates a transaction using Dandelion++ when enabled: in the stem
+// phase it forwards to a single epoch-stable successor (or fluffs by chance, on
+// embargo timeout, or when no Dandelion-capable successor exists); a fluff-phase
+// transaction is broadcast to all peers. With Dandelion disabled it is a plain
+// broadcast, exactly as before.
+func (n *Node) relayTx(tx core.Transaction, from *peer, stemPhase bool) {
+	if !n.cfg.Dandelion || !stemPhase {
+		n.fluff(tx, from)
+		return
+	}
+	sp := n.stemSuccessor(from)
+	if sp == nil || n.dand.rollFluff() {
+		n.fluff(tx, from)
+		return
+	}
+	sp.send(Message{Type: MsgTx, Tx: &tx, Stem: true})
+	n.dand.startEmbargo(tx.Hash(), func() { n.fluff(tx, nil) })
+}
+
+// fluff broadcasts a transaction to every peer except one, ending its stem phase.
+func (n *Node) fluff(tx core.Transaction, except *peer) {
+	n.broadcastExcept(Message{Type: MsgTx, Tx: &tx}, except)
+}
+
+// stemSuccessor returns this epoch's Dandelion++ stem successor: a random,
+// epoch-stable connected peer that supports Dandelion, excluding one peer.
+func (n *Node) stemSuccessor(exclude *peer) *peer {
+	n.peersMu.Lock()
+	var cands []*peer
+	for p := range n.peers {
+		if p != exclude && p.supports(CapDandelion) {
+			cands = append(cands, p)
+		}
+	}
+	n.peersMu.Unlock()
+	return n.dand.pick(cands, time.Now())
+}
+
 func (n *Node) markSeenBlock(h string) bool { return n.seenBlk.seen(h) }
 func (n *Node) markSeenTx(h string) bool    { return n.seenTx.seen(h) }
 
 func (n *Node) onTipChanged() { atomic.AddInt64(&n.tipGen, 1) }
+
+// onNewTx signals that a transaction entered the mempool, so a miner idling
+// between blocks wakes immediately to build a block including it instead of
+// waiting out the target block interval.
+func (n *Node) onNewTx() { atomic.AddInt64(&n.txGen, 1) }
 
 // afterNewBlock runs the bookkeeping common to accepting/adopting new blocks and
 // emits a real-time event (reorg=true when the tip changed via a reorg).
@@ -573,7 +719,7 @@ func (n *Node) buildBlock() (core.Block, []core.Transaction) {
 		Transactions: append([]core.Transaction{coinbase}, txs...),
 		PrevHash:     tip.Hash,
 		BaseFee:      baseFee,
-		Difficulty:   n.chain.NextDifficulty(),
+		Bits:         n.chain.NextBits(),
 	}
 	// Commit the post-block account state root (part of the PoW-hashed header).
 	// On error the candidate keeps an empty root and AddBlock will reject it, so
@@ -589,8 +735,8 @@ func (n *Node) commitMined(mined core.Block, txs []core.Transaction) error {
 		return err
 	}
 	n.markSeenBlock(mined.Hash)
-	log.Printf("mined block %d diff=%d txs=%d reward=%s %s",
-		mined.Index, mined.Difficulty, len(txs), core.FormatAmount(core.BlockReward(mined.Index)), short(mined.Hash))
+	log.Printf("mined block %d diff=%.2f txs=%d reward=%s %s",
+		mined.Index, core.TargetDifficulty(mined.Bits), len(txs), core.FormatAmount(core.BlockReward(mined.Index)), short(mined.Hash))
 	n.mempool.Remove(txs)
 	n.onTipChanged()
 	// Announce the new block by inventory; peers pull the body if they lack it.
@@ -659,12 +805,15 @@ func (n *Node) Generate(count int) ([]string, error) {
 	return hashes, nil
 }
 
-// sleepInterruptible sleeps up to d, returning false early if the tip changes.
+// sleepInterruptible sleeps up to d, returning false early if the tip changes or
+// a new transaction arrives (so the idle miner rebuilds promptly rather than
+// waiting out the whole interval).
 func (n *Node) sleepInterruptible(d time.Duration) bool {
-	start := atomic.LoadInt64(&n.tipGen)
+	tip := atomic.LoadInt64(&n.tipGen)
+	tx := atomic.LoadInt64(&n.txGen)
 	steps := int(d / (50 * time.Millisecond))
 	for i := 0; i < steps; i++ {
-		if atomic.LoadInt64(&n.tipGen) != start {
+		if atomic.LoadInt64(&n.tipGen) != tip || atomic.LoadInt64(&n.txGen) != tx {
 			return false
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -690,11 +839,20 @@ func short(h string) string {
 	return h
 }
 
-// remoteIP returns the IP portion of a connection's remote address (the ban key).
+// remoteIP returns the IP portion of a connection's remote address (the ban key
+// for pre-identity misbehaviour such as failed handshakes).
 func remoteIP(c net.Conn) string {
 	host, _, err := net.SplitHostPort(c.RemoteAddr().String())
 	if err != nil {
 		return c.RemoteAddr().String()
 	}
 	return host
+}
+
+// bannableIP reports whether an IP should accrue ban points. Loopback is never
+// banned so that many local nodes sharing 127.0.0.1 (tests, demos, a regtest
+// setup) don't ban one another over a single misbehaving local process.
+func bannableIP(ip string) bool {
+	parsed := net.ParseIP(ip)
+	return parsed != nil && !parsed.IsLoopback()
 }

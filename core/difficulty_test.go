@@ -1,54 +1,72 @@
 package core
 
-import "testing"
+import (
+	"math/big"
+	"testing"
+)
 
-// synthBlocks builds n blocks (indices 0..n-1) evenly spaced in time, all at the
-// given difficulty. Only fields read by expectedDifficulty are populated.
-func synthBlocks(n int, spacing int64, diff int) []Block {
+// synthBits builds n blocks (indices 0..n-1) spaced `spacing` seconds apart, all
+// committing the given compact target, for driving expectedBits directly.
+func synthBits(n int, spacing int64, bits uint32) []Block {
 	b := make([]Block, n)
 	for i := range b {
-		b[i] = Block{Index: uint64(i), Timestamp: int64(i) * spacing, Difficulty: diff}
+		b[i] = Block{Index: uint64(i), Timestamp: int64(i) * spacing, Bits: bits}
 	}
 	return b
 }
 
-func TestExpectedDifficultyGenesis(t *testing.T) {
-	if got := expectedDifficulty(nil, 0); got != GenesisDifficulty {
-		t.Fatalf("genesis difficulty = %d, want %d", got, GenesisDifficulty)
+func TestExpectedBitsGenesisWindow(t *testing.T) {
+	// Until a full window of history exists, the genesis target holds.
+	blocks := synthBits(lwmaWindow+1, TargetBlockTime, GenesisBits)
+	for h := uint64(0); h <= lwmaWindow; h++ {
+		if got := expectedBits(blocks, h); got != GenesisBits {
+			t.Fatalf("expectedBits(height=%d) = %#x, want GenesisBits %#x", h, got, GenesisBits)
+		}
 	}
 }
 
-func TestExpectedDifficultyNonBoundaryUnchanged(t *testing.T) {
-	blocks := synthBlocks(10, 5, 4)
-	// height 5 is not a retarget boundary, so it keeps the previous difficulty.
-	if got := expectedDifficulty(blocks, 5); got != 4 {
-		t.Fatalf("difficulty = %d, want 4 (unchanged off-boundary)", got)
+func TestExpectedBitsStableAtTargetSpacing(t *testing.T) {
+	blocks := synthBits(lwmaWindow+1, TargetBlockTime, GenesisBits)
+	if got := expectedBits(blocks, lwmaWindow+1); got != GenesisBits {
+		t.Fatalf("on-target spacing should leave the target unchanged: got %#x, want %#x", got, GenesisBits)
 	}
 }
 
-func TestExpectedDifficultyRetarget(t *testing.T) {
-	// window = RetargetInterval blocks, expected span = window * TargetBlockTime.
-	// spacing 1 -> very fast blocks -> difficulty increases.
-	if got := expectedDifficulty(synthBlocks(10, 1, 4), 10); got != 5 {
-		t.Errorf("fast blocks: difficulty = %d, want 5 (increase)", got)
+func TestExpectedBitsHardensAndEases(t *testing.T) {
+	fast := expectedBits(synthBits(lwmaWindow+1, 1, GenesisBits), lwmaWindow+1)
+	if CompactToBig(fast).Cmp(GenesisTarget) >= 0 {
+		t.Fatalf("fast blocks should harden the target (smaller number), got %#x", fast)
 	}
-	// spacing 20 -> very slow blocks -> difficulty decreases.
-	if got := expectedDifficulty(synthBlocks(10, 20, 4), 10); got != 3 {
-		t.Errorf("slow blocks: difficulty = %d, want 3 (decrease)", got)
-	}
-	// spacing equal to the target -> on time -> unchanged.
-	if got := expectedDifficulty(synthBlocks(10, TargetBlockTime, 4), 10); got != 4 {
-		t.Errorf("on-time blocks: difficulty = %d, want 4 (unchanged)", got)
+	slow := expectedBits(synthBits(lwmaWindow+1, 6*TargetBlockTime, GenesisBits), lwmaWindow+1)
+	if CompactToBig(slow).Cmp(GenesisTarget) <= 0 {
+		t.Fatalf("slow blocks should ease the target (larger number), got %#x", slow)
 	}
 }
 
-func TestExpectedDifficultyBounds(t *testing.T) {
-	// Fast blocks cannot push difficulty above MaxDifficulty.
-	if got := expectedDifficulty(synthBlocks(10, 1, MaxDifficulty), 10); got != MaxDifficulty {
-		t.Errorf("difficulty = %d, want capped at Max %d", got, MaxDifficulty)
+func TestExpectedBitsClamped(t *testing.T) {
+	// Already at the hardest target + fast blocks: cannot go below MinTarget.
+	if got := expectedBits(synthBits(lwmaWindow+1, 1, MinTargetBits), lwmaWindow+1); got != MinTargetBits {
+		t.Fatalf("target should clamp at MinTargetBits, got %#x", got)
 	}
-	// Slow blocks cannot push it below MinDifficulty.
-	if got := expectedDifficulty(synthBlocks(10, 20, MinDifficulty), 10); got != MinDifficulty {
-		t.Errorf("difficulty = %d, want floored at Min %d", got, MinDifficulty)
+	// Already at the easiest target + slow blocks: cannot exceed PowLimit.
+	if got := expectedBits(synthBits(lwmaWindow+1, 6*TargetBlockTime, PowLimitBits), lwmaWindow+1); got != PowLimitBits {
+		t.Fatalf("target should clamp at PowLimitBits, got %#x", got)
+	}
+}
+
+func TestExpectedBitsGenesisGapDoesNotCollapse(t *testing.T) {
+	// The old bug: the far-past genesis timestamp made the first solve time
+	// enormous, which the old retarget let collapse difficulty to the floor. With
+	// per-block solve-time clamping (and that gap landing on the lowest LWMA
+	// weight), the target stays close to genesis instead of blowing out.
+	blocks := synthBits(lwmaWindow+1, TargetBlockTime, GenesisBits)
+	for i := 1; i < len(blocks); i++ {
+		blocks[i].Timestamp = 1_000_000_000 + int64(i)*TargetBlockTime // far after genesis (ts 0)
+	}
+	got := CompactToBig(expectedBits(blocks, lwmaWindow+1))
+	lo := new(big.Int).Rsh(GenesisTarget, 1) // GenesisTarget/2
+	hi := new(big.Int).Lsh(GenesisTarget, 1) // GenesisTarget*2
+	if got.Cmp(lo) < 0 || got.Cmp(hi) > 0 {
+		t.Fatalf("genesis gap moved the target too far: got %s, want within [%s, %s]", got, lo, hi)
 	}
 }

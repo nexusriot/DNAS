@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"os"
 	"strings"
@@ -32,7 +33,7 @@ func NewClient(base string) *Client {
 type Info struct {
 	Height         int      `json:"height"`
 	Tip            string   `json:"tip"`
-	NextDifficulty int      `json:"next_difficulty"`
+	NextDifficulty float64  `json:"next_difficulty"`
 	Work           string   `json:"work"`
 	Mempool        int      `json:"mempool"`
 	MinRelayFee    uint64   `json:"min_relay_fee"`
@@ -55,7 +56,7 @@ type Tx struct {
 type Block struct {
 	Index        uint64 `json:"index"`
 	Hash         string `json:"hash"`
-	Difficulty   int    `json:"difficulty"`
+	Bits         uint32 `json:"bits"`
 	Timestamp    int64  `json:"timestamp"`
 	Transactions []Tx   `json:"transactions"`
 }
@@ -67,7 +68,7 @@ type header struct {
 	MerkleRoot string `json:"merkle_root"`
 	StateRoot  string `json:"state_root"`
 	BaseFee    uint64 `json:"base_fee"`
-	Difficulty int    `json:"difficulty"`
+	Bits       uint32 `json:"bits"`
 	Nonce      uint64 `json:"nonce"`
 	Hash       string `json:"hash"`
 }
@@ -240,8 +241,8 @@ func (c *Client) VerifyTx(txHash string) (string, error) {
 	if err := c.getJSON(fmt.Sprintf("/header/%d", pr.BlockIndex), &hdr); err != nil {
 		return "", err
 	}
-	hs := fmt.Sprintf("%d|%d|%s|%s|%s|%d|%d|%d", hdr.Index, hdr.Timestamp, hdr.PrevHash, hdr.MerkleRoot, hdr.StateRoot, hdr.BaseFee, hdr.Difficulty, hdr.Nonce)
-	powOK := sha(hs) == hdr.Hash && strings.HasPrefix(hdr.Hash, strings.Repeat("0", hdr.Difficulty))
+	hs := fmt.Sprintf("%d|%d|%s|%s|%s|%d|%d|%d", hdr.Index, hdr.Timestamp, hdr.PrevHash, hdr.MerkleRoot, hdr.StateRoot, hdr.BaseFee, hdr.Bits, hdr.Nonce)
+	powOK := sha(hs) == hdr.Hash && meetsTarget(hdr.Hash, hdr.Bits)
 	h := txHash
 	for _, s := range pr.Proof {
 		if s.Right {
@@ -254,6 +255,48 @@ func (c *Client) VerifyTx(txHash string) (string, error) {
 		return fmt.Sprintf("PROVEN in block %d (%d confirmations)", pr.BlockIndex, pr.Confirmations), nil
 	}
 	return fmt.Sprintf("FAILED (pow=%v inclusion=%v)", powOK, h == hdr.MerkleRoot), nil
+}
+
+// powLimit is the easiest proof-of-work target, mirroring core.PowLimit (the
+// compact 0x1f0fffff ≈ 2^244). It is used to verify header PoW and to render a
+// human difficulty without importing the core module.
+var powLimit = compactToBig(0x1f0fffff)
+
+// compactToBig decodes a compact "bits" target (Bitcoin-style nBits), mirroring
+// core.CompactToBig, so the light client can check PoW against the real target.
+func compactToBig(bits uint32) *big.Int {
+	mantissa := bits & 0x007fffff
+	exponent := bits >> 24
+	out := new(big.Int).SetUint64(uint64(mantissa))
+	if exponent <= 3 {
+		out.Rsh(out, 8*(3-uint(exponent)))
+	} else {
+		out.Lsh(out, 8*(uint(exponent)-3))
+	}
+	return out
+}
+
+// meetsTarget reports whether a hex hash is ≤ the target encoded by bits.
+func meetsTarget(hash string, bits uint32) bool {
+	raw, err := hex.DecodeString(hash)
+	if err != nil {
+		return false
+	}
+	target := compactToBig(bits)
+	if target.Sign() <= 0 || target.Cmp(powLimit) > 0 {
+		return false
+	}
+	return new(big.Int).SetBytes(raw).Cmp(target) <= 0
+}
+
+// difficultyOf renders a compact target as a difficulty ratio (powLimit/target).
+func difficultyOf(bits uint32) float64 {
+	target := compactToBig(bits)
+	if target.Sign() <= 0 {
+		return 0
+	}
+	f, _ := new(big.Rat).SetFrac(powLimit, target).Float64()
+	return f
 }
 
 func sha(s string) string {

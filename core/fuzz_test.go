@@ -26,17 +26,16 @@ func FuzzTransactionDecode(f *testing.F) {
 
 // FuzzHeaderPoW ensures header proof-of-work checking never panics.
 func FuzzHeaderPoW(f *testing.F) {
-	f.Add([]byte(`{"index":1,"difficulty":4,"hash":"0000abcd"}`))
-	f.Add([]byte(`{"difficulty":-1}`))
-	f.Add([]byte(`{"difficulty":100000}`))
+	f.Add([]byte(`{"index":1,"bits":486604799,"hash":"0000abcd"}`))
+	f.Add([]byte(`{"bits":0}`))
+	f.Add([]byte(`{"bits":4294967295}`))
 	f.Fuzz(func(t *testing.T, data []byte) {
 		var h Header
 		if json.Unmarshal(data, &h) != nil {
 			return
 		}
-		if h.Difficulty < 0 || h.Difficulty > 1024 {
-			return // strings.Repeat with a huge/negative count is out of scope
-		}
+		// Bits is a compact uint32 target; the target comparison handles any value
+		// without a huge allocation, so no guard is needed.
 		_ = h.HasValidPoW()
 		_ = h.ComputeHash()
 	})

@@ -124,16 +124,18 @@ Optional fields on `/send`:
 - `"nonce": <n>` — override the auto nonce; **fee-bump** a stuck tx by resending
   at its nonce with a higher fee (replace-by-fee).
 
-Fees have two layers. Every block carries a **consensus base fee** (EIP-1559 style)
-that each transaction must pay and that is **burned** (removed from supply); the
-miner keeps only the tip (`fee − base fee`). The base fee rises when blocks fill
-and decays when idle. Separately, a node won't *relay* a transaction paying below
-its **dynamic minimum relay fee** (`-minrelayfee`, default 10 000 base units, which
-also rises with mempool load). See both in `/info` (`base_fee`, `min_relay_fee`),
-or ask for a recommended total:
+Fees are priced **per byte** and have two layers. Every block carries a
+**consensus base fee** (EIP-1559 style): each transaction must pay at least
+`base fee × its size`, and that part is **burned** (removed from supply); the miner
+keeps only the tip (`fee − base fee × size`). The base fee rises when blocks fill
+and decays when idle, and a block is bounded by a byte budget. Separately, a node
+won't *relay* a transaction paying below its **dynamic minimum relay fee**
+(`-minrelayfee`, a per-byte rate, default 10, which also rises with mempool load).
+See both in `/info` (`base_fee`, `min_relay_fee`, both per byte), or ask for a
+recommended per-byte rate (multiply by your tx size):
 
 ```sh
-curl -s 'localhost:8080/estimatefee?blocks=3'   # -> {base_fee, tip, fee}
+curl -s 'localhost:8080/estimatefee?blocks=3'   # -> {base_fee, tip, fee} (per byte)
 ```
 
 The transfer is signed, gossiped to peers, and confirmed when a miner includes
@@ -169,8 +171,9 @@ node seeded with just one peer learns the rest of the network automatically.
 Coins mined or received on one node appear on all of them once they sync.
 
 Useful node flags: `-advertise` (address peers should dial you at, for multi-host),
-`-maxpeers`, `-mempool`, `-minrelayfee` (base relay fee in base units; 0 disables
-the floor), `-wallet FILE`, `-db FILE`, `-netkey KEY`.
+`-maxpeers`, `-mempool`, `-minrelayfee` (base relay fee in base units **per byte**;
+0 disables the floor), `-checkpoints height:hash,…` (pin finality checkpoints),
+`-wallet FILE`, `-db FILE`, `-netkey KEY`.
 
 ## 6. Web explorer
 
@@ -226,6 +229,42 @@ dnas spv -api localhost:8080 verify <txhash>  # prove a payment IS in the chain
 dnas spv -api localhost:8080 scan <address>   # which blocks touch it (+ prove the rest don't)
 dnas spv -api localhost:8080 balance <address># PROVE its balance against the state root
 dnas spv -api localhost:8080 history <address># reconstruct its transactions (a real light wallet)
+```
+
+For a **persistent** light wallet that remembers what it watches and stays in
+sync, use `dnas spv wallet` (state lives in `spvwallet.json`, or pass `-f FILE`):
+
+```sh
+dnas spv -api localhost:8080 wallet add <address>    # watch an address; scans + prints its history
+dnas spv -api localhost:8080 wallet update           # incremental sync (only new flagged blocks)
+dnas spv -api localhost:8080 wallet update -watch    # follow /events and re-sync on each block
+dnas spv -api localhost:8080 wallet status           # print watched balances without syncing
+dnas spv -api localhost:8080 wallet list | forget <address>
+```
+
+It downloads only the blocks a compact filter flags for a watched address,
+authenticates each against its PoW-verified header, and detects reorgs — never
+trusting a served balance or downloading the whole chain.
+
+With a **key file** it becomes self-custodial — it signs locally (the key never
+leaves the client) and submits only the signed transaction:
+
+```sh
+dnas spv -api localhost:8080 wallet -key lw.json new              # create + watch own address
+dnas spv -api localhost:8080 wallet -key lw.json send <addr> 5    # prove balance/nonce, sign, submit
+```
+
+## 8b2. Fast-sync from a snapshot (skip replaying history)
+
+A new node can bootstrap from a recent trusted point instead of replaying the
+whole chain. It fetches the account state at a (checkpoint) height, verifies it
+against that header's committed **state root** (and an optional pinned checkpoint),
+then downloads and fully validates only the blocks above it — reaching the same
+cumulative work, balances proven rather than trusted:
+
+```sh
+dnas fastsync -api localhost:8080 -checkpoint 20:<hash> <addr>   # trustless bootstrap + report balances
+dnas fastsync -api localhost:8080                               # from the server's latest safe height
 ```
 
 ## 8c. Ops: config file, metrics, clean shutdown

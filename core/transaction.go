@@ -117,6 +117,16 @@ func (t Transaction) Hash() string {
 	return hex.EncodeToString(h[:])
 }
 
+// Size is the transaction's serialized byte length. Fees are priced per byte: a
+// transaction must pay at least the block's base fee for every byte it occupies
+// (see the base-fee rule in applyTxsAndCoinbase), and the mempool ranks and
+// evicts by fee rate (fee per byte). It is the length of the canonical JSON
+// encoding — the same encoding Hash uses — so every node computes the same value.
+func (t Transaction) Size() int {
+	b, _ := json.Marshal(t)
+	return len(b)
+}
+
 // NewCoinbase builds the issuance transaction paying `amount` to `to`.
 func NewCoinbase(to string, amount uint64) Transaction {
 	return Transaction{From: CoinbaseSender, To: to, Amount: amount}

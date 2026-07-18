@@ -112,7 +112,7 @@ func TestReorgRejectsInvalidSuffixLeavesChainIntact(t *testing.T) {
 		Transactions: []Transaction{NewCoinbase(carol.Address(), BlockReward(ytip.Index+1)+Coin)},
 		PrevHash:     ytip.Hash,
 		BaseFee:      y.NextBaseFee(), // structurally valid so it's rejected for the coinbase overpay
-		Difficulty:   y.NextDifficulty(),
+		Bits:         y.NextBits(),
 	}
 	bad, _ = Mine(bad, nil)
 	badChain := append(y.Blocks(), bad)

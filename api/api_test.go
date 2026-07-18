@@ -31,7 +31,7 @@ func mineOnto(t *testing.T, chain *core.Blockchain, miner string, txs []core.Tra
 		Transactions: append([]core.Transaction{cb}, txs...),
 		PrevHash:     tip.Hash,
 		BaseFee:      baseFee,
-		Difficulty:   chain.NextDifficulty(),
+		Bits:         chain.NextBits(),
 	}
 	b.StateRoot, _ = chain.NextStateRoot(b)
 	mined, ok := core.Mine(b, nil)

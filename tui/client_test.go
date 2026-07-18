@@ -28,7 +28,7 @@ func TestClientInfoAndParsing(t *testing.T) {
 		fmt.Fprint(w, `{"height":7,"mining":true,"work":"1234","next_difficulty":4,"mempool":2,"peers":["a","b"]}`)
 	})
 	mux.HandleFunc("/chain", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `[{"index":0,"hash":"g"},{"index":1,"hash":"h1","difficulty":4,"transactions":[{"from":"COINBASE","to":"x","amount":5000000000}]}]`)
+		fmt.Fprint(w, `[{"index":0,"hash":"g"},{"index":1,"hash":"h1","bits":508715007,"transactions":[{"from":"COINBASE","to":"x","amount":5000000000}]}]`)
 	})
 	mux.HandleFunc("/mempool", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `[{"from":"a","to":"b","amount":100,"fee":1}]`)
@@ -131,19 +131,27 @@ func TestClientHDWallet(t *testing.T) {
 
 func TestClientVerifyTx(t *testing.T) {
 	// A single-transaction block: the proof is empty and the merkle root is the
-	// leaf itself. Use difficulty 0 so the PoW prefix check is trivially met, and
-	// set the header hash to its own computed hash.
+	// leaf itself. Mine the header (vary the nonce) until its hash meets the
+	// easiest target, so the real target-based PoW check passes.
 	txh := "abc123"
-	// Header fields in the PoW-committed order: index|ts|prev|merkle|state|basefee|diff|nonce.
-	hs := fmt.Sprintf("%d|%d|%s|%s|%s|%d|%d|%d", 1, 0, "p", txh, "", 0, 0, 0)
-	hdrHash := sha(hs)
+	const bits = 0x1f0fffff // PowLimit, the easiest allowed target
+	// Header fields in the PoW-committed order: index|ts|prev|merkle|state|basefee|bits|nonce.
+	var nonce uint64
+	var hdrHash string
+	for {
+		hdrHash = sha(fmt.Sprintf("%d|%d|%s|%s|%s|%d|%d|%d", 1, 0, "p", txh, "", 0, bits, nonce))
+		if meetsTarget(hdrHash, bits) {
+			break
+		}
+		nonce++
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/proof/", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `{"found":true,"block_index":1,"confirmations":2,"merkle_root":%q,"proof":[]}`, txh)
 	})
 	mux.HandleFunc("/header/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, `{"index":1,"timestamp":0,"prev_hash":"p","merkle_root":%q,"state_root":"","base_fee":0,"difficulty":0,"nonce":0,"hash":%q}`, txh, hdrHash)
+		fmt.Fprintf(w, `{"index":1,"timestamp":0,"prev_hash":"p","merkle_root":%q,"state_root":"","base_fee":0,"bits":%d,"nonce":%d,"hash":%q}`, txh, bits, nonce, hdrHash)
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
@@ -152,7 +160,7 @@ func TestClientVerifyTx(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := res; got[:6] != "PROVEN" {
-		t.Fatalf("VerifyTx = %q, want it to start with PROVEN", got)
+	if len(res) < 6 || res[:6] != "PROVEN" {
+		t.Fatalf("VerifyTx = %q, want it to start with PROVEN", res)
 	}
 }

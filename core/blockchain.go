@@ -42,10 +42,10 @@ type undoEntry struct {
 // nodes would compute different genesis hashes and never agree on a chain.
 func GenesisBlock() Block {
 	b := Block{
-		Index:      0,
-		Timestamp:  GenesisTimestamp,
-		PrevHash:   GenesisPrevHash,
-		Difficulty: GenesisDifficulty,
+		Index:     0,
+		Timestamp: GenesisTimestamp,
+		PrevHash:  GenesisPrevHash,
+		Bits:      GenesisBits,
 	}
 	b.MerkleRoot = MerkleRoot(b.Transactions)
 	b.StateRoot = stateRoot(map[string]Account{}) // empty state at genesis
@@ -60,7 +60,7 @@ func NewBlockchain() *Blockchain {
 	return &Blockchain{
 		blocks: []Block{genesis},
 		state:  map[string]Account{},
-		work:   BlockWork(genesis.Difficulty),
+		work:   BlockWork(genesis.Bits),
 		undos:  [][]undoEntry{nil}, // genesis has no undo (it is never rolled back)
 	}
 }
@@ -120,11 +120,11 @@ func (bc *Blockchain) Work() *big.Int {
 	return new(big.Int).Set(bc.work)
 }
 
-// NextDifficulty is the difficulty the next mined block must satisfy.
-func (bc *Blockchain) NextDifficulty() int {
+// NextBits is the compact proof-of-work target the next mined block must satisfy.
+func (bc *Blockchain) NextBits() uint32 {
 	bc.mu.RLock()
 	defer bc.mu.RUnlock()
-	return expectedDifficulty(bc.blocks, uint64(len(bc.blocks)))
+	return expectedBits(bc.blocks, uint64(len(bc.blocks)))
 }
 
 // Headers returns the header of every block, in order — enough for a light
@@ -259,7 +259,7 @@ func (bc *Blockchain) AddBlock(block Block) error {
 	}
 	bc.blocks = append(bc.blocks, block)
 	bc.undos = append(bc.undos, undo)
-	bc.work.Add(bc.work, BlockWork(block.Difficulty))
+	bc.work.Add(bc.work, BlockWork(block.Bits))
 	return nil
 }
 
@@ -309,10 +309,23 @@ func (bc *Blockchain) ReorgFrom(forkHeight uint64, suffix []Block) (bool, error)
 // validates the suffix on a rolled-back copy of state — so a bad suffix cannot
 // corrupt the live chain — then persists and commits atomically. bc.mu held.
 func (bc *Blockchain) reorgLocked(fork int, suffix []Block) (bool, error) {
+	// Finality guards, checked before fork choice so a deep or checkpoint-violating
+	// reorg is refused regardless of how much work it claims:
+	//   - never roll back a block at or below the highest checkpoint;
+	//   - never discard more than MaxReorgDepth already-committed blocks.
+	// Neither affects initial sync or forward extension (fork == our tip, so
+	// nothing is discarded).
+	if hc := highestCheckpoint(); uint64(fork) < hc {
+		return false, fmt.Errorf("reorg would discard the checkpointed block at height %d", hc)
+	}
+	if removed := len(bc.blocks) - 1 - fork; removed > MaxReorgDepth {
+		return false, fmt.Errorf("reorg too deep: would discard %d blocks (max %d)", removed, MaxReorgDepth)
+	}
+
 	// Candidate cumulative work = shared prefix + suffix.
 	candWork := ChainWork(bc.blocks[:fork+1])
 	for _, b := range suffix {
-		candWork.Add(candWork, BlockWork(b.Difficulty))
+		candWork.Add(candWork, BlockWork(b.Bits))
 	}
 	switch candWork.Cmp(bc.work) {
 	case -1: // less work
@@ -521,35 +534,49 @@ func Load(path string) (*Blockchain, error) {
 	return bc, nil
 }
 
-// expectedDifficulty deterministically derives the required difficulty for the
-// block at `height`, given the chain up to height-1. Difficulty only changes on
-// RetargetInterval boundaries, adjusting toward TargetBlockTime.
-func expectedDifficulty(blocks []Block, height uint64) int {
-	if height == 0 {
-		return GenesisDifficulty
+// expectedBits deterministically derives the required proof-of-work target for
+// the block at `height` using an LWMA-1 (linearly-weighted moving average)
+// retarget over the last `lwmaWindow` blocks. Unlike a step retarget it adjusts
+// every block and weights recent blocks more, so it tracks the target block time
+// smoothly. Per-block solve times are clamped to [1, 6·TargetBlockTime], which
+// also neutralises the huge first gap from the far-past genesis timestamp (it no
+// longer collapses the target on the first window). The result is clamped to
+// [MinTarget, PowLimit]. Until there is a full window of history it holds the
+// genesis target.
+func expectedBits(blocks []Block, height uint64) uint32 {
+	if height <= lwmaWindow {
+		return GenesisBits
 	}
-	prevDiff := blocks[height-1].Difficulty
-	if height%RetargetInterval != 0 {
-		return prevDiff
+	N := lwmaWindow
+	maxSolve := 6 * TargetBlockTime
+	var weightedSolve int64
+	sumTarget := new(big.Int)
+	for i := 1; i <= N; i++ {
+		cur := height - uint64(N) - 1 + uint64(i) // window blocks: height-N .. height-1
+		st := blocks[cur].Timestamp - blocks[cur-1].Timestamp
+		if st < 1 {
+			st = 1
+		} else if st > maxSolve {
+			st = maxSolve
+		}
+		weightedSolve += int64(i) * st
+		sumTarget.Add(sumTarget, CompactToBig(blocks[cur].Bits))
 	}
-	window := RetargetInterval
-	actual := blocks[height-1].Timestamp - blocks[height-window].Timestamp
-	expected := int64(window) * TargetBlockTime
+	// nextTarget = avgTarget · weightedSolve / (T · N(N+1)/2). If blocks arrive at
+	// exactly TargetBlockTime the two factors cancel and the target is unchanged;
+	// faster blocks shrink it (harder), slower blocks grow it (easier).
+	avgTarget := new(big.Int).Div(sumTarget, big.NewInt(int64(N)))
+	next := new(big.Int).Mul(avgTarget, big.NewInt(weightedSolve))
+	denom := big.NewInt(TargetBlockTime * int64(N) * int64(N+1) / 2)
+	next.Div(next, denom)
 
-	diff := prevDiff
-	switch {
-	case actual < expected/2:
-		diff++
-	case actual > expected*2:
-		diff--
+	if next.Sign() <= 0 || next.Cmp(MinTarget) < 0 {
+		next = new(big.Int).Set(MinTarget)
 	}
-	if diff < MinDifficulty {
-		diff = MinDifficulty
+	if next.Cmp(PowLimit) > 0 {
+		next = new(big.Int).Set(PowLimit)
 	}
-	if diff > MaxDifficulty {
-		diff = MaxDifficulty
-	}
-	return diff
+	return BigToCompact(next)
 }
 
 // expectedBaseFee deterministically derives the base fee for the block at
@@ -607,12 +634,26 @@ func immatureCoinbase(blocks []Block, height uint64, addr string) uint64 {
 	}
 	var sum uint64
 	for i := start; i < height && i < uint64(len(blocks)); i++ {
+		if len(blocks[i].Transactions) == 0 {
+			continue // pruned/placeholder block (below a snapshot): already final, so mature
+		}
 		cb := blocks[i].Transactions[0]
 		if cb.IsCoinbase() && cb.To == addr {
 			sum += cb.Amount
 		}
 	}
 	return sum
+}
+
+// blockWeight is the total serialized size of a block's non-coinbase
+// transactions — the metered quantity bounded by MaxBlockBytes and priced by the
+// per-byte base fee.
+func blockWeight(b Block) int {
+	w := 0
+	for i := 1; i < len(b.Transactions); i++ {
+		w += b.Transactions[i].Size()
+	}
+	return w
 }
 
 // medianTimePast returns the median timestamp of the last up-to-11 blocks. A new
@@ -670,8 +711,11 @@ func validateBlockStructure(blocks []Block, block Block) error {
 	if block.Timestamp > time.Now().Unix()+MaxFutureDrift {
 		return errors.New("timestamp too far in the future")
 	}
-	if block.Difficulty != expectedDifficulty(blocks, block.Index) {
-		return fmt.Errorf("wrong difficulty %d", block.Difficulty)
+	if cp, ok := checkpointAt(block.Index); ok && block.Hash != cp {
+		return fmt.Errorf("block %d violates checkpoint (hash does not match the pinned value)", block.Index)
+	}
+	if block.Bits != expectedBits(blocks, block.Index) {
+		return fmt.Errorf("wrong pow target: bits %#x, want %#x", block.Bits, expectedBits(blocks, block.Index))
 	}
 	if block.BaseFee != expectedBaseFee(blocks, block.Index) {
 		return fmt.Errorf("wrong base fee %d, want %d", block.BaseFee, expectedBaseFee(blocks, block.Index))
@@ -687,6 +731,9 @@ func validateBlockStructure(blocks []Block, block Block) error {
 	}
 	if len(block.Transactions) > MaxBlockTxs+1 {
 		return errors.New("too many transactions")
+	}
+	if w := blockWeight(block); w > MaxBlockBytes {
+		return fmt.Errorf("block too large: %d transaction bytes (max %d)", w, MaxBlockBytes)
 	}
 	coinbase := block.Transactions[0]
 	if !coinbase.IsCoinbase() {
@@ -737,8 +784,9 @@ func applyTxsAndCoinbase(state map[string]Account, blocks []Block, block Block) 
 		if tx.HTLCRefundNotReady(height) {
 			return fail(fmt.Errorf("tx %d htlc refund before timeout (timeout %d > height %d)", i, tx.HTLC.Timeout, height))
 		}
-		if tx.Fee < baseFee {
-			return fail(fmt.Errorf("tx %d fee %d below base fee %d", i, tx.Fee, baseFee))
+		minFee := BaseFeeFor(tx, baseFee)
+		if tx.Fee < minFee {
+			return fail(fmt.Errorf("tx %d fee %d below per-byte base fee %d (%d bytes × %d)", i, tx.Fee, minFee, tx.Size(), baseFee))
 		}
 		if len(tx.Memo) > MaxMemoBytes {
 			return fail(fmt.Errorf("tx %d memo too long (%d > %d)", i, len(tx.Memo), MaxMemoBytes))
@@ -752,7 +800,7 @@ func applyTxsAndCoinbase(state map[string]Account, blocks []Block, block Block) 
 		if err := applyTxTo(state, tx, reserve, set); err != nil {
 			return fail(fmt.Errorf("tx %d: %w", i, err))
 		}
-		tips += tx.Fee - baseFee // base fee is burned; miner keeps only the tip
+		tips += tx.Fee - minFee // base fee × size is burned; miner keeps only the tip
 	}
 
 	// Miner is paid the subsidy plus tips; the base-fee portion of every fee is

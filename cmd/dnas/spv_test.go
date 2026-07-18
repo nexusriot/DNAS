@@ -23,7 +23,7 @@ func buildChain(t *testing.T) ([]core.Header, core.TxProof, string) {
 		b := core.Block{
 			Index: tip.Index + 1, Timestamp: tip.Timestamp + 1,
 			Transactions: append([]core.Transaction{cb}, txs...),
-			PrevHash:     tip.Hash, BaseFee: baseFee, Difficulty: bc.NextDifficulty(),
+			PrevHash:     tip.Hash, BaseFee: baseFee, Bits: bc.NextBits(),
 		}
 		b.StateRoot, _ = bc.NextStateRoot(b)
 		mined, ok := core.Mine(b, nil)

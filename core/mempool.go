@@ -29,7 +29,7 @@ type Mempool struct {
 	mu          sync.Mutex
 	txs         map[string]Transaction
 	max         int
-	minRelayFee uint64 // base floor when empty; 0 disables the fee floor
+	minRelayFee uint64 // base per-byte relay floor when empty; 0 disables the fee floor
 }
 
 // NewMempool returns an empty mempool with the default size limit and no fee
@@ -52,10 +52,12 @@ func NewMempoolWithPolicy(max int, minRelayFee uint64) *Mempool {
 	return &Mempool{txs: map[string]Transaction{}, max: max, minRelayFee: minRelayFee}
 }
 
-// MinFee returns the current dynamic relay-fee floor: the least fee a
-// transaction must pay to be admitted right now. It equals the configured base
-// relay fee when the pool is empty and climbs quadratically toward
-// base*feeFloorMaxMultiplier as the pool fills. Returns 0 when no floor is set.
+// MinFee returns the current dynamic relay-fee floor as a rate (base units PER
+// BYTE): the least a transaction must pay per byte to be admitted right now. It
+// equals the configured base relay fee when the pool is empty and climbs
+// quadratically toward base*feeFloorMaxMultiplier as the pool fills. A
+// transaction is admitted when its fee ≥ MinFee() × its size. Returns 0 when no
+// floor is set.
 func (m *Mempool) MinFee() uint64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -100,9 +102,11 @@ func (m *Mempool) Add(tx Transaction) (bool, error) {
 		return false, nil
 	}
 
-	// Relay policy: refuse anything paying below the current dynamic floor.
-	if floor := m.minFeeLocked(); tx.Fee < floor {
-		return false, fmt.Errorf("fee %d below current relay floor %d", tx.Fee, floor)
+	// Relay policy: refuse anything paying below the current per-byte floor for its
+	// size (floor is a rate; a bigger transaction must pay proportionally more).
+	if floor := m.minFeeLocked(); floor > 0 && tx.Fee < floor*uint64(tx.Size()) {
+		return false, fmt.Errorf("fee %d below current relay floor %d/byte × %d bytes = %d",
+			tx.Fee, floor, tx.Size(), floor*uint64(tx.Size()))
 	}
 
 	// Replace-by-fee: a conflicting tx (same sender+nonce) may only be replaced
@@ -116,15 +120,25 @@ func (m *Mempool) Add(tx Transaction) (bool, error) {
 		return true, nil
 	}
 
+	// When full, admit only by out-bidding the lowest fee *rate* (fee per byte),
+	// which this transaction then evicts — so block space, a per-byte resource, is
+	// allocated to the highest-paying transactions per byte.
 	if len(m.txs) >= m.max {
-		minHash, minFee := m.lowestFeeLocked()
-		if tx.Fee <= minFee {
-			return false, errors.New("mempool full and fee too low")
+		minHash, minRate := m.lowestRateLocked()
+		if txRate(tx) <= minRate {
+			return false, errors.New("mempool full and fee rate too low")
 		}
 		delete(m.txs, minHash)
 	}
 	m.txs[h] = tx
 	return true, nil
+}
+
+// txRate is a transaction's fee per byte, used only to rank and evict within the
+// mempool (relay policy). It is a float for ordering convenience; consensus never
+// uses it (block validity is checked with the integer per-byte base fee rule).
+func txRate(tx Transaction) float64 {
+	return float64(tx.Fee) / float64(tx.Size())
 }
 
 // conflictLocked finds a queued transaction with the same sender and nonce as
@@ -153,16 +167,17 @@ func (m *Mempool) PruneExpired(tipHeight uint64) int {
 	return n
 }
 
-// lowestFeeLocked returns the hash and fee of the cheapest queued transaction.
-// The caller must hold m.mu and the pool must be non-empty.
-func (m *Mempool) lowestFeeLocked() (hash string, fee uint64) {
-	fee = ^uint64(0)
+// lowestRateLocked returns the hash and fee rate (fee per byte) of the queued
+// transaction paying the least per byte. The caller must hold m.mu and the pool
+// must be non-empty.
+func (m *Mempool) lowestRateLocked() (hash string, rate float64) {
+	first := true
 	for h, tx := range m.txs {
-		if tx.Fee < fee {
-			fee, hash = tx.Fee, h
+		if r := txRate(tx); first || r < rate {
+			rate, hash, first = r, h, false
 		}
 	}
-	return hash, fee
+	return hash, rate
 }
 
 // All returns a snapshot of pending transactions.
@@ -192,41 +207,61 @@ func (m *Mempool) Size() int {
 	return len(m.txs)
 }
 
-// EstimateTip estimates the tip (the fee above baseFee, which is what the miner
-// actually earns) a new transaction should pay to land within the next
-// `capacity` transactions by fee priority — a simple analog of Bitcoin's
-// estimatesmartfee. It returns 0 when the pool has room for everyone (no bidding
-// needed), otherwise the marginal tip at the cutoff, so a transaction paying just
-// above it displaces the queue's tail.
-func (m *Mempool) EstimateTip(baseFee uint64, capacity int) uint64 {
-	if capacity <= 0 {
+// EstimateTip estimates the tip PER BYTE (the fee above the per-byte base fee,
+// which is what the miner actually earns) a new transaction should pay to land
+// within the next capacityBytes of block space, ranked by tip rate — a simple
+// analog of Bitcoin's estimatesmartfee. It returns 0 when all pending
+// transactions fit (no bidding needed), otherwise the tip rate of the marginal
+// transaction at the byte cutoff, so a transaction paying just above it displaces
+// the queue's tail.
+func (m *Mempool) EstimateTip(baseFee uint64, capacityBytes int) uint64 {
+	if capacityBytes <= 0 {
 		return 0
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if len(m.txs) < capacity {
-		return 0 // uncongested: room for all pending txs in the target window
+
+	type entry struct {
+		rate    float64 // tip per byte, for ranking
+		tipRate uint64  // integer tip per byte, the reported estimate
+		size    int
 	}
-	tips := make([]uint64, 0, len(m.txs))
+	entries := make([]entry, 0, len(m.txs))
+	total := 0
 	for _, tx := range m.txs {
-		if tx.Fee > baseFee {
-			tips = append(tips, tx.Fee-baseFee)
-		} else {
-			tips = append(tips, 0)
+		size := tx.Size()
+		total += size
+		var tip uint64
+		if min := BaseFeeFor(tx, baseFee); tx.Fee > min {
+			tip = tx.Fee - min
+		}
+		entries = append(entries, entry{rate: float64(tip) / float64(size), tipRate: tip / uint64(size), size: size})
+	}
+	if total <= capacityBytes {
+		return 0 // uncongested: every pending tx fits in the target window
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].rate > entries[j].rate })
+	filled := 0
+	for _, e := range entries {
+		filled += e.size
+		if filled >= capacityBytes {
+			return e.tipRate // marginal tip rate at the byte cutoff
 		}
 	}
-	sort.Slice(tips, func(i, j int) bool { return tips[i] > tips[j] })
-	return tips[capacity-1]
+	return 0
 }
 
-// Select greedily chooses up to max transactions that form a valid sequence on
-// top of the current chain state: each must have the sender's next nonce and be
-// affordable. Among ready candidates it prefers higher fees. Recipients are
-// credited in the simulation so chained spends within one block are possible.
+// Select greedily chooses transactions that form a valid sequence on top of the
+// current chain state: each must have the sender's next nonce, be affordable, and
+// pay at least its per-byte base fee. It is bounded by both max transactions and
+// MaxBlockBytes of total size. Among ready candidates it prefers the highest fee
+// rate (fee per byte), so scarce block space goes to the best-paying bytes.
+// Recipients are credited in the simulation so chained spends within one block
+// are possible.
 func (m *Mempool) Select(bc *Blockchain, max int) []Transaction {
 	all := m.All()
 	mineHeight := bc.Height() + 1 // the block we're selecting for
-	baseFee := bc.NextBaseFee()   // the next block's base fee; txs must cover it
+	baseFee := bc.NextBaseFee()   // the next block's base fee (per byte); txs must cover it
 
 	type sim struct {
 		balance uint64
@@ -245,11 +280,15 @@ func (m *Mempool) Select(bc *Blockchain, max int) []Transaction {
 	}
 
 	var selected []Transaction
+	weight := 0 // running total of selected transaction bytes (<= MaxBlockBytes)
 	used := make(map[string]bool)
 	for len(selected) < max {
 		var ready []Transaction
 		for _, tx := range all {
-			if used[tx.Hash()] || tx.IsExpiredAt(mineHeight) || tx.IsLockedAt(mineHeight) || tx.HTLCRefundNotReady(mineHeight) || tx.Fee < baseFee {
+			if used[tx.Hash()] || tx.IsExpiredAt(mineHeight) || tx.IsLockedAt(mineHeight) || tx.HTLCRefundNotReady(mineHeight) || tx.Fee < BaseFeeFor(tx, baseFee) {
+				continue
+			}
+			if weight+tx.Size() > MaxBlockBytes { // wouldn't fit the block's byte budget
 				continue
 			}
 			s := get(tx.From)
@@ -261,7 +300,7 @@ func (m *Mempool) Select(bc *Blockchain, max int) []Transaction {
 		if len(ready) == 0 {
 			break
 		}
-		sort.Slice(ready, func(i, j int) bool { return ready[i].Fee > ready[j].Fee })
+		sort.Slice(ready, func(i, j int) bool { return txRate(ready[i]) > txRate(ready[j]) })
 		pick := ready[0]
 
 		s := get(pick.From)
@@ -274,6 +313,7 @@ func (m *Mempool) Select(bc *Blockchain, max int) []Transaction {
 
 		selected = append(selected, pick)
 		used[pick.Hash()] = true
+		weight += pick.Size()
 	}
 	return selected
 }

@@ -183,5 +183,10 @@ func (s *secureConn) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+// SetReadDeadline sets the read deadline on the underlying connection, so an
+// idle read (a stalled or dead peer) fails instead of blocking forever. Used to
+// enforce a liveness timeout on established peer connections.
+func (s *secureConn) SetReadDeadline(t time.Time) error { return s.conn.SetReadDeadline(t) }
+
 // Close closes the underlying connection.
 func (s *secureConn) Close() error { return s.conn.Close() }

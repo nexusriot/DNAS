@@ -134,7 +134,23 @@ async function foldProof(leaf, proof) {
   return h;
 }
 async function headerHash(hd) {
-  return sha256hex(`${hd.index}|${hd.timestamp}|${hd.prev_hash}|${hd.merkle_root}|${hd.state_root}|${hd.base_fee}|${hd.difficulty}|${hd.nonce}`);
+  return sha256hex(`${hd.index}|${hd.timestamp}|${hd.prev_hash}|${hd.merkle_root}|${hd.state_root}|${hd.base_fee}|${hd.bits}|${hd.nonce}`);
+}
+// Compact "bits" proof-of-work target (Bitcoin-style nBits), mirroring
+// core.CompactToBig, so the browser verifies PoW against the real 256-bit target.
+function compactToBig(bits) {
+  const mantissa = BigInt(bits & 0x007fffff), exponent = BigInt(bits >>> 24);
+  return exponent <= 3n ? mantissa >> (8n * (3n - exponent)) : mantissa << (8n * (exponent - 3n));
+}
+const POW_LIMIT = compactToBig(0x1f0fffff);
+function meetsTarget(hashHex, bits) {
+  const target = compactToBig(bits);
+  if (target <= 0n || target > POW_LIMIT) return false;
+  return BigInt("0x" + hashHex) <= target;
+}
+function difficultyOf(bits) {
+  const target = compactToBig(bits);
+  return target <= 0n ? 0 : Number((POW_LIMIT * 1000n) / target) / 1000;
 }
 
 function txLine(tx) {
@@ -154,7 +170,7 @@ function renderBlocks(chain) {
     const txs = (b.transactions || []);
     card.innerHTML =
       `<div class="row"><span><span class="idx">#${b.index}</span> <span class="mono muted">${short(b.hash, 16)}</span></span>`
-      + `<span class="muted">${txs.length} tx · diff ${b.difficulty} · ${when(b.timestamp)}</span></div>`
+      + `<span class="muted">${txs.length} tx · diff ${difficultyOf(b.bits).toFixed(2)} · ${when(b.timestamp)}</span></div>`
       + `<div class="txs">${txs.map(txLine).join("") || '<span class="muted">no transactions</span>'}</div>`;
     card.onclick = () => {
       const t = card.querySelector(".txs");
@@ -179,7 +195,7 @@ async function refresh() {
     document.getElementById("chips").innerHTML = [
       ["height", info.height],
       ["tip", short(info.tip, 10)],
-      ["next diff", info.next_difficulty],
+      ["next diff", Number(info.next_difficulty).toFixed(2)],
       ["work", info.work],
       ["mempool", info.mempool],
       ["base fee", fmt(info.base_fee)],
@@ -237,7 +253,7 @@ async function verifyTx() {
   try {
     const pr = await j("/proof/" + txh);                 // full node supplies proof
     const hd = await j("/header/" + pr.block_index);     // ...and the block header
-    const powOK = (await headerHash(hd)) === hd.hash && hd.hash.startsWith("0".repeat(hd.difficulty));
+    const powOK = (await headerHash(hd)) === hd.hash && meetsTarget(hd.hash, hd.bits);
     const root = await foldProof(txh, pr.proof);         // fold the proof ourselves
     const incOK = root === hd.merkle_root;
     out.innerHTML =

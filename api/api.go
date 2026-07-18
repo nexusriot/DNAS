@@ -68,6 +68,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/headers", s.headers)        // all block headers
 	mux.HandleFunc("/header/", s.header)         // one header by height
 	mux.HandleFunc("/block/", s.block)           // one full block body by height
+	mux.HandleFunc("/snapshot/", s.snapshot)     // full account state at a height (fast-sync)
 	mux.HandleFunc("/proof/", s.proof)           // inclusion proof for a tx hash
 	mux.HandleFunc("/cfilters", s.cfilters)      // compact block filters (all)
 	mux.HandleFunc("/cfilter/", s.cfilter)       // one compact filter by height
@@ -138,7 +139,8 @@ func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"height":          tip.Index,
 		"tip":             tip.Hash,
-		"next_difficulty": s.node.Chain().NextDifficulty(),
+		"next_bits":       s.node.Chain().NextBits(),
+		"next_difficulty": core.TargetDifficulty(s.node.Chain().NextBits()),
 		"work":            s.node.Chain().Work().String(),
 		"mempool":         s.node.Mempool().Size(),
 		"min_relay_fee":   s.node.Mempool().MinFee(),
@@ -148,11 +150,12 @@ func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// estimateFee recommends a total fee for a transaction to confirm within roughly
-// `blocks` blocks: GET /estimatefee?blocks=N (default 3). It combines the
-// consensus base fee (mandatory, burned) with a tip estimated from current
-// mempool congestion, and never returns below the node's relay floor (or the tx
-// wouldn't even be admitted). The result splits out base_fee and tip so callers
+// estimateFee recommends a fee RATE (base units per byte) for a transaction to
+// confirm within roughly `blocks` blocks: GET /estimatefee?blocks=N (default 3).
+// It combines the consensus per-byte base fee (mandatory, burned) with a tip rate
+// estimated from current mempool congestion, and never returns below the node's
+// relay floor. Callers multiply the returned per-byte fee by their transaction's
+// size to get the total to pay. The result splits out base_fee and tip so callers
 // see where the fee goes.
 func (s *Server) estimateFee(w http.ResponseWriter, r *http.Request) {
 	blocks := 3
@@ -169,17 +172,18 @@ func (s *Server) estimateFee(w http.ResponseWriter, r *http.Request) {
 	}
 	baseFee := s.node.Chain().NextBaseFee()
 	relayFloor := s.node.Mempool().MinFee()
-	tip := s.node.Mempool().EstimateTip(baseFee, blocks*core.MaxBlockTxs)
-	fee := baseFee + tip
+	tip := s.node.Mempool().EstimateTip(baseFee, blocks*core.MaxBlockBytes)
+	fee := baseFee + tip  // per-byte rate
 	if fee < relayFloor { // must at least clear the relay floor to be admitted
 		fee = relayFloor
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"blocks":        blocks,
+		"per_byte":      true,
 		"base_fee":      baseFee,
 		"tip":           fee - baseFee,
 		"fee":           fee,
-		"fee_fmt":       core.FormatAmount(fee),
+		"fee_fmt":       core.FormatAmount(fee) + "/byte",
 		"min_relay_fee": relayFloor,
 	})
 }
@@ -196,10 +200,10 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s gauge\n%s %v\n", name, help, name, name, v)
 	}
 	gauge("dnas_height", "Current chain height.", tip.Index)
-	gauge("dnas_difficulty", "Difficulty of the next block.", s.node.Chain().NextDifficulty())
+	gauge("dnas_difficulty", "Difficulty of the next block (PowLimit/target ratio).", core.TargetDifficulty(s.node.Chain().NextBits()))
 	gauge("dnas_mempool_size", "Pending transactions in the mempool.", s.node.Mempool().Size())
-	gauge("dnas_min_relay_fee", "Current dynamic minimum relay fee (base units).", s.node.Mempool().MinFee())
-	gauge("dnas_base_fee", "Current EIP-1559 base fee for the next block (base units).", s.node.Chain().NextBaseFee())
+	gauge("dnas_min_relay_fee", "Current dynamic minimum relay fee (base units per byte).", s.node.Mempool().MinFee())
+	gauge("dnas_base_fee", "Current EIP-1559 base fee for the next block (base units per byte).", s.node.Chain().NextBaseFee())
 	gauge("dnas_peers", "Connected peers.", len(s.node.PeerAddrs()))
 	gauge("dnas_mining", "1 if mining is active, else 0.", mining)
 }
@@ -556,6 +560,34 @@ func (s *Server) block(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, b)
+}
+
+// snapshot serves the full account state as of a height (GET /snapshot/{height}),
+// for fast-sync: a new node fetches this plus the PoW-verified header chain,
+// checks the accounts hash to the header's committed state root, and bootstraps
+// without replaying every block. The path also accepts /snapshot/latest for a
+// safely-buried recent height (tip − coinbase maturity).
+func (s *Server) snapshot(w http.ResponseWriter, r *http.Request) {
+	arg := strings.TrimPrefix(r.URL.Path, "/snapshot/")
+	var height uint64
+	if arg == "latest" || arg == "" {
+		if tip := s.node.Chain().Height(); tip > core.CoinbaseMaturity {
+			height = tip - core.CoinbaseMaturity
+		}
+	} else {
+		h, err := strconv.ParseUint(arg, 10, 64)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid height")
+			return
+		}
+		height = h
+	}
+	snap, ok := s.node.Chain().SnapshotAt(height)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "no such height")
+		return
+	}
+	writeJSON(w, http.StatusOK, snap)
 }
 
 // proof returns a transaction-inclusion (SPV) proof: /proof/{txhash}.

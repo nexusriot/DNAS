@@ -2,14 +2,18 @@ package node
 
 import "sync"
 
-// Ban scoring: peers accumulate points for misbehaviour and are banned once they
-// reach the threshold. Scores are keyed by remote IP (harder to rotate than a
-// keypair) and last for the process lifetime.
+// Ban scoring: peers accumulate points for misbehaviour and are cut off once
+// they reach the threshold. The key depends on when the misbehaviour is
+// detectable: failed handshakes happen before a peer proves an identity, so they
+// are keyed by remote IP (loopback exempt, see bannableIP); protocol-level
+// misbehaviour after authentication (bad headers, invalid blocks) is keyed by
+// the peer's authenticated identity. Scores persist across a graceful restart
+// (see persist.go) and otherwise last the process lifetime.
 const (
 	banThreshold    = 100
-	banHandshake    = 20 // failed secure/identity handshake
-	banBadHeaders   = 34 // served an internally-invalid header chain
-	banInvalidBlock = 20 // served a block that fails PoW/structure
+	banHandshake    = 20 // failed secure/identity handshake (keyed by IP)
+	banBadHeaders   = 34 // served an internally-invalid header chain (keyed by identity)
+	banInvalidBlock = 20 // served a block that fails PoW/structure (keyed by identity)
 )
 
 type banbook struct {

@@ -17,7 +17,11 @@ Module `github.com/nexusriot/DNAS/node` — the peer-to-peer daemon.
   run over it transparently). Returns a session id used to bind node identities.
 - Node identity: after the encrypted handshake, each side signs the session id
   with its Ed25519 key (`MsgIdentity`) to prove who it is.
-- `ban.go` — `banbook`: ban scoring keyed by peer identity for misbehaviour.
+- `ban.go` — `banbook`: ban scoring. Failed handshakes are scored by IP (loopback
+  exempt); post-authentication fraud (bad header chains, or blocks failing their own
+  `SelfValid` PoW/merkle check) by identity. A plain fork is not penalised.
+- Keepalive: an established connection is pinged (`ping`/`pong`) and dropped if it
+  falls silent past an idle read deadline, so a dead peer doesn't leak a slot.
 - `peerbook.go` — known-peer bookkeeping for discovery: dedup, self-exclusion
   and an outbound-dial cap.
 - `seen.go` — bounded FIFO `seenSet` for gossip de-duplication.
@@ -26,8 +30,14 @@ Module `github.com/nexusriot/DNAS/node` — the peer-to-peer daemon.
   pulled and applied via `ReorgFrom`. `getchain`/`chain` remains a deep-fork /
   bootstrap fallback.
 - `protocol.go` — the JSON message envelope and message types: `identity`,
-  `hello`, `getpeers`/`peers`, `tx`, `inv`/`getdata`/`block`,
-  `getheaders`/`headers` (+locator), `getblocks`/`blocks`, and `getchain`/`chain`.
+  `version` (protocol version + capability negotiation), `hello`,
+  `getpeers`/`peers`, `tx` (with a Dandelion++ `stem` flag),
+  `inv`/`getdata`/`block`, `getheaders`/`headers` (+locator),
+  `getblocks`/`blocks`, `getchain`/`chain`, and `ping`/`pong` (keepalive).
+- `dandelion.go` — Dandelion++ transaction relay: a new tx is forwarded down a
+  private **stem** to one epoch-stable successor, then **fluffs** into a normal
+  broadcast (by chance, on embargo timeout, or when no capable successor exists),
+  hiding its origin. `relayTx`/`fluff`/`stemSuccessor` in `node.go` drive it.
 - `events.go` — a tiny in-process publish/subscribe bus. `Node.Subscribe()`
   hands out a buffered `<-chan Event` plus an unsubscribe func; an
   `Event{Type: "block"|"reorg"|"tx", …}` is emitted on mined/accepted/synced

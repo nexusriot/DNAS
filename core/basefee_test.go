@@ -58,21 +58,25 @@ func TestBaseFeeBurnedAndEnforced(t *testing.T) {
 		t.Fatal("base fee should be non-zero on a devnet")
 	}
 
-	// A transaction paying below the base fee cannot be mined.
-	low := signedTx(t, alice, bob.Address(), Coin, baseFee-1, 0)
+	// A transaction paying below its per-byte base fee (base fee × size) cannot be
+	// mined. A tiny total fee is far below base fee × ~250 bytes.
+	low := signedTx(t, alice, bob.Address(), Coin, baseFee, 0)
 	if err := bc.AddBlock(mineOn(t, bc, miner.Address(), []Transaction{low})); err == nil {
-		t.Fatal("a transaction paying below the base fee must be rejected")
+		t.Fatal("a transaction paying below its per-byte base fee must be rejected")
 	}
 
-	// One paying base fee + a tip: the miner gets reward + tip; the base fee burns.
-	tip := 7 * Coin
-	good := signedTx(t, alice, bob.Address(), Coin, baseFee+tip, 0)
+	// One paying base fee × size + a tip: the miner gets reward + tip; the base
+	// fee (× size) burns. Pick a fee comfortably above the per-byte minimum.
+	tip := uint64(7 * Coin)
+	fee := baseFee*2000 + tip // 2000 exceeds the tx's byte size, so the tip is well-defined
+	good := signedTx(t, alice, bob.Address(), Coin, fee, 0)
+	burned := BaseFeeFor(good, baseFee)
 	if err := bc.AddBlock(mineOn(t, bc, miner.Address(), []Transaction{good})); err != nil {
-		t.Fatalf("a transaction paying at/above the base fee should be accepted: %v", err)
+		t.Fatalf("a transaction paying at/above its per-byte base fee should be accepted: %v", err)
 	}
 	h := bc.Height()
-	if got, want := bc.Balance(miner.Address()), BlockReward(h)+uint64(tip); got != want {
-		t.Fatalf("miner = %d, want reward+tip %d (base fee %d burned, not paid to miner)", got, want, baseFee)
+	if got, want := bc.Balance(miner.Address()), BlockReward(h)+(fee-burned); got != want {
+		t.Fatalf("miner = %d, want reward+tip %d (base fee %d burned, not paid to miner)", got, want, burned)
 	}
 	if bc.Balance(bob.Address()) != Coin {
 		t.Fatalf("bob = %d, want %d", bc.Balance(bob.Address()), Coin)

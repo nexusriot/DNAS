@@ -48,6 +48,8 @@ func main() {
 		runWallet(args[1:])
 	case "spv":
 		runSPV(args[1:])
+	case "fastsync":
+		runFastSync(args[1:])
 	case "htlc":
 		runHTLC(args[1:])
 	case "help", "-h", "--help":
@@ -72,6 +74,9 @@ Usage:
   dnas spv [-api URL] scan <address>  find/prove non-inclusion of an address
   dnas spv [-api URL] balance <addr>  prove an address's balance (state proof)
   dnas spv [-api URL] history <addr>  reconstruct an address's history (light wallet)
+  dnas spv [-api URL] wallet ...      persistent light wallet (add/update/status/watch)
+  dnas spv [-api URL] wallet -key F new|send <to> <amount>   self-custodial light wallet (signs locally)
+  dnas fastsync [-api URL] [-checkpoint H:HASH]   bootstrap state from a verified snapshot
   dnas htlc new                       mint a preimage + hash for an atomic swap
   dnas htlc <address|claim|refund>    build hash-time-locked contract spends
   dnas version                        print the build version
@@ -87,7 +92,8 @@ Node flags:
   -maxpeers N     maximum outbound peer connections (default 8)
   -mempool N      max pending transactions (default 5000)
   -mine           enable mining
-  -regtest        regtest mode: mine blocks on demand via POST /generate`)
+  -regtest        regtest mode: mine blocks on demand via POST /generate
+  -checkpoints L  finality checkpoints, comma-separated height:hash pairs`)
 }
 
 // walletPassphrase reads the optional at-rest encryption passphrase from the
@@ -295,7 +301,21 @@ func runNode(args []string) {
 	minRelayFee := fs.Int("minrelayfee", cfg.integer("minrelayfee", int(core.DefaultMinRelayFee)), "base minimum relay fee in base units (rises with mempool load; 0 disables)")
 	mine := fs.Bool("mine", cfg.boolean("mine", false), "enable mining")
 	regtest := fs.Bool("regtest", cfg.boolean("regtest", false), "regtest mode: enable on-demand block generation (POST /generate)")
+	dandelion := fs.Bool("dandelion", cfg.boolean("dandelion", true), "relay new transactions via Dandelion++ stem/fluff (origin privacy)")
+	checkpoints := fs.String("checkpoints", cfg.str("checkpoints", ""), "finality checkpoints as comma-separated height:hash pairs")
 	_ = fs.Parse(args)
+
+	// Pin any finality checkpoints before syncing, so a block at a checkpointed
+	// height must match and no reorg may fork below it.
+	for _, cp := range parsePeers(*checkpoints) {
+		height, hash, ok := strings.Cut(cp, ":")
+		h, err := strconv.ParseUint(strings.TrimSpace(height), 10, 64)
+		if !ok || err != nil || strings.TrimSpace(hash) == "" {
+			log.Fatalf("bad -checkpoints entry %q (want height:hash)", cp)
+		}
+		core.AddCheckpoint(h, strings.TrimSpace(hash))
+		log.Printf("checkpoint pinned: height %d", h)
+	}
 
 	// In regtest, isolate the network by default (a distinct pre-shared key) so a
 	// local test node can't accidentally peer with a devnet, unless the operator
@@ -337,6 +357,7 @@ func runNode(args []string) {
 		Mine:          *mine,
 		StateDir:      filepath.Dir(*dbPath), // persist peers/bans/mempool beside the chain
 		Regtest:       *regtest,
+		Dandelion:     *dandelion,
 	}, chain, mp, w)
 	n.Start()
 
@@ -463,8 +484,8 @@ func repl(n *node.Node) {
 			fmt.Println(n.Wallet().Address())
 		case "info":
 			tip := n.Chain().Tip()
-			fmt.Printf("height=%d diff(next)=%d tip=%s mempool=%d peers=%d\n",
-				tip.Index, n.Chain().NextDifficulty(), tip.Hash[:10], n.Mempool().Size(), len(n.PeerAddrs()))
+			fmt.Printf("height=%d diff(next)=%.2f tip=%s mempool=%d peers=%d\n",
+				tip.Index, core.TargetDifficulty(n.Chain().NextBits()), tip.Hash[:10], n.Mempool().Size(), len(n.PeerAddrs()))
 		case "peers":
 			fmt.Println(n.PeerAddrs())
 		case "mempool":

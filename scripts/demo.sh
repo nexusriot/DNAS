@@ -119,8 +119,11 @@ if command -v python3 >/dev/null 2>&1; then
 import sys, json, hashlib
 proof = json.loads(sys.argv[1]); hdr = json.loads(sys.argv[2]); leaf = sys.argv[3]
 def sha(x): return hashlib.sha256(x.encode()).hexdigest()
-hs = "{}|{}|{}|{}|{}|{}|{}|{}".format(hdr["index"], hdr["timestamp"], hdr["prev_hash"], hdr["merkle_root"], hdr["state_root"], hdr["base_fee"], hdr["difficulty"], hdr["nonce"])
-pow_ok = sha(hs) == hdr["hash"] and hdr["hash"].startswith("0" * hdr["difficulty"])
+hs = "{}|{}|{}|{}|{}|{}|{}|{}".format(hdr["index"], hdr["timestamp"], hdr["prev_hash"], hdr["merkle_root"], hdr["state_root"], hdr["base_fee"], hdr["bits"], hdr["nonce"])
+def compact_to_big(bits):
+    mant, exp = bits & 0x007fffff, bits >> 24
+    return mant >> (8 * (3 - exp)) if exp <= 3 else mant << (8 * (exp - 3))
+pow_ok = sha(hs) == hdr["hash"] and int(hdr["hash"], 16) <= compact_to_big(hdr["bits"])
 h = leaf
 for s in proof["proof"]:
     h = sha(h + s["hash"]) if s["right"] else sha(s["hash"] + h)

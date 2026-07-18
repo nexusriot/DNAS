@@ -39,12 +39,15 @@ see [DESIGN.md](DESIGN.md).
   sender after a timeout height (the *refund* branch). Revealing the preimage
   on-chain is what enables **cross-chain atomic swaps**; `dnas htlc` builds and
   spends them and `scripts/htlc-demo.sh` walks both branches end to end.
-- **Issuance & an EIP-1559 base fee.** New coins are created only by the coinbase
-  transaction, paying the miner `reward + tips`. The reward starts at 50 DNAS and
-  halves every 210 000 blocks. Each block also has a **consensus base fee** that
-  every transaction must pay and that is **burned** (removed from supply); the
-  miner keeps only the tip (`fee − base fee`). The base fee adjusts each block
-  toward a target fullness, so it rises under load and decays when idle.
+- **Issuance & a per-byte EIP-1559 base fee.** New coins are created only by the
+  coinbase transaction, paying the miner `reward + tips`. The reward starts at 50
+  DNAS and halves every 210 000 blocks. Each block also has a **consensus base
+  fee priced per byte**: every transaction must pay at least `base fee × its size`,
+  and that portion is **burned** (removed from supply); the miner keeps only the
+  tip (`fee − base fee × size`). The base fee adjusts each block toward a target
+  fullness, so it rises under load and decays when idle, and a block is bounded by
+  `MaxBlockBytes` of transaction data — block space is a metered, priced resource
+  and the mempool ranks transactions by fee *rate* (fee per byte).
 - **Coinbase maturity.** A freshly-mined coinbase reward cannot be spent until it
   is buried under `CoinbaseMaturity` further blocks (3 here; Bitcoin uses 100).
   Both consensus and the miner's own block builder enforce it, so a reorg that
@@ -69,18 +72,37 @@ see [DESIGN.md](DESIGN.md).
   balance and nonce — not just transaction inclusion. The bundled `dnas spv`
   command is such a light client: `sync`, `verify <txhash>`, `scan <address>`,
   `balance <address>` (state proof), and `history <address>` (reconstructs a
-  wallet's transfers from filters + authenticated blocks).
+  wallet's transfers from filters + authenticated blocks). `dnas spv wallet` is a
+  **persistent** light wallet: it watches addresses across runs, stores its
+  scanned height and reconstructed balances, syncs incrementally (downloading only
+  new filter-flagged blocks), detects reorgs, and can `-watch` the live event
+  stream. With a key file it is also **self-custodial**: `dnas spv wallet send`
+  proves the balance/nonce trustlessly, signs locally (the key never leaves the
+  client), and submits only the signed transaction.
+- **Snapshot fast-sync.** Because each header commits a state root, a new node can
+  bootstrap from a recent trusted point without replaying the whole chain:
+  `dnas fastsync` fetches the account state at a (checkpoint) height, verifies it
+  against the header's committed state root, then downloads and fully validates
+  only the blocks above it — reaching the same cumulative work, balances proven
+  rather than trusted.
 - **Deterministic genesis.** Every node computes the same genesis block, so
   independent nodes can actually agree on one chain.
 - **Most-work consensus with a deterministic tie-break, MTP timestamps, and
-  reorgs.** Proof of work (leading-zero hash) with a deterministic difficulty
-  retarget. Peers adopt the chain with the greatest cumulative work
+  reorgs.** Proof of work is a **256-bit compact target** (Bitcoin-style nBits),
+  retargeted every block by an **LWMA** toward the target block time (continuous,
+  not the old coarse 3–5 steps). Peers adopt the chain with the greatest
+  cumulative work
   (Σ 16^difficulty); equal-work forks are broken by preferring the smaller tip
   hash, so every node converges on the same canonical chain. A block's timestamp
   must exceed the median of the last 11 (median-time-past), bounding timestamp
   manipulation while tolerating small out-of-order stamps. Switching chains is a
   true **reorg**: state is rolled back to the common ancestor via per-block undo
   logs and only the new suffix is applied — no replay from genesis.
+- **Finality: bounded reorgs + checkpoints.** A reorg that would discard more than
+  `MaxReorgDepth` (100) committed blocks, or fork below a pinned **checkpoint**, is
+  refused — settled history is final, so a deep-reorg attack can't rewrite it.
+  Genesis is an implicit checkpoint; operators pin more with
+  `-checkpoints height:hash,…`. Initial sync and forward extension are unaffected.
 
 ## Networking & security
 
@@ -90,9 +112,20 @@ see [DESIGN.md](DESIGN.md).
   dropped, and traffic is AES-256-GCM encrypted. Each peer then proves its
   **Ed25519 node identity** by signing the session id, so peers are
   cryptographically identified (not just "knows the key").
-- **Ban scoring.** Peers that misbehave (e.g. serve an internally-invalid header
-  chain) accrue ban points by identity and are cut off past a threshold; a
-  simple fork is *not* penalised.
+- **Ban scoring.** Peers that misbehave accrue ban points and are cut off past a
+  threshold: failed handshakes are scored by IP (loopback exempt), and
+  post-authentication fraud — a bad header chain, or a block that fails its own
+  PoW/merkle root — by identity. A simple fork is *not* penalised.
+- **Keepalive.** Idle connections are pinged and dropped if they fall silent past
+  a timeout, so a half-open (dead) peer doesn't leak a goroutine and slot.
+- **Protocol version + capabilities.** After the handshake, peers exchange a
+  protocol version (incompatible peers are dropped) and capability flags, so the
+  wire format can evolve and optional features are negotiated per connection.
+- **Dandelion++ transaction privacy.** New transactions are relayed along a
+  private *stem* (forwarded to one epoch-stable peer) before *fluffing* into a
+  normal broadcast, so a network observer can't easily pinpoint the origin; an
+  embargo timer guarantees delivery if a stem peer stalls. On by default
+  (`-dandelion`), it degrades to plain broadcast when disabled.
 - **Headers-first, ranged sync + inventory gossip.** New blocks are announced by
   hash (`inv`); peers pull only the bodies they lack (`getdata`). Catching up is
   headers-first: fetch and PoW-check headers (`getheaders`/`headers`), then
@@ -103,14 +136,14 @@ see [DESIGN.md](DESIGN.md).
 - **Peer discovery.** Nodes gossip the addresses they know (`getpeers`/`peers`),
   so a node seeded with a single peer discovers the rest and dials them, up to
   `-maxpeers`. Self-dials and duplicates are avoided.
-- **Bounded memory & dynamic relay fee.** The mempool is capped and evicts the
-  lowest-fee transaction under pressure; the gossip de-duplication sets are
-  bounded FIFOs, so a long-running node's memory does not grow without limit. It
-  also enforces a **dynamic minimum relay fee** (`-minrelayfee`) that starts at a
-  configured base and rises quadratically as the pool fills — cheap to relay on
-  an idle devnet, priced up under load. This is *local relay policy*, not a
-  consensus base fee: a block that includes an under-floor transaction is still
-  valid.
+- **Bounded memory & dynamic relay fee.** The mempool is capped and, under
+  pressure, evicts the transaction paying the least *per byte* (fee rate); the
+  gossip de-duplication sets are bounded FIFOs, so a long-running node's memory
+  does not grow without limit. It also enforces a **dynamic minimum relay fee**
+  (`-minrelayfee`, a per-byte rate) that starts at a configured base and rises
+  quadratically as the pool fills — cheap to relay on an idle devnet, priced up
+  under load. This is *local relay policy*, not the consensus base fee: a block
+  that includes an under-floor transaction is still valid.
 - **Persistent soft state.** Alongside the append-only chain store, a node
   persists its known peers, ban scores, and pending mempool beside the db file
   and restores them on the next start, so a graceful restart resumes warm (bans
@@ -216,9 +249,11 @@ graceful restart resumes warm.
 | `-netkey`    | `dnas-devnet`  | pre-shared network key; **peers must match**   |
 | `-maxpeers`  | `8`            | maximum outbound peer connections              |
 | `-mempool`   | `5000`         | max pending transactions                       |
-| `-minrelayfee` | `10000`      | base min relay fee (base units); rises with mempool load; 0 disables |
+| `-minrelayfee` | `10`         | base min relay fee (base units **per byte**); rises with mempool load; 0 disables |
 | `-mine`      | off            | enable mining                                  |
 | `-regtest`   | off            | regtest mode: mine on demand via `POST /generate` (isolated netkey) |
+| `-dandelion` | on             | relay new transactions via Dandelion++ stem/fluff (origin privacy) |
+| `-checkpoints` | —            | finality checkpoints, comma-separated `height:hash` pairs |
 | `-config`    | —              | JSON config file (flags override its values)   |
 
 A node shuts down cleanly on `SIGINT`/`SIGTERM` (stops mining, closes peers,
@@ -249,12 +284,13 @@ go run ./cmd/dnas node -listen :3001 -api :8081 -peers localhost:3000 -mine \
 | GET    | `/mempool`        | pending transactions                                          |
 | GET    | `/peers`          | connected peers                                               |
 | GET    | `/address`        | this node's wallet address                                    |
-| GET    | `/estimatefee`    | `?blocks=N` → recommended fee (base fee + estimated tip)       |
+| GET    | `/estimatefee`    | `?blocks=N` → recommended fee **rate** per byte (base fee + estimated tip) |
 | GET    | `/headers`        | all block headers (SPV)                                       |
 | GET    | `/header/{index}` | one block header (SPV)                                        |
 | GET    | `/block/{index}`  | one full block body (light clients fetch only flagged blocks) |
 | GET    | `/proof/{txhash}` | transaction-inclusion merkle proof (SPV)                      |
 | GET    | `/stateproof/{addr}` | proof of an address's balance/nonce vs the header state root |
+| GET    | `/snapshot/{height}` | full account state at a height (fast-sync; `/snapshot/latest`) |
 | GET    | `/cfilters`       | compact block filters for every block (light-client scan)     |
 | GET    | `/cfilter/{index}`| one block's compact filter                                    |
 | GET    | `/cfheaders`      | the filter-header chain (BIP157-style)                        |

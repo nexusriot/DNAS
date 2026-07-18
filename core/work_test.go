@@ -5,20 +5,30 @@ import (
 	"testing"
 )
 
+// bitsFor returns the compact target with the low `zeroBytes*8` bits free — i.e.
+// work ≈ 2^(8*zeroBytes). Used to build blocks of known relative work for tests.
+func bitsFor(highBit uint) uint32 { return BigToCompact(powOfTwoMinusOne(highBit)) }
+
 func TestBlockWork(t *testing.T) {
-	// 16^difficulty
-	cases := map[int]int64{0: 1, 1: 16, 2: 256, 4: 65536}
-	for diff, want := range cases {
-		if got := BlockWork(diff); got.Cmp(big.NewInt(want)) != 0 {
-			t.Errorf("BlockWork(%d) = %s, want %d", diff, got, want)
-		}
+	// work = 2^256/(target+1): a harder (smaller) target yields more work.
+	if BlockWork(GenesisBits).Sign() <= 0 {
+		t.Fatal("genesis work should be positive")
+	}
+	if BlockWork(MinTargetBits).Cmp(BlockWork(GenesisBits)) <= 0 {
+		t.Fatal("hardest target should carry more work than genesis")
+	}
+	if BlockWork(GenesisBits).Cmp(BlockWork(PowLimitBits)) <= 0 {
+		t.Fatal("genesis should carry more work than the easiest target")
+	}
+	if BlockWork(0).Sign() != 0 {
+		t.Fatal("a zero/invalid target should carry zero work")
 	}
 }
 
 func TestChainWorkSumsBlocks(t *testing.T) {
-	blocks := []Block{{Difficulty: 2}, {Difficulty: 2}, {Difficulty: 3}}
-	// 256 + 256 + 4096
-	want := big.NewInt(256 + 256 + 4096)
+	blocks := []Block{{Bits: GenesisBits}, {Bits: GenesisBits}, {Bits: MinTargetBits}}
+	want := new(big.Int).Add(BlockWork(GenesisBits), BlockWork(GenesisBits))
+	want.Add(want, BlockWork(MinTargetBits))
 	if got := ChainWork(blocks); got.Cmp(want) != 0 {
 		t.Fatalf("ChainWork = %s, want %s", got, want)
 	}
@@ -26,8 +36,8 @@ func TestChainWorkSumsBlocks(t *testing.T) {
 
 func TestMoreWorkBeatsLength(t *testing.T) {
 	// A short chain of hard blocks can outweigh a longer chain of easy ones.
-	longEasy := ChainWork([]Block{{Difficulty: 1}, {Difficulty: 1}, {Difficulty: 1}, {Difficulty: 1}}) // 4*16 = 64
-	shortHard := ChainWork([]Block{{Difficulty: 3}})                                                   // 4096
+	longEasy := ChainWork([]Block{{Bits: PowLimitBits}, {Bits: PowLimitBits}, {Bits: PowLimitBits}, {Bits: PowLimitBits}})
+	shortHard := ChainWork([]Block{{Bits: MinTargetBits}})
 	if shortHard.Cmp(longEasy) <= 0 {
 		t.Fatalf("expected shortHard(%s) > longEasy(%s)", shortHard, longEasy)
 	}
@@ -35,8 +45,24 @@ func TestMoreWorkBeatsLength(t *testing.T) {
 
 func TestChainTracksWork(t *testing.T) {
 	bc := NewBlockchain()
-	genesisWork := BlockWork(GenesisDifficulty)
-	if bc.Work().Cmp(genesisWork) != 0 {
-		t.Fatalf("fresh chain work = %s, want %s", bc.Work(), genesisWork)
+	if bc.Work().Cmp(BlockWork(GenesisBits)) != 0 {
+		t.Fatalf("fresh chain work = %s, want %s", bc.Work(), BlockWork(GenesisBits))
+	}
+}
+
+func TestCompactRoundTrip(t *testing.T) {
+	// Compact encoding is lossy in the low bits but must be idempotent: decoding
+	// then re-encoding a compact value returns the same compact value.
+	for _, bits := range []uint32{GenesisBits, MinTargetBits, PowLimitBits, bitsFor(200)} {
+		if got := BigToCompact(CompactToBig(bits)); got != bits {
+			t.Errorf("round trip %#x -> %#x", bits, got)
+		}
+	}
+	// Ordering is preserved: a smaller target encodes to represent less-or-equal.
+	if CompactToBig(MinTargetBits).Cmp(CompactToBig(GenesisBits)) >= 0 {
+		t.Fatal("MinTarget should be a smaller number (harder) than GenesisTarget")
+	}
+	if CompactToBig(GenesisBits).Cmp(CompactToBig(PowLimitBits)) >= 0 {
+		t.Fatal("GenesisTarget should be smaller than PowLimit (easiest)")
 	}
 }
