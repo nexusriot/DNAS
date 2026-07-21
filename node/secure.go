@@ -31,13 +31,16 @@ type secureConn struct {
 	rbuf []byte // decrypted bytes of the current frame not yet consumed by Read
 }
 
-// secureHandshake performs a symmetric, pre-shared-key-authenticated X25519 key
-// exchange and returns an encrypted connection plus a session id. Both peers run
-// it identically. A peer that does not know psk cannot produce a valid HMAC and
-// is rejected, and cannot derive the session key, so it can neither authenticate
-// nor read. The session id is a deterministic value both peers compute from the
-// handshake transcript; it is used to bind node-identity signatures to this
-// specific session (preventing replay).
+// secureHandshake performs an X25519 key exchange, optionally authenticated by a
+// pre-shared key, and returns an encrypted connection plus a session id. Both
+// peers run it identically. When psk is non-empty (a private net) a peer that
+// does not know it fails the HMAC check and cannot derive the session key, so it
+// can neither authenticate nor read. When psk is empty the network is OPEN /
+// permissionless: the exchange still yields an AES-256-GCM key from the ECDH
+// secret (traffic is encrypted), but membership is not gated — anyone may connect
+// (peers are still identified afterwards by their Ed25519 node identity). The
+// session id is a deterministic value both peers compute from the handshake
+// transcript; it binds node-identity signatures to this session (preventing replay).
 func secureHandshake(conn net.Conn, psk []byte) (*secureConn, []byte, error) {
 	_ = conn.SetDeadline(time.Now().Add(handshakeTimeout))
 	defer func() { _ = conn.SetDeadline(time.Time{}) }()

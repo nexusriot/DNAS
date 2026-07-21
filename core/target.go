@@ -15,14 +15,23 @@ import (
 // lwmaWindow is the number of recent blocks the LWMA retarget averages over.
 const lwmaWindow = 20
 
+// NoRetarget disables difficulty retargeting: expectedBits holds the genesis
+// target so blocks stay instant regardless of how fast they are mined. It is set
+// for regtest and the test suite (mirroring Bitcoin Core's fPowNoRetargeting); a
+// real network leaves it false so difficulty tracks hashpower without bound.
+var NoRetarget bool
+
 var (
-	// PowLimitBits / MinTargetBits / GenesisBits are the compact encodings stored
-	// in headers; the *Target values are their canonical (compact-representable)
-	// big.Int forms, so consensus never compares against a value a header can't
-	// commit. The band (~2^244 easiest … ~2^236 hardest, ~2^240 at genesis)
-	// mirrors the old difficulty 3–5, keeping devnet mining well under a second.
-	PowLimitBits  = BigToCompact(powOfTwoMinusOne(244)) // easiest allowed target
-	MinTargetBits = BigToCompact(powOfTwoMinusOne(236)) // hardest allowed target
+	// PowLimitBits / GenesisBits are the compact encodings stored in headers; the
+	// *Target values are their canonical (compact-representable) big.Int forms, so
+	// consensus never compares against a value a header can't commit. PowLimit
+	// (~2^244) is the EASIEST allowed target — the difficulty floor and the value a
+	// fresh/regtest chain sits at. There is deliberately no hardest-target clamp:
+	// difficulty rises without bound as hashpower grows (see expectedBits).
+	// MinTargetBits (~2^236) is retained only as a reference point in tests (the
+	// difficulty the old toy used to cap at); it is no longer a consensus clamp.
+	PowLimitBits  = BigToCompact(powOfTwoMinusOne(244)) // easiest allowed target (floor)
+	MinTargetBits = BigToCompact(powOfTwoMinusOne(236)) // test reference only (not a clamp)
 	GenesisBits   = BigToCompact(powOfTwoMinusOne(240)) // committed at genesis
 
 	PowLimit      = CompactToBig(PowLimitBits)

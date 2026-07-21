@@ -157,8 +157,9 @@ curl -sN localhost:8080/events                  # live stream (SSE): new blocks 
 
 ## 5. Form a network
 
-Start a second node that connects to the first. Peers must share the same
-`-netkey` (default `dnas-devnet`); each needs its own ports and data dir:
+Start a second node that connects to the first. By default the network is
+**open/permissionless** (no `-netkey` needed); to run a *private* network instead,
+give every node the same `-netkey`. Each node needs its own ports and data dir:
 
 ```sh
 mkdir -p ~/dnas-b && cd ~/dnas-b
@@ -285,6 +286,30 @@ Waiting ~5 s per block is tedious for testing. `-regtest` mines only when asked
 ```sh
 dnas node -regtest -api :8080 &
 curl -s -X POST localhost:8080/generate -d '{"n":10}'   # mine 10 blocks instantly
+```
+
+## 8d2. External mining
+
+Mining is decoupled from the node — point a separate miner at its API. The miner
+fetches a block template, finds the winning nonce locally, and submits the block:
+
+```sh
+dnas node -api :8080 &                       # a node that doesn't mine itself
+dnas miner -api localhost:8080 -address <your-address>          # mine continuously
+dnas miner -api localhost:8080 -address <your-address> -once    # mine one block
+```
+
+## 8d3. Native assets (tokens)
+
+Issue and move a token; fees are always paid in coin, and balances are provable
+against the state root like any coin balance:
+
+```sh
+# from a self-custodial light wallet with a funded key (see 8b):
+dnas spv -api localhost:8080 wallet -key lw.json issue GOLD 1000      # mint 1000 GOLD
+dnas spv -api localhost:8080 wallet -key lw.json -asset <id> send <addr> 250
+dnas spv -api localhost:8080 balance <addr>                          # shows proven asset balances
+curl -s localhost:8080/account/<addr>                                # includes an "assets" map
 ```
 
 ## 8e. Hash-time-locked contracts (atomic swaps)

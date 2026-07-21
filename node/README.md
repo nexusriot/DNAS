@@ -12,11 +12,16 @@ Module `github.com/nexusriot/DNAS/node` — the peer-to-peer daemon.
   loop and `Node.Generate`. In **regtest** mode (`Config.Regtest`, `Node.Regtest`)
   `Node.Generate(n)` mines N blocks immediately to the node wallet — bypassing the
   idle interval and the mining toggle — the primitive behind `POST /generate`.
-- `secure.go` — `secureConn`: a PSK-authenticated X25519 handshake and
-  AES-256-GCM encrypted, length-framed message stream (`json.Encoder`/`Decoder`
-  run over it transparently). Returns a session id used to bind node identities.
+- `secure.go` — `secureConn`: an X25519 handshake + AES-256-GCM encrypted,
+  length-framed message stream. **Permissionless by default** — with no network key
+  the handshake is anonymous (anyone may connect); a non-empty key authenticates a
+  private net (HMAC-gated). Returns a session id used to bind node identities.
 - Node identity: after the encrypted handshake, each side signs the session id
-  with its Ed25519 key (`MsgIdentity`) to prove who it is.
+  with its Ed25519 key (`MsgIdentity`) to prove who it is (open net or not).
+- Eclipse/DoS resistance: inbound connections are admitted (`admitInbound`) under
+  a total and per-IP-group cap (loopback exempt); each peer read loop runs a
+  token-bucket `rateLimiter` (`ratelimit.go`) and the whole-chain request is
+  throttled per peer.
 - `ban.go` — `banbook`: ban scoring. Failed handshakes are scored by IP (loopback
   exempt); post-authentication fraud (bad header chains, or blocks failing their own
   `SelfValid` PoW/merkle check) by identity. A plain fork is not penalised.
@@ -38,6 +43,12 @@ Module `github.com/nexusriot/DNAS/node` — the peer-to-peer daemon.
   private **stem** to one epoch-stable successor, then **fluffs** into a normal
   broadcast (by chance, on embargo timeout, or when no capable successor exists),
   hiding its origin. `relayTx`/`fluff`/`stemSuccessor` in `node.go` drive it.
+- **External mining:** `BuildTemplate(addr)` returns a candidate block for an
+  off-node miner and `SubmitMinedBlock` validates+appends a mined one (behind the
+  `/blocktemplate` and `/submitblock` API endpoints; `dnas miner` is the client).
+- **Injectable transport:** `Node.dialFn`/`listenFn` default to TCP but let tests
+  drive nodes over an in-memory switchboard with latency and partitions
+  (`simnet_test.go`), for adversarial reorg/finality/sync convergence testing.
 - `events.go` — a tiny in-process publish/subscribe bus. `Node.Subscribe()`
   hands out a buffered `<-chan Event` plus an unsubscribe func; an
   `Event{Type: "block"|"reorg"|"tx", …}` is emitted on mined/accepted/synced

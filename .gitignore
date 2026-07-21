@@ -1,12 +1,14 @@
 # ---- Runtime artifacts (created by a running node / wallet) ----
-# chain stores & JSON snapshots, wallet key files, persisted soft state (peers /
-# bans / mempool), a node config, and logs. The demos use temp dirs, but the
-# README/QUICKSTART examples write these into the working dir.
+# chain stores & JSON snapshots, wallet key files, the SPV light-wallet state,
+# persisted soft state (peers / bans / mempool), a node config, and logs. The
+# demos use temp dirs, but the README/QUICKSTART examples write these into the
+# working dir.
 chain*.json
 chain*.db
 *.db
 wallet*.json
 w*.json
+spvwallet*.json
 alice.json
 bob.json
 peers.json

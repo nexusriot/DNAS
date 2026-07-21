@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: build · vet · fmt · race-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26" # matches the go directive in every module's go.mod
+
+      - name: gofmt
+        run: |
+          # node/integration_test.go is intentionally left non-gofmt-clean, so it
+          # is exempt; every other file must be formatted.
+          unformatted=$(gofmt -l core node api cmd wallet | grep -v 'node/integration_test.go' || true)
+          tui_unformatted=$(cd tui && gofmt -l .)
+          if [ -n "$unformatted$tui_unformatted" ]; then
+            echo "These files need gofmt:"; echo "$unformatted"; echo "$tui_unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: make vet
+
+      - name: build
+        run: make build
+
+      - name: test (race detector)
+        run: make test-race
+
+  release:
+    name: release artifacts
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so `git describe` can stamp the version
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: cross-compiled tarballs (linux/amd64 + linux/arm64)
+        run: make dist
+
+      - name: debian packages (amd64 + arm64)
+        run: make deb # dpkg-deb ships on ubuntu-latest
+
+      - name: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: dnas-${{ github.ref_name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.deb
+          if-no-files-found: error

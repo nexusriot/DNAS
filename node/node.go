@@ -29,6 +29,20 @@ const (
 	// missed ping doesn't disconnect a healthy but briefly slow peer.
 	pingInterval    = 30 * time.Second
 	peerIdleTimeout = 90 * time.Second
+
+	// Eclipse/DoS resistance for an open network: cap total inbound connections and
+	// inbound connections per IP group (/16), so an attacker can't monopolise a
+	// node's inbound slots without controlling many address ranges. Loopback is
+	// exempt (local demos/tests). Outbound dials stay capped by MaxPeers.
+	maxInbound         = 64
+	maxInboundPerGroup = 4
+
+	// Per-peer inbound message rate limit (token bucket): sustained msgs/sec + burst.
+	msgRatePerSec = 100.0
+	msgRateBurst  = 200.0
+
+	// getChainCooldown throttles the expensive whole-chain request per peer.
+	getChainCooldown = 10 * time.Second
 )
 
 // Config holds a node's network and mining settings.
@@ -45,14 +59,15 @@ type Config struct {
 }
 
 type peer struct {
-	conn    *secureConn
-	enc     *json.Encoder
-	mu      sync.Mutex      // serializes writes to enc
-	addr    string          // peer's advertised address (from hello)
-	id      string          // peer's authenticated identity public key
-	ip      string          // remote IP, for ban scoring
-	version int             // negotiated protocol version
-	caps    map[string]bool // advertised capabilities (e.g. Dandelion++)
+	conn         *secureConn
+	enc          *json.Encoder
+	mu           sync.Mutex      // serializes writes to enc
+	addr         string          // peer's advertised address (from hello)
+	id           string          // peer's authenticated identity public key
+	ip           string          // remote IP, for ban scoring
+	version      int             // negotiated protocol version
+	caps         map[string]bool // advertised capabilities (e.g. Dandelion++)
+	lastGetChain time.Time       // throttles the expensive whole-chain request
 }
 
 // supports reports whether the peer advertised a capability.
@@ -76,6 +91,10 @@ type Node struct {
 	peersMu sync.Mutex
 	peers   map[*peer]bool
 
+	inboundMu    sync.Mutex     // guards the inbound-connection counters below
+	inboundTotal int            // current inbound connections (loopback exempt)
+	inboundGroup map[string]int // current inbound connections per IP group
+
 	seenBlk *seenSet
 	seenTx  *seenSet
 	book    *peerbook
@@ -86,6 +105,11 @@ type Node struct {
 	mining atomic.Bool // whether the miner is currently active (toggle at runtime)
 	tipGen int64       // atomic; bumped whenever the tip changes to interrupt mining
 	txGen  int64       // atomic; bumped when a new tx enters the mempool, to wake an idle miner
+
+	// Transport, injectable so tests can drive nodes over an in-memory network
+	// with controllable latency and partitions. Production uses TCP.
+	dialFn   func(string) (net.Conn, error)
+	listenFn func(string) (net.Listener, error)
 }
 
 // New constructs a Node. The wallet enables mining and API-side signing; if it
@@ -97,28 +121,34 @@ func New(cfg Config, chain *core.Blockchain, mp *core.Mempool, w *wallet.Wallet)
 	if cfg.MaxPeers <= 0 {
 		cfg.MaxPeers = DefaultMaxPeers
 	}
-	if cfg.NetKey == "" {
-		cfg.NetKey = DefaultNetKey
-	}
+	// An empty NetKey means an OPEN, permissionless network: the handshake is still
+	// X25519-ECDH + AES-256-GCM encrypted, but not gated on a shared secret, so
+	// anyone may connect (peers are still cryptographically identified by their
+	// Ed25519 node identity for ban scoring). A non-empty NetKey authenticates a
+	// private network (e.g. a devnet or regtest). It is NOT defaulted to a shared
+	// key any more — a real cryptocurrency is permissionless by default.
 	identity := w
 	if identity == nil {
 		identity, _ = wallet.New()
 	}
 	n := &Node{
-		cfg:      cfg,
-		chain:    chain,
-		mempool:  mp,
-		wallet:   w,
-		identity: identity,
-		psk:      []byte(cfg.NetKey),
-		peers:    map[*peer]bool{},
-		seenBlk:  newSeenSet(seenCapacity),
-		seenTx:   newSeenSet(seenCapacity),
-		book:     newPeerbook(cfg.AdvertiseAddr, cfg.MaxPeers),
-		bans:     newBanbook(banThreshold),
-		events:   newEventBus(),
-		dand:     newDandelion(),
+		cfg:          cfg,
+		chain:        chain,
+		mempool:      mp,
+		wallet:       w,
+		identity:     identity,
+		psk:          []byte(cfg.NetKey),
+		peers:        map[*peer]bool{},
+		inboundGroup: map[string]int{},
+		seenBlk:      newSeenSet(seenCapacity),
+		seenTx:       newSeenSet(seenCapacity),
+		book:         newPeerbook(cfg.AdvertiseAddr, cfg.MaxPeers),
+		bans:         newBanbook(banThreshold),
+		events:       newEventBus(),
+		dand:         newDandelion(),
 	}
+	n.dialFn = func(addr string) (net.Conn, error) { return net.Dial("tcp", addr) }
+	n.listenFn = func(addr string) (net.Listener, error) { return net.Listen("tcp", addr) }
 	n.mining.Store(cfg.Mine)
 	return n
 }
@@ -259,7 +289,7 @@ func (n *Node) SubmitTx(tx core.Transaction) error {
 }
 
 func (n *Node) listen() {
-	ln, err := net.Listen("tcp", n.cfg.ListenAddr)
+	ln, err := n.listenFn(n.cfg.ListenAddr)
 	if err != nil {
 		log.Fatalf("listen %s: %v", n.cfg.ListenAddr, err)
 	}
@@ -269,7 +299,66 @@ func (n *Node) listen() {
 		if err != nil {
 			continue
 		}
-		go n.handleConn(conn)
+		// Eclipse/DoS guard: reject the connection before the handshake if it would
+		// exceed the total or per-IP-group inbound cap.
+		ip := remoteIP(conn)
+		if !n.admitInbound(ip) {
+			_ = conn.Close()
+			continue
+		}
+		go func() {
+			defer n.releaseInbound(ip)
+			n.handleConn(conn)
+		}()
+	}
+}
+
+// ipGroup returns the coarse network group an IP belongs to (its /16 for IPv4,
+// /32 for IPv6), used to bound how many inbound connections one address range may
+// hold — an attacker then needs many distinct ranges to eclipse a node.
+func ipGroup(ip string) string {
+	p := net.ParseIP(ip)
+	if p == nil {
+		return ip
+	}
+	if v4 := p.To4(); v4 != nil {
+		return fmt.Sprintf("v4:%d.%d", v4[0], v4[1])
+	}
+	return "v6:" + p.Mask(net.CIDRMask(32, 128)).String()
+}
+
+// admitInbound reports whether a new inbound connection from ip is allowed under
+// the total and per-group caps, reserving a slot if so. Loopback (and unparseable
+// addresses) bypass the caps so local demos/tests with many 127.0.0.1 peers work.
+func (n *Node) admitInbound(ip string) bool {
+	if !bannableIP(ip) { // loopback / unparseable: exempt
+		return true
+	}
+	n.inboundMu.Lock()
+	defer n.inboundMu.Unlock()
+	if n.inboundTotal >= maxInbound {
+		return false
+	}
+	g := ipGroup(ip)
+	if n.inboundGroup[g] >= maxInboundPerGroup {
+		return false
+	}
+	n.inboundTotal++
+	n.inboundGroup[g]++
+	return true
+}
+
+// releaseInbound frees the slot reserved by admitInbound when the connection ends.
+func (n *Node) releaseInbound(ip string) {
+	if !bannableIP(ip) {
+		return
+	}
+	n.inboundMu.Lock()
+	defer n.inboundMu.Unlock()
+	n.inboundTotal--
+	g := ipGroup(ip)
+	if n.inboundGroup[g]--; n.inboundGroup[g] <= 0 {
+		delete(n.inboundGroup, g)
 	}
 }
 
@@ -287,7 +376,7 @@ func (n *Node) maybeDial(addr string) {
 
 func (n *Node) dialLoop(addr string) {
 	for {
-		conn, err := net.Dial("tcp", addr)
+		conn, err := n.dialFn(addr)
 		if err != nil {
 			time.Sleep(3 * time.Second)
 			continue
@@ -304,10 +393,12 @@ func (n *Node) handleConn(rawConn net.Conn) {
 		return
 	}
 
-	// Establish the encrypted, PSK-authenticated channel. A peer that fails the
-	// handshake doesn't know the network key (or is probing it); score it by IP
-	// so a persistent prober is eventually cut off. Loopback is exempt so many
-	// local nodes sharing 127.0.0.1 (tests, demos) never ban one another.
+	// Establish the encrypted channel. On a private net (non-empty netkey) this
+	// also authenticates network membership; on an open net it is anonymous
+	// encryption. A failed handshake is a crypto/protocol error or the wrong
+	// netkey; score it by IP so a persistent prober is eventually cut off. Loopback
+	// is exempt so many local nodes sharing 127.0.0.1 (tests, demos) don't ban each
+	// other. (Peer identity is still proven via Ed25519 below, open net or not.)
 	sc, sid, err := secureHandshake(rawConn, n.psk)
 	if err != nil {
 		log.Printf("rejected peer %s: handshake failed: %v", ip, err)
@@ -381,10 +472,15 @@ func (n *Node) handleConn(rawConn net.Conn) {
 	p.send(Message{Type: MsgGetPeers})
 	p.send(n.getHeadersMsg())
 
+	limiter := newRateLimiter(msgRatePerSec, msgRateBurst)
 	for {
 		_ = sc.SetReadDeadline(time.Now().Add(peerIdleTimeout))
 		var m Message
 		if err := dec.Decode(&m); err != nil {
+			return
+		}
+		if !limiter.allow(time.Now()) {
+			log.Printf("dropping peer %s: inbound message rate exceeded", ip)
 			return
 		}
 		n.handleMessage(p, m)
@@ -505,8 +601,13 @@ func (n *Node) handleMessage(p *peer, m Message) {
 	case MsgBlocks:
 		n.onBlocks(p, m.Blocks)
 
-	// whole-chain exchange, used only as a fork/bootstrap fallback
+	// whole-chain exchange, used only as a fork/bootstrap fallback — throttled
+	// per peer because serializing the whole chain is expensive.
 	case MsgGetChain:
+		if !p.lastGetChain.IsZero() && time.Since(p.lastGetChain) < getChainCooldown {
+			return
+		}
+		p.lastGetChain = time.Now()
 		p.send(Message{Type: MsgChain, Chain: n.chain.Blocks()})
 
 	case MsgChain:
@@ -702,13 +803,20 @@ func (n *Node) afterNewBlock(reorg bool) {
 // and the selected (non-coinbase) transactions so the caller can drop them from
 // the mempool once the block is committed.
 func (n *Node) buildBlock() (core.Block, []core.Transaction) {
+	return n.buildBlockFor(n.wallet.Address())
+}
+
+// buildBlockFor assembles the next candidate block paying the coinbase to
+// minerAddr. The internal miner passes its own wallet; BuildTemplate passes an
+// external miner's address.
+func (n *Node) buildBlockFor(minerAddr string) (core.Block, []core.Transaction) {
 	tip := n.chain.Tip()
 	height := tip.Index + 1
 	baseFee := n.chain.NextBaseFee()
 	txs := n.mempool.Select(n.chain, core.MaxBlockTxs) // already excludes fee < baseFee
 	// Miner is paid the subsidy plus tips (fees above the base fee); the base-fee
 	// portion is burned.
-	coinbase := core.NewCoinbase(n.wallet.Address(), core.CoinbaseAmount(height, txs, baseFee))
+	coinbase := core.NewCoinbase(minerAddr, core.CoinbaseAmount(height, txs, baseFee))
 	ts := time.Now().Unix()
 	if ts <= tip.Timestamp {
 		ts = tip.Timestamp + 1
@@ -721,11 +829,46 @@ func (n *Node) buildBlock() (core.Block, []core.Transaction) {
 		BaseFee:      baseFee,
 		Bits:         n.chain.NextBits(),
 	}
+	candidate.MerkleRoot = core.MerkleRoot(candidate.Transactions)
 	// Commit the post-block account state root (part of the PoW-hashed header).
 	// On error the candidate keeps an empty root and AddBlock will reject it, so
 	// the miner simply rebuilds — no invalid block escapes.
 	candidate.StateRoot, _ = n.chain.NextStateRoot(candidate)
 	return candidate, txs
+}
+
+// BuildTemplate returns a candidate block to mine paying minerAddr — every field
+// filled in except the winning Nonce. An external miner (see `dnas miner`)
+// searches for a Nonce whose hash meets Bits, then submits it via
+// SubmitMinedBlock / POST /submitblock.
+func (n *Node) BuildTemplate(minerAddr string) (core.Block, error) {
+	if minerAddr == "" {
+		return core.Block{}, fmt.Errorf("miner address required")
+	}
+	b, _ := n.buildBlockFor(minerAddr)
+	if b.StateRoot == "" {
+		return core.Block{}, fmt.Errorf("could not compute candidate state root")
+	}
+	return b, nil
+}
+
+// SubmitMinedBlock accepts a block mined by an external miner: it validates and
+// appends it, drops its transactions from the mempool, wakes the internal miner,
+// and announces it. Returns an error if the block is invalid or no longer builds
+// on the tip (the miner should then fetch a fresh template).
+func (n *Node) SubmitMinedBlock(b core.Block) error {
+	if err := n.chain.AddBlock(b); err != nil {
+		return err
+	}
+	n.markSeenBlock(b.Hash)
+	if len(b.Transactions) > 1 {
+		n.mempool.Remove(b.Transactions[1:])
+	}
+	log.Printf("accepted externally-mined block %d diff=%.2f %s",
+		b.Index, core.TargetDifficulty(b.Bits), short(b.Hash))
+	n.afterNewBlock(false)
+	n.broadcast(Message{Type: MsgInv, Index: b.Index, Hash: b.Hash})
+	return nil
 }
 
 // commitMined records a freshly mined block: append it, dedup, drop its

@@ -11,11 +11,14 @@ import (
 	"time"
 )
 
-// Account is the state tracked per address: a spendable balance and a nonce
-// (the next expected transaction sequence number, which stops replay).
+// Account is the state tracked per address: a spendable coin balance, a nonce
+// (the next expected transaction sequence number, which stops replay), and any
+// native asset balances the address holds (asset id -> amount). Assets is
+// omitempty, so a coin-only account serializes and hashes exactly as before.
 type Account struct {
-	Balance uint64 `json:"balance"`
-	Nonce   uint64 `json:"nonce"`
+	Balance uint64            `json:"balance"`
+	Nonce   uint64            `json:"nonce"`
+	Assets  map[string]uint64 `json:"assets,omitempty"`
 }
 
 // Blockchain is a thread-safe chain of blocks plus the account state derived by
@@ -540,11 +543,16 @@ func Load(path string) (*Blockchain, error) {
 // every block and weights recent blocks more, so it tracks the target block time
 // smoothly. Per-block solve times are clamped to [1, 6·TargetBlockTime], which
 // also neutralises the huge first gap from the far-past genesis timestamp (it no
-// longer collapses the target on the first window). The result is clamped to
-// [MinTarget, PowLimit]. Until there is a full window of history it holds the
-// genesis target.
+// longer collapses the target on the first window).
+//
+// The target is clamped to PowLimit on the EASY side only — there is no hard
+// ceiling on difficulty, so it rises without bound to match whatever hashpower
+// shows up (this is what gives proof of work its economic security: rewriting
+// history must redo that work). When NoRetarget is set (regtest and the test
+// suite, like Bitcoin's fPowNoRetargeting) it instead holds the genesis target so
+// blocks stay instant; a real network leaves it off.
 func expectedBits(blocks []Block, height uint64) uint32 {
-	if height <= lwmaWindow {
+	if NoRetarget || height <= lwmaWindow {
 		return GenesisBits
 	}
 	N := lwmaWindow
@@ -564,17 +572,17 @@ func expectedBits(blocks []Block, height uint64) uint32 {
 	}
 	// nextTarget = avgTarget · weightedSolve / (T · N(N+1)/2). If blocks arrive at
 	// exactly TargetBlockTime the two factors cancel and the target is unchanged;
-	// faster blocks shrink it (harder), slower blocks grow it (easier).
+	// faster blocks shrink it (harder, without bound), slower blocks grow it (easier).
 	avgTarget := new(big.Int).Div(sumTarget, big.NewInt(int64(N)))
 	next := new(big.Int).Mul(avgTarget, big.NewInt(weightedSolve))
 	denom := big.NewInt(TargetBlockTime * int64(N) * int64(N+1) / 2)
 	next.Div(next, denom)
 
-	if next.Sign() <= 0 || next.Cmp(MinTarget) < 0 {
-		next = new(big.Int).Set(MinTarget)
+	if next.Sign() <= 0 {
+		next = big.NewInt(1) // never zero/negative (would be an unsatisfiable target)
 	}
 	if next.Cmp(PowLimit) > 0 {
-		next = new(big.Int).Set(PowLimit)
+		next = new(big.Int).Set(PowLimit) // easiest allowed; no hard cap on the difficulty side
 	}
 	return BigToCompact(next)
 }
@@ -791,6 +799,12 @@ func applyTxsAndCoinbase(state map[string]Account, blocks []Block, block Block) 
 		if len(tx.Memo) > MaxMemoBytes {
 			return fail(fmt.Errorf("tx %d memo too long (%d > %d)", i, len(tx.Memo), MaxMemoBytes))
 		}
+		// Height-activated rule (consensus upgrade): once UpgradeDustLimit is in
+		// force, coin transfers below DustThreshold are rejected. Off until an
+		// activation height is scheduled, and never applies to asset/issue txs.
+		if IsUpgradeActive(UpgradeDustLimit, height) && !tx.IsIssue() && !tx.IsAssetTransfer() && tx.Amount > 0 && tx.Amount < DustThreshold {
+			return fail(fmt.Errorf("tx %d dust output: amount %d below dust threshold %d", i, tx.Amount, DustThreshold))
+		}
 		h := tx.Hash()
 		if seen[h] {
 			return fail(errors.New("duplicate transaction in block"))
@@ -840,6 +854,12 @@ func applyTxTo(state map[string]Account, tx Transaction, reserve uint64, set fun
 	if err := tx.VerifySignature(); err != nil {
 		return err
 	}
+	if tx.IsIssue() {
+		return applyIssue(state, tx, reserve, set)
+	}
+	if tx.IsAssetTransfer() {
+		return applyAssetTransfer(state, tx, reserve, set)
+	}
 	if tx.Amount == 0 && tx.Fee == 0 {
 		return errors.New("empty transfer")
 	}
@@ -867,6 +887,67 @@ func applyTxTo(state map[string]Account, tx Transaction, reserve uint64, set fun
 		return errors.New("recipient balance overflow")
 	}
 	recip.Balance += tx.Amount
+	set(tx.To, recip)
+	return nil
+}
+
+// applyIssue mints a new asset to the sender: it pays the coin fee (respecting
+// coinbase maturity via reserve) and is credited Supply units of a fresh asset
+// whose id is bound to (issuer, ticker, nonce).
+func applyIssue(state map[string]Account, tx Transaction, reserve uint64, set func(string, Account)) error {
+	if err := validTicker(tx.Issue.Ticker); err != nil {
+		return err
+	}
+	if tx.Issue.Supply == 0 || tx.Issue.Supply > MaxAssetSupply {
+		return fmt.Errorf("asset supply must be in 1..%d", MaxAssetSupply)
+	}
+	sender := state[tx.From]
+	if tx.Nonce != sender.Nonce {
+		return fmt.Errorf("bad nonce for %s: got %d, want %d", tx.From, tx.Nonce, sender.Nonce)
+	}
+	need := tx.Fee + reserve
+	if need < tx.Fee {
+		return errors.New("fee+reserve overflow")
+	}
+	if sender.Balance < need {
+		return fmt.Errorf("insufficient spendable balance for %s: have %d, need fee %d (%d immature)", tx.From, sender.Balance, tx.Fee, reserve)
+	}
+	sender.Balance -= tx.Fee
+	sender.Nonce++
+	sender = sender.withAssetDelta(AssetID(tx.From, tx.Issue.Ticker, tx.Nonce), int64(tx.Issue.Supply))
+	set(tx.From, sender)
+	return nil
+}
+
+// applyAssetTransfer moves tx.Amount of asset tx.AssetID from sender to
+// recipient. The fee is paid in coin (respecting coinbase maturity); the asset
+// amount is checked against the sender's asset balance. Supplies are capped
+// (MaxAssetSupply) so the arithmetic can't overflow.
+func applyAssetTransfer(state map[string]Account, tx Transaction, reserve uint64, set func(string, Account)) error {
+	if tx.Amount == 0 {
+		return errors.New("empty asset transfer")
+	}
+	sender := state[tx.From]
+	if tx.Nonce != sender.Nonce {
+		return fmt.Errorf("bad nonce for %s: got %d, want %d", tx.From, tx.Nonce, sender.Nonce)
+	}
+	need := tx.Fee + reserve
+	if need < tx.Fee {
+		return errors.New("fee+reserve overflow")
+	}
+	if sender.Balance < need {
+		return fmt.Errorf("insufficient coin for fee for %s: have %d, need %d (%d immature)", tx.From, sender.Balance, tx.Fee, reserve)
+	}
+	if sender.Assets[tx.AssetID] < tx.Amount {
+		return fmt.Errorf("insufficient asset for %s: have %d, need %d", tx.From, sender.Assets[tx.AssetID], tx.Amount)
+	}
+	sender.Balance -= tx.Fee
+	sender.Nonce++
+	sender = sender.withAssetDelta(tx.AssetID, -int64(tx.Amount))
+	set(tx.From, sender)
+
+	recip := state[tx.To] // reflects the sender update when From == To
+	recip = recip.withAssetDelta(tx.AssetID, int64(tx.Amount))
 	set(tx.To, recip)
 	return nil
 }

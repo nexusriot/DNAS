@@ -15,7 +15,10 @@ dnas htlc new|address|claim|refund                 hash-time-locked contracts
 dnas spv [-api URL] sync|verify <txhash>|scan|balance|history <address>   light client (headers/proof/filters/state)
 dnas spv [-api URL] wallet [-f FILE] add|update|status|list|forget          persistent light wallet (incremental, -watch)
 dnas spv [-api URL] wallet -key FILE new|send <to> <amount>                 self-custodial light wallet (signs locally)
+dnas spv [-api URL] wallet -key FILE issue <ticker> <supply>                mint a native asset (token)
+dnas spv [-api URL] wallet -key FILE -asset ID send <to> <amount>           transfer a native asset
 dnas fastsync [-api URL] [-checkpoint H:HASH] [addr...]                     bootstrap state from a verified snapshot
+dnas miner -api URL -address ADDR [-once]                                   external miner (template -> mine -> submit)
 dnas version                     print the build version (stamped via -ldflags)
 ```
 
@@ -39,7 +42,11 @@ client), and submits only the signed transaction. `dnas fastsync` (`fastsync.go`
 bootstraps a node's state from a peer's `/snapshot` without replaying the chain:
 it PoW-verifies the headers, checks the account snapshot against the header's
 committed state root (and an optional `-checkpoint`), seeds a chain, then fully
-validates only the blocks above the snapshot. `dnas htlc`
+validates only the blocks above the snapshot. `dnas miner` (`miner.go`) is a
+standalone external miner: it fetches a block template over the API, searches for
+a winning nonce locally, and submits the mined block — so mining runs off-node.
+The self-custodial wallet also mints and moves **native assets** (`wallet issue`,
+`wallet -asset ID send`). `dnas htlc`
 (`new`, `address`, `claim`,
 `refund`) mints a preimage+hash and builds, signs, and submits HTLC spends —
 `claim` reveals the preimage, `refund` is valid only past the timeout height —

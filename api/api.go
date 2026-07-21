@@ -53,13 +53,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/mempool", s.mempool)
 	mux.HandleFunc("/peers", s.peers)
 	mux.HandleFunc("/address", s.address)
-	mux.HandleFunc("/tx", s.guard(s.submitTx))       // POST a fully signed transaction
-	mux.HandleFunc("/send", s.guard(s.send))         // POST {to, amount, fee, expiry?, nonce?}; signed by node wallet
-	mux.HandleFunc("/mine", s.guard(s.mine))         // POST {on: bool}; toggle mining at runtime
-	mux.HandleFunc("/generate", s.guard(s.generate)) // POST {n}; regtest-only on-demand mining
-	mux.HandleFunc("/estimatefee", s.estimateFee)    // GET ?blocks=N; recommended fee
-	mux.HandleFunc("/metrics", s.metrics)            // Prometheus-style metrics
-	mux.HandleFunc("/events", s.events)              // Server-Sent Events: live block/tx stream
+	mux.HandleFunc("/tx", s.guard(s.submitTx))             // POST a fully signed transaction
+	mux.HandleFunc("/send", s.guard(s.send))               // POST {to, amount, fee, expiry?, nonce?}; signed by node wallet
+	mux.HandleFunc("/mine", s.guard(s.mine))               // POST {on: bool}; toggle mining at runtime
+	mux.HandleFunc("/generate", s.guard(s.generate))       // POST {n}; regtest-only on-demand mining
+	mux.HandleFunc("/blocktemplate", s.blockTemplate)      // GET ?address=ADDR; candidate block for an external miner
+	mux.HandleFunc("/submitblock", s.guard(s.submitBlock)) // POST a mined block
+	mux.HandleFunc("/estimatefee", s.estimateFee)          // GET ?blocks=N; recommended fee
+	mux.HandleFunc("/metrics", s.metrics)                  // Prometheus-style metrics
+	mux.HandleFunc("/events", s.events)                    // Server-Sent Events: live block/tx stream
 	// Stateless wallet helpers (no node state touched; localhost/toy use).
 	mux.HandleFunc("/multisig/address", s.multisigAddress) // POST {threshold, pubkeys[]}
 	mux.HandleFunc("/htlc/address", s.htlcAddress)         // POST {hash, recipient, sender, timeout}
@@ -186,6 +188,42 @@ func (s *Server) estimateFee(w http.ResponseWriter, r *http.Request) {
 		"fee_fmt":       core.FormatAmount(fee) + "/byte",
 		"min_relay_fee": relayFloor,
 	})
+}
+
+// blockTemplate returns a candidate block for an external miner to hash:
+// GET /blocktemplate?address=ADDR (defaulting to the node's own wallet). The
+// miner searches for a Nonce whose hash meets Bits, then POSTs it to /submitblock.
+func (s *Server) blockTemplate(w http.ResponseWriter, r *http.Request) {
+	addr := r.URL.Query().Get("address")
+	if addr == "" {
+		if wal := s.node.Wallet(); wal != nil {
+			addr = wal.Address()
+		} else {
+			writeErr(w, http.StatusBadRequest, "address required (node has no wallet to default to)")
+			return
+		}
+	}
+	b, err := s.node.BuildTemplate(addr)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, b)
+}
+
+// submitBlock accepts a block mined externally (POST /submitblock). It is an
+// authenticated write; a stale or invalid block returns 400 so the miner refetches.
+func (s *Server) submitBlock(w http.ResponseWriter, r *http.Request) {
+	var b core.Block
+	if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid block json")
+		return
+	}
+	if err := s.node.SubmitMinedBlock(b); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"accepted": true, "height": b.Index, "hash": b.Hash})
 }
 
 // metrics exposes node stats in the Prometheus text exposition format.
@@ -320,11 +358,15 @@ func (s *Server) balance(w http.ResponseWriter, r *http.Request) {
 func (s *Server) account(w http.ResponseWriter, r *http.Request) {
 	addr := strings.TrimPrefix(r.URL.Path, "/account/")
 	acc := s.node.Chain().Account(addr)
-	writeJSON(w, http.StatusOK, map[string]any{
+	out := map[string]any{
 		"address": addr,
 		"balance": acc.Balance,
 		"nonce":   acc.Nonce,
-	})
+	}
+	if len(acc.Assets) > 0 {
+		out["assets"] = acc.Assets
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) mempool(w http.ResponseWriter, r *http.Request) {

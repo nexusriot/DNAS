@@ -66,13 +66,25 @@ Module `github.com/nexusriot/DNAS/core` — the ledger and consensus rules.
 - `target.go` — proof of work is a **256-bit compact target** (`Bits`, nBits-style
   `CompactToBig`/`BigToCompact`); a hash must be ≤ the target. `expectedBits`
   (in `blockchain.go`) retargets **every block** with an LWMA toward
-  `TargetBlockTime`, clamped to `[MinTarget, PowLimit]`.
+  `TargetBlockTime`, clamped only to `PowLimit` on the easy side — **no hard
+  difficulty cap**, so difficulty rises without bound with hashpower. `NoRetarget`
+  (regtest/tests) holds it at the genesis target for instant blocks.
+- `codec.go` — the **canonical, length-prefixed binary encoding** used for a
+  transaction's hash (txid), its fee-determining `Size()`, and its signing bytes,
+  so those are reproducible by any implementation (not tied to `encoding/json`).
+- `upgrade.go` — height-activated consensus upgrades: `SetUpgradeHeight` /
+  `IsUpgradeActive(name, height)` gate a rule change to a coordinated flag-day
+  (`UpgradeDustLimit` is the worked example, guarded in `applyTxsAndCoinbase`).
 - `work.go` — cumulative proof-of-work (`BlockWork = 2^256/(target+1)`,
   `ChainWork`). Fork choice is greatest cumulative work, with equal-work ties
   broken deterministically by the smaller tip hash so every node converges.
 - `snapshot.go` — `Snapshot` (account state + header at a height), `SnapshotAt`,
   `VerifySnapshot` (accounts hash to the header's state root), and
   `NewFromSnapshot` (seed a chain from a verified snapshot for fast-sync).
+- `asset.go` — native tokens: `AssetIssue`, `AssetID` (bound to issuer+ticker+nonce),
+  ticker validation, and copy-on-write asset-balance updates. Balances live in
+  `Account.Assets` and are committed in the state root (`stateLeaf`), so a coin-only
+  account is unchanged and asset balances are light-client-provable.
 - `Mempool` — bounded pool of pending transactions with lowest-*rate* eviction
   (fee per byte), replace-by-fee (fee-bumping), expiry pruning, and nonce-aware,
   rate-ordered, byte-bounded block selection (`Select`, capped at `MaxBlockBytes`).

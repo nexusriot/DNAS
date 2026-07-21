@@ -264,8 +264,9 @@ func (m *Mempool) Select(bc *Blockchain, max int) []Transaction {
 	baseFee := bc.NextBaseFee()   // the next block's base fee (per byte); txs must cover it
 
 	type sim struct {
-		balance uint64
+		balance uint64 // spendable coin
 		nonce   uint64
+		assets  map[string]uint64
 	}
 	cache := map[string]sim{}
 	get := func(addr string) sim {
@@ -274,16 +275,37 @@ func (m *Mempool) Select(bc *Blockchain, max int) []Transaction {
 		}
 		// Use the spendable balance so immature coinbase isn't selected — the
 		// miner would otherwise build a block its own consensus rules reject.
-		s := sim{balance: bc.SpendableBalance(addr), nonce: bc.Account(addr).Nonce}
+		acc := bc.Account(addr)
+		assets := make(map[string]uint64, len(acc.Assets))
+		for k, v := range acc.Assets {
+			assets[k] = v
+		}
+		s := sim{balance: bc.SpendableBalance(addr), nonce: acc.Nonce, assets: assets}
 		cache[addr] = s
 		return s
+	}
+	// ready reports whether tx can be applied on the simulated state (correct
+	// nonce, coin fee affordable, and — for asset moves — enough of the asset).
+	ready := func(tx Transaction) bool {
+		s := get(tx.From)
+		if tx.Nonce != s.nonce {
+			return false
+		}
+		switch {
+		case tx.IsIssue():
+			return s.balance >= tx.Fee
+		case tx.IsAssetTransfer():
+			return s.balance >= tx.Fee && s.assets[tx.AssetID] >= tx.Amount
+		default:
+			return s.balance >= tx.Amount+tx.Fee
+		}
 	}
 
 	var selected []Transaction
 	weight := 0 // running total of selected transaction bytes (<= MaxBlockBytes)
 	used := make(map[string]bool)
 	for len(selected) < max {
-		var ready []Transaction
+		var candidates []Transaction
 		for _, tx := range all {
 			if used[tx.Hash()] || tx.IsExpiredAt(mineHeight) || tx.IsLockedAt(mineHeight) || tx.HTLCRefundNotReady(mineHeight) || tx.Fee < BaseFeeFor(tx, baseFee) {
 				continue
@@ -291,25 +313,37 @@ func (m *Mempool) Select(bc *Blockchain, max int) []Transaction {
 			if weight+tx.Size() > MaxBlockBytes { // wouldn't fit the block's byte budget
 				continue
 			}
-			s := get(tx.From)
-			if tx.Nonce != s.nonce || s.balance < tx.Amount+tx.Fee {
-				continue
+			if ready(tx) {
+				candidates = append(candidates, tx)
 			}
-			ready = append(ready, tx)
 		}
-		if len(ready) == 0 {
+		if len(candidates) == 0 {
 			break
 		}
-		sort.Slice(ready, func(i, j int) bool { return txRate(ready[i]) > txRate(ready[j]) })
-		pick := ready[0]
+		sort.Slice(candidates, func(i, j int) bool { return txRate(candidates[i]) > txRate(candidates[j]) })
+		pick := candidates[0]
 
 		s := get(pick.From)
-		s.balance -= pick.Amount + pick.Fee
 		s.nonce++
-		cache[pick.From] = s
-		r := get(pick.To)
-		r.balance += pick.Amount
-		cache[pick.To] = r
+		switch {
+		case pick.IsIssue():
+			s.balance -= pick.Fee
+			s.assets[AssetID(pick.From, pick.Issue.Ticker, pick.Nonce)] += pick.Issue.Supply
+			cache[pick.From] = s
+		case pick.IsAssetTransfer():
+			s.balance -= pick.Fee
+			s.assets[pick.AssetID] -= pick.Amount
+			cache[pick.From] = s
+			r := get(pick.To)
+			r.assets[pick.AssetID] += pick.Amount
+			cache[pick.To] = r
+		default:
+			s.balance -= pick.Amount + pick.Fee
+			cache[pick.From] = s
+			r := get(pick.To)
+			r.balance += pick.Amount
+			cache[pick.To] = r
+		}
 
 		selected = append(selected, pick)
 		used[pick.Hash()] = true

@@ -3,7 +3,8 @@
 This document explains **how DNAS works and why it is built the way it is** —
 the data model, consensus, networking, and the deliberate trade-offs behind each
 choice. For usage see [README.md](README.md) and [QUICKSTART.md](QUICKSTART.md);
-each module also has its own `README.md`.
+each module also has its own `README.md`. For the deliberate gaps and what would
+close them, see [ROADMAP.md](ROADMAP.md).
 
 DNAS ("Definitely Not A Scam") is a small but genuinely working proof-of-work
 cryptocurrency. It is a learning project, not money.
@@ -24,9 +25,15 @@ cryptocurrency. It is a learning project, not money.
 
 **Non-goals**
 
-- Not money, not sybil-resistant, not for the open internet. Difficulty bounds
-  are tiny so a laptop mines instantly.
-- No smart contracts, no privacy features, no economic security guarantees.
+- Not money. It now runs an *open, permissionless* network (no shared key needed)
+  with *real, unbounded* proof-of-work difficulty and a canonical, cross-language
+  consensus encoding — the three properties that separate a simulation from a
+  cryptocurrency — but it still has a single implementation, transparent balances,
+  no external audit, and no economic-security guarantees. Don't secure value with
+  it. (Difficulty is only clamped down to a trivial floor on a devnet/regtest,
+  where `NoRetarget` holds it fixed for instant blocks.)
+- No smart contracts, no confidential amounts or recipient privacy (Dandelion++
+  only obscures which peer *originated* a transaction).
 
 ---
 
@@ -89,7 +96,7 @@ deliberate choice for readability: balances and replay protection are a small
 map rather than a set of coins to track.
 
 ```go
-type Account struct { Balance uint64; Nonce uint64 }
+type Account struct { Balance uint64; Nonce uint64; Assets map[string]uint64 }
 ```
 
 - **Balances** are integer base units. `Coin = 100_000_000` (1 DNAS), so amounts
@@ -98,6 +105,18 @@ type Account struct { Balance uint64; Nonce uint64 }
   sender's next nonce, which prevents replay and orders a sender's transactions.
 - Chain state is a `map[address]Account` derived by applying blocks in order. It
   is never trusted from the wire; it is recomputed from validated blocks.
+
+**Native assets (tokens).** Besides the base coin, an account may hold balances of
+any number of native assets (`Assets`, asset id → amount). A transaction with
+`Issue` set mints a new asset to its sender — the id is `hash(issuer|ticker|nonce)`,
+so issuances never collide — and a transaction with `AssetID` set moves that asset
+instead of coin (the **fee is always paid in coin**). Asset balances are committed
+in the state root alongside coin (`stateLeaf` appends the sorted asset balances),
+so a light client proves an asset balance exactly as it proves a coin balance —
+and `Assets` is `omitempty`, so a coin-only account hashes byte-for-byte as before
+(no genesis change). Supplies are capped (`MaxAssetSupply`) so asset arithmetic
+can't overflow, and the asset state is updated copy-on-write so reorg undo logs
+stay correct.
 
 ---
 
@@ -111,6 +130,8 @@ type Transaction struct {
     Expiry           uint64          // highest valid height (0 = none)
     LockUntil        uint64          // lowest valid height (time-lock)
     Memo             string          // ≤ MaxMemoBytes
+    AssetID          string          // move this native asset instead of coin (§4)
+    Issue            *AssetIssue     // OR mint a new native asset to From (§4)
     Signature        []byte          // single-key authorization
     Multisig         *MultisigScript // OR multisig authorization
     Signatures       [][]byte
@@ -120,9 +141,24 @@ type Transaction struct {
 ```
 
 **Signing.** The signed message (`signingBytes`) covers every consensus-relevant
-field (From/To/Amount/Fee/Nonce/Expiry/LockUntil/Memo) but **not** the signature
-fields. Crucially it is *identical* for single-key and multisig transactions, so
-the two authorization paths sign the same bytes.
+field (From/To/Amount/Fee/Nonce/Expiry/LockUntil/AssetID/Issue/Memo) but **not**
+the signature fields. Crucially it is *identical* for single-key and multisig
+transactions, so the two authorization paths sign the same bytes. (A native-asset
+transfer or issuance is an ordinary single-key spend by `From`; the fee is always
+paid in coin — see §4.)
+
+**Canonical encoding.** Signing bytes, the transaction hash (its txid), and the
+fee-determining `Size()` are all taken over a **canonical, length-prefixed binary
+encoding** ([`core/codec.go`](core/codec.go)), *not* `encoding/json`. This matters
+for being a real cryptocurrency: a JSON encoder's field ordering, escaping and
+omitempty rules are library- and language-specific, so hashing over them would let
+a second implementation compute different txids and fee floors and silently fork.
+The binary layout — a version byte, big-endian integers, 4-byte-length-prefixed
+strings, presence-flagged optional structs — is unambiguous and reproducible by
+any implementation, in any language. (The block header hash and the state-root
+leaf are simple `%d|%s` ASCII formats, already reproducible, so they were left as
+is.) The wire transport may still be JSON; the hash *preimage* is always these
+canonical bytes.
 
 **Authorization** is resolved by `VerifySignature`:
 
@@ -153,16 +189,17 @@ are skipped during selection.
 *same* `(From, Nonce)` with a strictly higher fee; the mempool replaces the old
 one (§10).
 
-**Coinbase.** The block's first transaction mints `reward + fees` to the miner
-and has no signature (`IsCoinbase`).
+**Coinbase.** The block's first transaction mints `reward + tips` to the miner
+and has no signature (`IsCoinbase`) — the base-fee portion of every fee is burned
+rather than paid to the miner (§9).
 
 ---
 
 ## 6. Blocks, headers, and Merkle proofs
 
 ```go
-type Block  struct { Index, Timestamp, Nonce; PrevHash; MerkleRoot; StateRoot; BaseFee; Difficulty; Transactions; Hash }
-type Header struct { Index, Timestamp, Nonce; PrevHash; MerkleRoot; StateRoot; BaseFee; Difficulty; Hash }
+type Block  struct { Index, Timestamp, Nonce; PrevHash; MerkleRoot; StateRoot; BaseFee; Bits; Transactions; Hash }
+type Header struct { Index, Timestamp, Nonce; PrevHash; MerkleRoot; StateRoot; BaseFee; Bits; Hash }
 ```
 
 A block hash commits to header fields **plus two merkle roots** — a `MerkleRoot`
@@ -199,10 +236,17 @@ weighting recent blocks more so it tracks `TargetBlockTime` smoothly rather than
 in ±1 steps. Per-block solve times are clamped to `[1, 6·TargetBlockTime]`, which
 also neutralises the enormous first gap from the far-past genesis timestamp — the
 old step retarget collapsed to the floor on the first window; the LWMA does not.
-The target is clamped to `[MinTarget, PowLimit]` (a band ≈ the old difficulty
-3–5) so a devnet never stalls on an unreachable target or spins on a trivial one,
-and every node derives the same next target deterministically. `TargetDifficulty`
-renders a target as a human ratio (`PowLimit ÷ target`) for display only.
+
+**Difficulty is unbounded on the hard side.** The target is clamped only to
+`PowLimit` on the *easy* side (a floor, the value a fresh chain starts at); there
+is deliberately **no ceiling on difficulty**, so it rises without limit to match
+whatever hashpower shows up. This is what gives proof of work its economic
+security — rewriting history means redoing that ever-growing work — and is the
+property that separates a real chain from a toy where blocks are free. For a
+devnet or the test suite, `NoRetarget` (mirroring Bitcoin Core's
+`fPowNoRetargeting`, set by `-regtest`) instead holds the genesis target so blocks
+stay instant; a real network leaves it off. `TargetDifficulty` renders a target
+as a human ratio (`PowLimit ÷ target`) for display only.
 
 ---
 
@@ -238,6 +282,17 @@ operators add more with `-checkpoints height:hash,…` (e.g. hashes of
 deeply-buried blocks from a trusted release) so a fresh or lagging node can't be
 fed a bogus deep history. Both guards leave initial sync and forward extension
 untouched — they only bound rolling *back* committed blocks.
+
+**Consensus upgrades (flag-day activation).** Rule changes activate at a
+configured block height ([`core/upgrade.go`](core/upgrade.go)): a validation rule
+guards itself with `IsUpgradeActive(name, blockHeight)`, so blocks below the
+activation height keep the old rule and blocks at/after it enforce the new one —
+the whole network switching together on a coordinated flag-day instead of forking
+uncoordinated. Heights are configuration, set identically on every node at startup
+(like checkpoints). `UpgradeDustLimit` is a worked example (once active, coin
+transfers below `DustThreshold` are rejected). This is *height* activation; miner
+version-bit *signaling* (BIP9) would additionally need a header version field and
+is left as future work.
 
 **Coinbase maturity.** A coinbase mined at height `C` is spendable only once the
 chain reaches `C + CoinbaseMaturity`. In an account model there are no coins to
@@ -325,12 +380,17 @@ and test; the *payment* is per byte.)
 
 `node/` implements an authenticated, encrypted, identified peer-to-peer network.
 
-**Secure transport (`secureConn`, `secureHandshake`).** Every connection begins
-with an X25519 ECDH key exchange **authenticated by a pre-shared network key**
-(`-netkey`): a peer that doesn't know the key fails an HMAC check and is dropped.
-Traffic is then AES-256-GCM encrypted, length-framed, with a JSON encoder/decoder
-running over it. The handshake sends and receives concurrently so it also works
-over `net.Pipe` (used in tests).
+**Secure transport (`secureConn`, `secureHandshake`) — permissionless by
+default.** Every connection begins with an X25519 ECDH key exchange; traffic is
+then AES-256-GCM encrypted, length-framed, with a JSON encoder/decoder over it.
+Whether it is *authenticated* depends on the network key: with **no `-netkey`
+(the default) the network is open/permissionless** — anyone may connect (the
+handshake is anonymous but encrypted), which is what an actual cryptocurrency
+requires. Supplying a `-netkey` authenticates a **private** network: a peer that
+doesn't know it fails an HMAC check and is dropped (used for a devnet or regtest).
+Either way, peers are still cryptographically identified afterwards by their
+Ed25519 node identity (below). The handshake sends and receives concurrently so it
+also works over `net.Pipe` (used in tests).
 
 **Peer identity.** The handshake yields a deterministic session id; each peer
 then signs it with its **Ed25519 node identity** (`MsgIdentity`), so peers are
@@ -375,6 +435,18 @@ no peer supports it. (`node/dandelion.go`.)
 **Discovery (`peerbook`).** Nodes gossip known addresses (`MsgGetPeers` /
 `MsgPeers`) and auto-dial discovered peers up to `-maxpeers`, excluding
 self/dupes/already-connected.
+
+**Eclipse & DoS resistance.** Because the network is open, a node bounds who can
+fill its slots: inbound connections are admitted (`admitInbound`, before the
+handshake) only under a total cap (`maxInbound`) and a **per-IP-group cap**
+(`maxInboundPerGroup`, grouping by /16), so an attacker must control many distinct
+address ranges to monopolise a victim's inbound peers (an eclipse attack) rather
+than spinning up cheap connections from one host. Loopback is exempt so local
+demos aren't limited. Each peer's read loop runs a **token-bucket rate limiter**
+(`msgRatePerSec`/`msgRateBurst`): a peer that floods messages is dropped. The
+expensive whole-chain request (`MsgGetChain`) is additionally throttled to once
+per `getChainCooldown` per peer. These bound the resource-exhaustion vectors that
+a permissionless network exposes.
 
 **Sync protocol.** New blocks are announced by hash and pulled on demand; catch-up
 is headers-first; forks transfer only the divergent suffix:
@@ -563,10 +635,14 @@ with `httptest`). Highlights:
   (`node/events.go`) whose subscribers get a buffered channel; a slow consumer
   drops events rather than stalling the node's hot paths.
 - **Write (guarded):** `POST /send` (built + signed by the node wallet; optional
-  nonce/expiry/lock_until/memo), `POST /tx` (a fully-signed tx incl. multisig or
-  HTLC), `POST /mine` (`{on}` toggles mining at runtime), and `POST /generate`
-  (`{n}`, regtest only: mine N blocks on demand so tests/demos don't wait on the
-  block interval). When `DNAS_API_TOKEN`
+  nonce/expiry/lock_until/memo), `POST /tx` (a fully-signed tx incl. multisig,
+  HTLC, an asset transfer or an issuance), `POST /mine` (`{on}` toggles mining at
+  runtime), `POST /generate` (`{n}`, regtest only: mine N blocks on demand), and
+  `POST /submitblock` (accept a block mined by an external miner).
+- **Mining:** `GET /blocktemplate?address=ADDR` returns a candidate block (every
+  field filled but the winning nonce) so an external miner (`dnas miner`) can hash
+  it off-node and submit the result to `/submitblock` — mining is fully decoupled
+  from the node. When `DNAS_API_TOKEN`
   is set these require an `Authorization: Bearer <token>` header
   (constant-time compared); read endpoints stay open, and an unset token leaves
   the whole API open (the localhost/toy default). The token is read from the
@@ -616,7 +692,7 @@ All in [`core/params.go`](core/params.go). Every node must agree on these.
 | `InitialBlockReward`  | 50 · Coin        | first-epoch coinbase subsidy              |
 | `HalvingInterval`     | 210 000          | blocks between reward halvings            |
 | `GenesisBits`         | ~2^240 target    | compact PoW target at genesis (nBits)     |
-| `PowLimit`/`MinTarget`| ~2^244 / ~2^236  | easiest / hardest target (retarget clamp) |
+| `PowLimit`            | ~2^244 target    | easiest target (difficulty floor); no hard ceiling — difficulty is unbounded |
 | `TargetBlockTime`     | 5 s              | desired spacing (LWMA retarget target)    |
 | `lwmaWindow`          | 20               | blocks the LWMA retarget averages over    |
 | `ProtocolVersion`     | 1                | P2P wire version (peers below are dropped) |
@@ -625,6 +701,9 @@ All in [`core/params.go`](core/params.go). Every node must agree on these.
 | `MaxBlockTxs`         | 1000             | non-coinbase txs per block                |
 | `MaxBlockBytes`       | 1 000 000        | total non-coinbase tx bytes per block     |
 | `MaxMemoBytes`        | 256              | per-tx memo cap                           |
+| `MaxTickerLen`        | 8                | native-asset ticker length cap            |
+| `MaxAssetSupply`      | 2^62             | native-asset supply cap (overflow-safe)   |
+| `DustThreshold`       | 1000             | min coin transfer once UpgradeDustLimit is active |
 | `MaxFutureDrift`      | 120 s            | how far ahead a timestamp may be          |
 | `DefaultMinRelayFee`  | 10 /byte         | base of the dynamic fee floor (policy, per byte) |
 | `InitialBaseFee`      | 10 /byte         | EIP-1559 base fee at genesis (consensus, per byte) |
@@ -639,6 +718,11 @@ All in [`core/params.go`](core/params.go). Every node must agree on these.
 
 | Decision | Why | Trade-off |
 |----------|-----|-----------|
+| Unbounded PoW difficulty (LWMA, no hard cap) + `NoRetarget` for devnet | Real economic security — rewriting history costs ever-growing work; a devnet still gets instant blocks | Genesis starts easy; security only exists once real hashpower is present |
+| Canonical binary consensus encoding (not JSON) | txid/size/signing are reproducible by any implementation, so a second client can't silently fork | The wire transport is still JSON (a separate efficiency concern) |
+| Height-activated consensus upgrades | Rule changes roll out on a coordinated flag-day, not an uncoordinated fork | No miner version-bit signaling yet (needs a header version field) |
+| Permissionless by default; `-netkey` opt-in for a private net | Anyone can join — the defining property of a cryptocurrency | The open handshake is anonymous (no MITM authentication); safety rests on many peers + identity + eclipse caps |
+| Inbound caps (total + per-IP-group) + per-peer rate limiting | Eclipse/DoS resistance for an open network | Heuristic caps, not a full addrman/ASN-diversity scheme |
 | Account+nonce, not UTXO | Simpler state & replay logic to read | Coinbase maturity needs a history scan instead of per-coin locks |
 | Smaller-tip-hash tie-break | Deterministic → all nodes converge; monotonic → no flapping | Not first-seen; a heavier/smaller-hash block always wins |
 | Coinbase maturity by history scan | No new state, reverses on reorg for free | O(maturity) scan per spend check (tiny here) |
@@ -651,6 +735,9 @@ All in [`core/params.go`](core/params.go). Every node must agree on these.
 | Snapshot fast-sync, verified against the state root | Trustless bootstrap without replaying settled history — composes checkpoints + state roots | The fast-synced (pruned) chain runs in memory; persisting it needs a base-offset store format (future work) |
 | Dandelion++ on by default | Transaction-origin privacy | Adds relay latency, bounded by the embargo; a small devnet fluffs within a few hops |
 | Light wallet signs locally | A real self-custodial wallet — the key never leaves the client | The next nonce is tracked locally between confirmations |
+| Native assets in the account, committed in the state root | Tokens with light-client-provable balances; `omitempty` keeps coin-only state (and genesis) unchanged | Fees are always coin (no per-asset fee market); it's balances, not a scripting/contract system |
+| External miner protocol (`getblocktemplate`/`submitblock`) | Mining decoupled from the node — hashpower can live elsewhere | A stale template is rejected; the miner refetches |
+| Adversarial sim via an injected transport | Stress reorg/finality/sync/partitions in-process, deterministically | Test-only; a reliable stream transport models latency/partitions, not packet loss |
 | State root in the header (balance proofs) | Light clients prove balances, not just inclusion | Another header field; proves membership only, not account absence |
 | Regtest = on-demand `/generate`, not fast continuous mining | Deterministic, controlled block production; no runaway chain | A separate mode; isolated by netkey rather than a distinct genesis |
 | Checksums client-side only | Avoids a consensus validation cascade | A malicious client can still burn its own coins |
@@ -673,6 +760,11 @@ All in [`core/params.go`](core/params.go). Every node must agree on these.
   transaction/header/Merkle/amount decoding and address/mnemonic validation.
 - **In-process integration tests** (`node/integration_test.go`) spin up multiple
   nodes on ephemeral ports and assert sync/discovery/convergence.
+- **Adversarial network simulation** (`node/simnet_test.go`) wires nodes through a
+  switchboard (injected via `Node.dialFn`/`listenFn`) that adds latency and can
+  partition links on demand, then asserts that a network which forks under a
+  partition re-converges on the most-work chain after healing — stressing reorg,
+  fork choice and sync under conditions the plain integration tests don't reach.
 - **GUI tests** (`gui/test_dnas_gui.py`) run headless (`QT_QPA_PLATFORM=offscreen`)
   against a stub HTTP server.
 - **End-to-end demo** (`scripts/demo.sh`) runs a three-node network exercising
@@ -694,6 +786,10 @@ All in [`core/params.go`](core/params.go). Every node must agree on these.
   with `dpkg-deb --root-owner-group`.
 - The build **version is stamped** via `-ldflags "-X main.version=…"` (default
   from `git describe`) and reported by `dnas version`.
+- **CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs a gofmt
+  check, `make vet`, `make build`, and `make test-race` on every push and pull
+  request, and on a version tag (`v*`) also runs `make dist` + `make deb` and
+  uploads the tarballs and `.deb`s as build artifacts.
 
 See [scripts/README.md](scripts/README.md) for the script details.
 
@@ -701,8 +797,15 @@ See [scripts/README.md](scripts/README.md) for the script details.
 
 ## 21. Known limitations
 
-- Not sybil-resistant; identities aren't cost-bound. Bans now persist across a
-  graceful restart, but a hard kill can lose them (re-learned from peers).
+- The network is now open/permissionless with inbound caps (total + per-IP-group)
+  and per-peer rate limiting for eclipse/DoS resistance, but identities and IPs are
+  still cheap, so it is not fully sybil-resistant (no proof-of-work/stake peer
+  gating, no ASN-diversity addrman). The open handshake is anonymous — it has no
+  MITM authentication; safety rests on connecting to many peers. Bans persist
+  across a graceful restart but a hard kill can lose them (re-learned from peers).
+- Consensus is defined by a canonical binary encoding (portable across
+  implementations), but there is still only ONE implementation — no second client
+  has verified the spec, and there are no cross-client consensus test vectors.
 - Recipient checksums are client-side, not consensus.
 - API auth is a single shared bearer token on write endpoints, not per-user
   authentication; reads are unauthenticated.
@@ -719,14 +822,22 @@ See [scripts/README.md](scripts/README.md) for the script details.
   header state root, not account *absence*.
 - HTLC refund timing and coinbase maturity are enforced at block application, not
   in signature verification. HD is not SLIP-0010. Proof of work is a continuous
-  256-bit target (nBits) retargeted by an LWMA, but the target band is kept tiny
-  by design so a laptop mines instantly.
+  256-bit target (nBits) retargeted by an LWMA with **no hard difficulty cap**, so
+  on a real network difficulty tracks hashpower without bound; only a devnet /
+  regtest (`NoRetarget`) holds it at the easy genesis floor for instant blocks.
 - Snapshot fast-sync bootstraps trustlessly (state verified against the header
   state root, anchored by a checkpoint) but the resulting pruned chain runs in
   memory — persisting it through the index-based block store is future work.
 - Dandelion++ hides a transaction's origin along the stem, but on a tiny devnet
   with few peers the anonymity set is small; it is a demonstration of the scheme.
+- Native assets are balances committed in the state root; fees are always paid in
+  coin (no per-asset fee market), and there is no scripting/contract layer — asset
+  logic is limited to issue and transfer.
 - Regtest is isolated from a devnet by its network key, not a distinct genesis;
   point it at a separate data directory.
+
+Each limitation is a chosen stopping point. [ROADMAP.md](ROADMAP.md) turns this
+list into a prioritized plan (on-disk state trie, second implementation, script
+VM, addrman/BIP152, and the rest).
 
 It is a toy. Do not point it at the internet.

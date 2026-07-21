@@ -357,6 +357,9 @@ func spvBalance(base, addr string) error {
 	}
 	fmt.Printf("✓ proven against a %d-header PoW chain (state committed in block %d)\n", len(headers), p.BlockIndex)
 	fmt.Printf("  %s\n  balance %s  nonce %d\n", addr, core.FormatAmount(p.Account.Balance), p.Account.Nonce)
+	for id, amt := range p.Account.Assets {
+		fmt.Printf("  asset %s  %d units\n", id, amt)
+	}
 	return nil
 }
 

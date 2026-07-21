@@ -113,7 +113,7 @@ func TestSPVWalletSendBuildAndNonce(t *testing.T) {
 	w, _ := wallet.New()
 	bob, _ := wallet.New()
 
-	tx, err := buildSend(w, bob.Address(), 3*core.Coin, 1000, 5)
+	tx, err := buildSend(w, bob.Address(), 3*core.Coin, 1000, 5, "")
 	if err != nil {
 		t.Fatal(err)
 	}

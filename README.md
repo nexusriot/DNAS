@@ -19,7 +19,8 @@ It is a learning project, not money. Do not point it at the internet.
 New here? See [QUICKSTART.md](QUICKSTART.md) to build, mine, run a wallet, send a
 payment, form a network, and verify transactions. For *how and why* it works —
 the ledger model, consensus, networking, and the trade-offs behind each choice —
-see [DESIGN.md](DESIGN.md).
+see [DESIGN.md](DESIGN.md). For what it deliberately does *not* do yet, and where
+it would go next, see [ROADMAP.md](ROADMAP.md).
 
 ## What makes it a cryptocurrency (not just a hash-chain)
 
@@ -48,6 +49,11 @@ see [DESIGN.md](DESIGN.md).
   fullness, so it rises under load and decays when idle, and a block is bounded by
   `MaxBlockBytes` of transaction data — block space is a metered, priced resource
   and the mempool ranks transactions by fee *rate* (fee per byte).
+- **Native assets (tokens).** Beyond the base coin, any address can **issue** a
+  named asset and transfer it; balances are tracked per account and **committed in
+  the state root**, so a light client proves an asset balance just like a coin
+  balance. Fees are always paid in coin. (`dnas spv wallet -key F issue <ticker>
+  <supply>` / `... -asset <id> send <to> <amt>`.)
 - **Coinbase maturity.** A freshly-mined coinbase reward cannot be spent until it
   is buried under `CoinbaseMaturity` further blocks (3 here; Bitcoin uses 100).
   Both consensus and the miner's own block builder enforce it, so a reorg that
@@ -85,14 +91,19 @@ see [DESIGN.md](DESIGN.md).
   against the header's committed state root, then downloads and fully validates
   only the blocks above it — reaching the same cumulative work, balances proven
   rather than trusted.
+- **External mining.** Mining is decoupled from the node: `GET /blocktemplate`
+  hands out a candidate block, an external miner (`dnas miner`) searches for the
+  winning nonce off-node, and `POST /submitblock` accepts it — so hashpower can
+  live on a separate machine.
 - **Deterministic genesis.** Every node computes the same genesis block, so
   independent nodes can actually agree on one chain.
 - **Most-work consensus with a deterministic tie-break, MTP timestamps, and
   reorgs.** Proof of work is a **256-bit compact target** (Bitcoin-style nBits),
-  retargeted every block by an **LWMA** toward the target block time (continuous,
-  not the old coarse 3–5 steps). Peers adopt the chain with the greatest
-  cumulative work
-  (Σ 16^difficulty); equal-work forks are broken by preferring the smaller tip
+  retargeted every block by an **LWMA** toward the target block time with **no
+  hard difficulty cap** — so difficulty rises without bound to match real
+  hashpower (a devnet/regtest holds it fixed via `NoRetarget` for instant blocks).
+  Peers adopt the chain with the greatest cumulative work
+  (Σ 2^256/(target+1)); equal-work forks are broken by preferring the smaller tip
   hash, so every node converges on the same canonical chain. A block's timestamp
   must exceed the median of the last 11 (median-time-past), bounding timestamp
   manipulation while tolerating small out-of-order stamps. Switching chains is a
@@ -106,12 +117,17 @@ see [DESIGN.md](DESIGN.md).
 
 ## Networking & security
 
-- **Authenticated, encrypted, identified links.** Every connection begins with a
-  symmetric X25519 key exchange authenticated by a pre-shared network key
-  (`-netkey`) — a peer that doesn't know the key fails an HMAC check and is
-  dropped, and traffic is AES-256-GCM encrypted. Each peer then proves its
-  **Ed25519 node identity** by signing the session id, so peers are
-  cryptographically identified (not just "knows the key").
+- **Permissionless, encrypted, identified links.** Every connection begins with a
+  symmetric X25519 key exchange and AES-256-GCM encryption. By **default there is
+  no shared key — the network is open**: anyone may connect (the defining property
+  of a cryptocurrency). Supplying a `-netkey` instead authenticates a *private*
+  network (a peer without the key fails an HMAC check). Either way each peer proves
+  its **Ed25519 node identity** by signing the session id, so peers are
+  cryptographically identified.
+- **Eclipse & DoS resistance.** Inbound connections are capped in total and
+  per-IP-group (/16), so an attacker can't monopolise a node's peer slots without
+  many address ranges; each peer is rate-limited (token bucket) and the expensive
+  whole-chain request is throttled per peer.
 - **Ban scoring.** Peers that misbehave accrue ban points and are cut off past a
   threshold: failed handshakes are scored by IP (loopback exempt), and
   post-authentication fraud — a bad header chain, or a block that fails its own
@@ -246,7 +262,7 @@ graceful restart resumes warm.
 | `-peers`     | —              | comma-separated seed peer addresses            |
 | `-wallet`    | `wallet.json`  | wallet key file (created if missing)           |
 | `-db`        | `chain.db`     | append-only blockchain store file              |
-| `-netkey`    | `dnas-devnet`  | pre-shared network key; **peers must match**   |
+| `-netkey`    | — (open)       | pre-shared key for a **private** net; empty = open/permissionless |
 | `-maxpeers`  | `8`            | maximum outbound peer connections              |
 | `-mempool`   | `5000`         | max pending transactions                       |
 | `-minrelayfee` | `10`         | base min relay fee (base units **per byte**); rises with mempool load; 0 disables |
@@ -280,11 +296,13 @@ go run ./cmd/dnas node -listen :3001 -api :8081 -peers localhost:3000 -mine \
 | GET    | `/info`           | height, tip, next difficulty, work, mempool, min relay fee, base fee, peers |
 | GET    | `/chain`          | the full chain                                                |
 | GET    | `/balance/{addr}` | balance (raw + formatted)                                     |
-| GET    | `/account/{addr}` | balance and nonce                                             |
+| GET    | `/account/{addr}` | balance, nonce, and any native-asset balances                 |
 | GET    | `/mempool`        | pending transactions                                          |
 | GET    | `/peers`          | connected peers                                               |
 | GET    | `/address`        | this node's wallet address                                    |
 | GET    | `/estimatefee`    | `?blocks=N` → recommended fee **rate** per byte (base fee + estimated tip) |
+| GET    | `/blocktemplate`  | `?address=ADDR` → candidate block for an external miner       |
+| POST   | `/submitblock`    | submit an externally-mined block                              |
 | GET    | `/headers`        | all block headers (SPV)                                       |
 | GET    | `/header/{index}` | one block header (SPV)                                        |
 | GET    | `/block/{index}`  | one full block body (light clients fetch only flagged blocks) |
@@ -396,10 +414,14 @@ branch and the other via the **refund** (timeout) branch.
 
 ## Known limitations (it's a toy)
 
-- Node identities aren't cost-bound, so ban scoring (keyed by identity) can be
-  evaded by rotating keys — fine for a friendly devnet, not sybil-resistant.
-  There's no allow-list. Ban scores persist across a *graceful* restart but a
-  hard kill can lose the latest state (it re-syncs from peers anyway).
+- The network is open/permissionless with inbound caps (total + per-IP-group) and
+  per-peer rate limiting for eclipse/DoS resistance, but node identities and IPs
+  aren't cost-bound, so it isn't fully sybil-resistant (no PoW/stake peer gating,
+  no ASN-diversity addrman), and the open handshake is anonymous (no MITM auth).
+  Ban scores persist across a *graceful* restart but a hard kill can lose the
+  latest state (re-synced from peers).
+- Consensus uses a canonical binary encoding (portable across implementations),
+  but there is still only one implementation and no cross-client test vectors.
 - Locator sync transfers only the divergent suffix for normal forks; genuinely
   deep or losing forks still fall back to a whole-chain exchange.
 - Recipient checksums are enforced client-side (in `/send` and the REPL), not in
@@ -414,4 +436,11 @@ branch and the other via the **refund** (timeout) branch.
   filters aren't committed in the PoW header, so (like BIP157/158) their
   correctness rests on the honest-node / multi-peer assumption rather than being
   trustless. Committing a filter root in the header would be a consensus change.
-- Difficulty bounds are tiny so a laptop can mine instantly.
+- Proof-of-work difficulty is unbounded (it tracks hashpower); a devnet/regtest
+  pins it to the easy genesis floor (`NoRetarget`) so a laptop mines instantly.
+- Consensus rules can change via height-activated upgrades (`core/upgrade.go`), but
+  there's no on-chain miner signaling (BIP9) — activation heights are set at
+  startup, like checkpoints.
+
+Each of these is a deliberate stopping point, not an oversight; the prioritized
+plan for closing them is in [ROADMAP.md](ROADMAP.md).

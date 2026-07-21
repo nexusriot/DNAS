@@ -50,6 +50,8 @@ func main() {
 		runSPV(args[1:])
 	case "fastsync":
 		runFastSync(args[1:])
+	case "miner":
+		runMiner(args[1:])
 	case "htlc":
 		runHTLC(args[1:])
 	case "help", "-h", "--help":
@@ -77,6 +79,7 @@ Usage:
   dnas spv [-api URL] wallet ...      persistent light wallet (add/update/status/watch)
   dnas spv [-api URL] wallet -key F new|send <to> <amount>   self-custodial light wallet (signs locally)
   dnas fastsync [-api URL] [-checkpoint H:HASH]   bootstrap state from a verified snapshot
+  dnas miner -api URL -address ADDR   external miner (get template, mine, submit)
   dnas htlc new                       mint a preimage + hash for an atomic swap
   dnas htlc <address|claim|refund>    build hash-time-locked contract spends
   dnas version                        print the build version
@@ -295,7 +298,7 @@ func runNode(args []string) {
 	peersStr := fs.String("peers", cfg.str("peers", ""), "comma-separated seed peer addresses")
 	walletPath := fs.String("wallet", cfg.str("wallet", "wallet.json"), "wallet key file (created if missing)")
 	dbPath := fs.String("db", cfg.str("db", "chain.db"), "blockchain append-only store file")
-	netKey := fs.String("netkey", cfg.str("netkey", node.DefaultNetKey), "pre-shared network key (peers must match)")
+	netKey := fs.String("netkey", cfg.str("netkey", ""), "pre-shared network key for a PRIVATE net (peers must match); empty = open/permissionless")
 	maxPeers := fs.Int("maxpeers", cfg.integer("maxpeers", node.DefaultMaxPeers), "maximum outbound peer connections")
 	mempoolMax := fs.Int("mempool", cfg.integer("mempool", core.DefaultMempoolSize), "max pending transactions")
 	minRelayFee := fs.Int("minrelayfee", cfg.integer("minrelayfee", int(core.DefaultMinRelayFee)), "base minimum relay fee in base units (rises with mempool load; 0 disables)")
@@ -319,9 +322,18 @@ func runNode(args []string) {
 
 	// In regtest, isolate the network by default (a distinct pre-shared key) so a
 	// local test node can't accidentally peer with a devnet, unless the operator
-	// set -netkey explicitly.
-	if *regtest && *netKey == node.DefaultNetKey {
-		*netKey = "dnas-regtest"
+	// set -netkey explicitly, and hold difficulty fixed (no retargeting) so blocks
+	// stay instant on demand.
+	if *regtest {
+		core.NoRetarget = true
+		if *netKey == "" {
+			*netKey = "dnas-regtest"
+		}
+	}
+	if *netKey == "" {
+		log.Print("network: OPEN / permissionless (encrypted, no shared key; set -netkey for a private net)")
+	} else {
+		log.Print("network: private (authenticated by the shared -netkey)")
 	}
 
 	var relayFloor uint64

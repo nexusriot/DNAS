@@ -3,6 +3,7 @@ package core
 import (
 	"fmt"
 	"sort"
+	"strings"
 )
 
 // The account state is committed in each block header as a merkle root over the
@@ -11,9 +12,27 @@ import (
 // included. Leaves are sorted by address for determinism (every node builds an
 // identical tree), and each leaf binds the address to its (balance, nonce).
 
-// stateLeaf is the merkle leaf committing one account.
+// stateLeaf is the merkle leaf committing one account: address, coin balance,
+// nonce, and any asset balances (appended in sorted order so the encoding is
+// deterministic). A coin-only account has no asset suffix, so its leaf — and
+// therefore the whole state root for a coin-only chain — is byte-identical to
+// before assets existed.
 func stateLeaf(addr string, acc Account) string {
-	return hashBytes([]byte(fmt.Sprintf("%s|%d|%d", addr, acc.Balance, acc.Nonce)))
+	s := fmt.Sprintf("%s|%d|%d", addr, acc.Balance, acc.Nonce)
+	if len(acc.Assets) > 0 {
+		ids := make([]string, 0, len(acc.Assets))
+		for id := range acc.Assets {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		var b strings.Builder
+		b.WriteString(s)
+		for _, id := range ids {
+			fmt.Fprintf(&b, "|%s:%d", id, acc.Assets[id])
+		}
+		s = b.String()
+	}
+	return hashBytes([]byte(s))
 }
 
 // sortedStateLeaves returns the account addresses in sorted order together with

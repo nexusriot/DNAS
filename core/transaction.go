@@ -3,7 +3,6 @@ package core
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -30,6 +29,12 @@ type Transaction struct {
 	Expiry    uint64 `json:"expiry,omitempty"`
 	LockUntil uint64 `json:"lock_until,omitempty"`
 	Memo      string `json:"memo,omitempty"`
+
+	// Native asset support. When AssetID is set, Amount is an amount of that asset
+	// (moved from From to To) rather than coin; the Fee is always paid in coin.
+	// When Issue is set, the transaction mints a new asset to From (Fee in coin).
+	AssetID string      `json:"asset_id,omitempty"`
+	Issue   *AssetIssue `json:"issue,omitempty"`
 
 	// Single-signature authorization.
 	PubKey    string `json:"pubkey,omitempty"`
@@ -100,32 +105,33 @@ func (t Transaction) IsLockedAt(height uint64) bool {
 	return t.LockUntil != 0 && height < t.LockUntil
 }
 
-// signingBytes are the canonical bytes a sender signs. They exclude PubKey and
-// Signature so the signature can cover everything that defines the transfer.
-// Memo is placed last: every earlier field is delimiter-free, so the encoding
-// stays unambiguous even if the memo contains the delimiter.
-func (t Transaction) signingBytes() []byte {
-	return []byte(fmt.Sprintf("%s|%s|%d|%d|%d|%d|%d|%s",
-		t.From, t.To, t.Amount, t.Fee, t.Nonce, t.Expiry, t.LockUntil, t.Memo))
-}
+// signingBytes are the canonical bytes a sender signs: a length-prefixed binary
+// encoding (see codec.go) of every field that defines the transfer, excluding the
+// signature/authorization fields. Being binary and length-prefixed, it is
+// unambiguous for any field value and reproducible by any implementation.
+func (t Transaction) signingBytes() []byte { return t.canonicalSigningBytes() }
 
-// Hash uniquely identifies the transaction, signature included, for mempool
-// deduplication and merkle trees.
+// IsAssetTransfer reports whether this transaction moves a native asset (Amount
+// is in asset units) rather than coin.
+func (t Transaction) IsAssetTransfer() bool { return t.AssetID != "" && t.Issue == nil }
+
+// IsIssue reports whether this transaction mints a new native asset.
+func (t Transaction) IsIssue() bool { return t.Issue != nil }
+
+// Hash uniquely identifies the transaction (its "txid"), signature included, for
+// mempool deduplication and merkle trees. It is sha256 over the canonical binary
+// encoding (codec.go), not encoding/json, so every implementation agrees.
 func (t Transaction) Hash() string {
-	b, _ := json.Marshal(t)
-	h := sha256.Sum256(b)
+	h := sha256.Sum256(t.canonicalBytes())
 	return hex.EncodeToString(h[:])
 }
 
-// Size is the transaction's serialized byte length. Fees are priced per byte: a
-// transaction must pay at least the block's base fee for every byte it occupies
-// (see the base-fee rule in applyTxsAndCoinbase), and the mempool ranks and
-// evicts by fee rate (fee per byte). It is the length of the canonical JSON
-// encoding — the same encoding Hash uses — so every node computes the same value.
-func (t Transaction) Size() int {
-	b, _ := json.Marshal(t)
-	return len(b)
-}
+// Size is the transaction's canonical serialized byte length. Fees are priced per
+// byte: a transaction must pay at least the block's base fee for every byte it
+// occupies (see the base-fee rule in applyTxsAndCoinbase), and the mempool ranks
+// and evicts by fee rate (fee per byte). It is the length of the canonical binary
+// encoding — the same bytes Hash uses — so every node computes the same value.
+func (t Transaction) Size() int { return len(t.canonicalBytes()) }
 
 // NewCoinbase builds the issuance transaction paying `amount` to `to`.
 func NewCoinbase(to string, amount uint64) Transaction {

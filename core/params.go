@@ -50,6 +50,11 @@ const (
 	// MaxMemoBytes caps the optional per-transaction memo.
 	MaxMemoBytes = 256
 
+	// DustThreshold is the smallest coin transfer allowed once the UpgradeDustLimit
+	// consensus upgrade is active (a worked example of a height-activated rule; the
+	// rule is off until an activation height is scheduled).
+	DustThreshold uint64 = 1000
+
 	// DefaultMinRelayFee is the base per-BYTE fee a node asks for before it will
 	// relay/queue a transaction (a transaction pays this times its size). It is
 	// *relay policy*, not a consensus rule: a node with a lower floor will still

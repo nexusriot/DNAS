@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/nexusriot/DNAS/core"
@@ -258,7 +259,8 @@ func (sw *SPVWallet) printStatus() {
 func runSPVWallet(base string, args []string) {
 	fs := flag.NewFlagSet("spv wallet", flag.ExitOnError)
 	file := fs.String("f", "spvwallet.json", "SPV wallet state file")
-	keyFile := fs.String("key", "", "signing key file for `new`/`send` (encrypted if DNAS_WALLET_PASSPHRASE is set)")
+	keyFile := fs.String("key", "", "signing key file for `new`/`send`/`issue` (encrypted if DNAS_WALLET_PASSPHRASE is set)")
+	asset := fs.String("asset", "", "for `send`: transfer this asset id (amount is in asset units, not DNAS)")
 	watch := fs.Bool("watch", false, "after updating, follow the node's /events stream and re-sync on each new block")
 	_ = fs.Parse(args)
 	rest := fs.Args()
@@ -343,12 +345,19 @@ func runSPVWallet(base string, args []string) {
 	case "send":
 		// A self-custodial send: sign locally with the key file, submit via /tx.
 		if *keyFile == "" || len(rest) < 3 {
-			fmt.Println("usage: dnas spv -api URL wallet -key FILE send <to> <amount> [fee]")
+			fmt.Println("usage: dnas spv -api URL wallet -key FILE [-asset ID] send <to> <amount> [fee]")
 			return
 		}
-		sw.send(base, *keyFile, rest[1:], func() { saveOr(sw) })
+		sw.send(base, *keyFile, *asset, rest[1:], func() { saveOr(sw) })
+	case "issue":
+		// Mint a new native asset, signed locally.
+		if *keyFile == "" || len(rest) < 3 {
+			fmt.Println("usage: dnas spv -api URL wallet -key FILE issue <ticker> <supply> [fee]")
+			return
+		}
+		sw.issue(base, *keyFile, rest[1:], func() { saveOr(sw) })
 	default:
-		fmt.Println("unknown wallet command:", cmd, "(new | add | update | status | list | forget | send)")
+		fmt.Println("unknown wallet command:", cmd, "(new | add | update | status | list | forget | send | issue)")
 	}
 }
 
@@ -362,21 +371,41 @@ func (sw *SPVWallet) nextNonce(addr string, provenNonce uint64) uint64 {
 	return provenNonce
 }
 
-// buildSend builds and signs a transfer from w. Pure (no network), so it is
-// unit-tested directly; send() feeds it the trustlessly-proven nonce.
-func buildSend(w *wallet.Wallet, to string, amount, fee, nonce uint64) (core.Transaction, error) {
-	tx := core.Transaction{From: w.Address(), To: to, Amount: amount, Fee: fee, Nonce: nonce}
+// buildSend builds and signs a transfer from w (coin when assetID is empty, else
+// a native-asset transfer). Pure (no network), so it is unit-tested directly.
+func buildSend(w *wallet.Wallet, to string, amount, fee, nonce uint64, assetID string) (core.Transaction, error) {
+	tx := core.Transaction{From: w.Address(), To: to, Amount: amount, Fee: fee, Nonce: nonce, AssetID: assetID}
 	if err := tx.Sign(w); err != nil {
 		return core.Transaction{}, err
 	}
 	return tx, nil
 }
 
-// send builds, signs, and submits a transaction from the wallet's own key file.
-// The private key never leaves the client: the balance and nonce are proven
-// trustlessly (state proof against a PoW-verified header), the transaction is
-// signed locally, and only the signed transaction is sent to the node.
-func (sw *SPVWallet) send(base, keyFile string, args []string, save func()) {
+// recordSent advances the wallet's local next-nonce for an address after a submit.
+func (sw *SPVWallet) recordSent(addr string, nonce uint64) {
+	if sw.NextNonce == nil {
+		sw.NextNonce = map[string]uint64{}
+	}
+	sw.NextNonce[addr] = nonce + 1
+}
+
+// resolveFee returns the fee to use: an explicit arg (decimal DNAS) or the node's
+// per-byte estimate times a size budget.
+func resolveFee(base string, args []string) (uint64, error) {
+	if len(args) > 2 {
+		return core.ParseAmount(args[2])
+	}
+	// Budget for a generous transaction size so the fee clears the per-byte floor
+	// even for larger (asset / memo-bearing) transactions.
+	return feePerByte(base) * 1000, nil
+}
+
+// send builds, signs, and submits a transfer from the wallet's own key file (coin,
+// or a native asset when assetID is set). The private key never leaves the client:
+// the balance and nonce are proven trustlessly (state proof against a PoW-verified
+// header), the transaction is signed locally, and only the signed transaction is
+// sent to the node.
+func (sw *SPVWallet) send(base, keyFile, assetID string, args []string, save func()) {
 	w, _, err := wallet.LoadOrCreateEncrypted(keyFile, walletPassphrase())
 	if err != nil {
 		fmt.Println("key error:", err)
@@ -386,40 +415,47 @@ func (sw *SPVWallet) send(base, keyFile string, args []string, save func()) {
 		fmt.Println("invalid recipient:", err)
 		return
 	}
-	amount, err := core.ParseAmount(args[1])
+
+	// A coin amount is decimal DNAS; an asset amount is plain integer units.
+	var amount uint64
+	if assetID != "" {
+		amount, err = strconv.ParseUint(args[1], 10, 64)
+	} else {
+		amount, err = core.ParseAmount(args[1])
+	}
 	if err != nil {
-		fmt.Println(err)
+		fmt.Println("bad amount:", err)
 		return
 	}
 
-	// Trustlessly prove our confirmed balance and nonce.
 	acc, err := provenAccount(base, w.Address())
 	if err != nil {
 		fmt.Println("could not prove account state:", err)
 		return
 	}
-
-	// Fee: explicit, or derived from the node's per-byte estimate × a size budget.
-	var fee uint64
-	if len(args) > 2 {
-		if fee, err = core.ParseAmount(args[2]); err != nil {
-			fmt.Println(err)
-			return
-		}
-	} else {
-		fee = feePerByte(base) * 400 // ~400-byte budget covers base fee + a tip
+	fee, err := resolveFee(base, args)
+	if err != nil {
+		fmt.Println(err)
+		return
 	}
-
-	// Next nonce: past the proven confirmed nonce and any sends not yet confirmed.
 	nonce := sw.nextNonce(w.Address(), acc.Nonce)
 
-	if amount+fee > acc.Balance {
-		fmt.Printf("insufficient proven balance: have %s, need %s\n",
-			core.FormatAmount(acc.Balance), core.FormatAmount(amount+fee))
+	// The fee is always coin; an asset send additionally needs enough of the asset.
+	if assetID != "" {
+		if fee > acc.Balance {
+			fmt.Printf("insufficient coin for fee: have %s, need %s\n", core.FormatAmount(acc.Balance), core.FormatAmount(fee))
+			return
+		}
+		if acc.Assets[assetID] < amount {
+			fmt.Printf("insufficient asset: have %d, need %d\n", acc.Assets[assetID], amount)
+			return
+		}
+	} else if amount+fee > acc.Balance {
+		fmt.Printf("insufficient proven balance: have %s, need %s\n", core.FormatAmount(acc.Balance), core.FormatAmount(amount+fee))
 		return
 	}
 
-	tx, err := buildSend(w, args[0], amount, fee, nonce)
+	tx, err := buildSend(w, args[0], amount, fee, nonce, assetID)
 	if err != nil {
 		fmt.Println("sign:", err)
 		return
@@ -428,14 +464,58 @@ func (sw *SPVWallet) send(base, keyFile string, args []string, save func()) {
 		fmt.Println("rejected:", err)
 		return
 	}
-	if sw.NextNonce == nil {
-		sw.NextNonce = map[string]uint64{}
-	}
-	sw.NextNonce[w.Address()] = nonce + 1
-	sw.addAddress(w.Address()) // keep watching our own address
+	sw.recordSent(w.Address(), nonce)
+	sw.addAddress(w.Address())
 	save()
-	fmt.Printf("submitted %s → %s  %s (fee %s, nonce %d)\n",
-		tx.Hash()[:12], short(args[0]), core.FormatAmount(amount), core.FormatAmount(fee), nonce)
+	if assetID != "" {
+		fmt.Printf("submitted %s → %s  %d units of %s (fee %s, nonce %d)\n",
+			tx.Hash()[:12], short(args[0]), amount, short(assetID), core.FormatAmount(fee), nonce)
+	} else {
+		fmt.Printf("submitted %s → %s  %s (fee %s, nonce %d)\n",
+			tx.Hash()[:12], short(args[0]), core.FormatAmount(amount), core.FormatAmount(fee), nonce)
+	}
+}
+
+// issue mints a new native asset, signed locally with the wallet's key file.
+func (sw *SPVWallet) issue(base, keyFile string, args []string, save func()) {
+	w, _, err := wallet.LoadOrCreateEncrypted(keyFile, walletPassphrase())
+	if err != nil {
+		fmt.Println("key error:", err)
+		return
+	}
+	supply, err := strconv.ParseUint(args[1], 10, 64)
+	if err != nil {
+		fmt.Println("bad supply:", err)
+		return
+	}
+	acc, err := provenAccount(base, w.Address())
+	if err != nil {
+		fmt.Println("could not prove account state:", err)
+		return
+	}
+	fee, err := resolveFee(base, args)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	nonce := sw.nextNonce(w.Address(), acc.Nonce)
+	if fee > acc.Balance {
+		fmt.Printf("insufficient coin for fee: have %s, need %s\n", core.FormatAmount(acc.Balance), core.FormatAmount(fee))
+		return
+	}
+	tx := core.Transaction{From: w.Address(), Fee: fee, Nonce: nonce, Issue: &core.AssetIssue{Ticker: args[0], Supply: supply}}
+	if err := tx.Sign(w); err != nil {
+		fmt.Println("sign:", err)
+		return
+	}
+	if err := postJSON(base+"/tx", tx); err != nil {
+		fmt.Println("rejected:", err)
+		return
+	}
+	sw.recordSent(w.Address(), nonce)
+	sw.addAddress(w.Address())
+	save()
+	fmt.Printf("issued %d %s — asset id %s (nonce %d)\n", supply, args[0], core.AssetID(w.Address(), args[0], nonce), nonce)
 }
 
 // watchEvents follows the node's SSE stream and re-syncs on every new block or
