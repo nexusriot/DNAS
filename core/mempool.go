@@ -34,17 +34,12 @@ type Mempool struct {
 
 // NewMempool returns an empty mempool with the default size limit and no fee
 // floor (base relay fee 0).
-func NewMempool() *Mempool { return NewMempoolWithLimit(DefaultMempoolSize) }
+func NewMempool() *Mempool { return NewMempoolWithPolicy(DefaultMempoolSize, 0) }
 
-// NewMempoolWithLimit returns an empty mempool holding at most max transactions
-// (values <= 0 fall back to the default) and no fee floor.
-func NewMempoolWithLimit(max int) *Mempool {
-	return NewMempoolWithPolicy(max, 0)
-}
-
-// NewMempoolWithPolicy returns an empty mempool bounded at max transactions with
-// the given base minimum relay fee. The effective floor rises with occupancy
-// (see MinFee). A minRelayFee of 0 disables the floor entirely.
+// NewMempoolWithPolicy returns an empty mempool bounded at max transactions
+// (values <= 0 fall back to the default) with the given base minimum relay fee.
+// The effective floor rises with occupancy (see MinFee). A minRelayFee of 0
+// disables the floor entirely.
 func NewMempoolWithPolicy(max int, minRelayFee uint64) *Mempool {
 	if max <= 0 {
 		max = DefaultMempoolSize
@@ -189,6 +184,14 @@ func (m *Mempool) All() []Transaction {
 		out = append(out, tx)
 	}
 	return out
+}
+
+// Get returns a pending transaction by hash.
+func (m *Mempool) Get(hash string) (Transaction, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	tx, ok := m.txs[hash]
+	return tx, ok
 }
 
 // Remove deletes the given transactions (e.g. after they are mined).

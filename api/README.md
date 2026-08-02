@@ -6,7 +6,12 @@ node.
 Read endpoints: `/info` (includes `next_bits`/`next_difficulty`, `min_relay_fee`,
 the current dynamic fee floor, and the consensus `base_fee` — both per byte),
 `/chain`, `/balance/{addr}`, `/account/{addr}` (balance, nonce, and any native
-asset balances), `/mempool`, `/peers`, `/address`, `/estimatefee?blocks=N`
+asset balances), `/mempool`, `/tx/{txhash}` (one transaction by id — `confirmed`
+with its block and confirmation count, resolved through the chain's transaction
+index, or `pending` from this node's mempool, so a wallet polls one endpoint from
+submission to confirmation), `/supply` (minted, burned, circulating, and the
+`consistent` conservation check `minted − burned == circulating`),
+`/peers`, `/address`, `/estimatefee?blocks=N`
 (recommended per-byte fee = base fee + estimated tip, never below the relay
 floor), `/metrics` (Prometheus format, incl. `dnas_min_relay_fee` and
 `dnas_base_fee`).

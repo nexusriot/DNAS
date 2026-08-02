@@ -149,6 +149,8 @@ curl -s localhost:8080/balance/dnas...          # balance (raw + formatted)
 curl -s localhost:8080/account/dnas...          # balance + nonce
 curl -s localhost:8080/chain                    # full chain
 curl -s localhost:8080/mempool                  # pending txs
+curl -s localhost:8080/tx/<txhash>              # one tx: "pending" or "confirmed" + confirmations
+curl -s localhost:8080/supply                   # minted / burned / circulating coin
 curl -s localhost:8080/peers                    # connected peers
 curl -s localhost:8080/estimatefee              # recommended fee (base fee + tip)
 curl -s localhost:8080/stateproof/dnas...       # proof of an address's balance vs the state root
@@ -273,8 +275,14 @@ dnas fastsync -api localhost:8080                               # from the serve
 ```sh
 dnas node -config node.json            # JSON config seeds flags; flags still override
 curl -s localhost:8080/metrics         # Prometheus-format node metrics
+dnas supply -api localhost:8080        # minted / burned / circulating + conservation check
 # Ctrl-C / SIGTERM stops mining, closes peers, and flushes the store cleanly.
 ```
+
+`dnas supply` is the audit view of issuance: coin is created only by block
+subsidies and destroyed only by the burned base fee, so `minted − burned` must
+equal what accounts actually hold. A `conservation BROKEN` line would mean coin
+appeared or vanished some other way.
 
 `node.json` keys mirror the flags, e.g. `{"listen":":3000","api":":8080","mine":true,"maxpeers":8}`.
 

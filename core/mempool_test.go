@@ -44,7 +44,7 @@ func TestMempoolRejectsUnsigned(t *testing.T) {
 }
 
 func TestMempoolEvictsLowestFeeWhenFull(t *testing.T) {
-	mp := NewMempoolWithLimit(2)
+	mp := NewMempoolWithPolicy(2, 0)
 	low := mkTx(t, 1)
 	mid := mkTx(t, 5)
 	if ok, _ := mp.Add(low); !ok {

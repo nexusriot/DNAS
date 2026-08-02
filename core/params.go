@@ -24,8 +24,8 @@ const (
 
 	// TargetBlockTime is the desired seconds between blocks. Proof of work uses a
 	// 256-bit target in compact form (see target.go), retargeted every block by an
-	// LWMA toward this spacing and clamped to [MinTarget, PowLimit] so a toy devnet
-	// never stalls on an unreachable target or spins on a trivial one.
+	// LWMA toward this spacing. Only the easy side is clamped (to PowLimit), so
+	// difficulty rises without bound to match whatever hashpower shows up.
 	TargetBlockTime int64 = 5
 
 	// CoinbaseMaturity is how many blocks a coinbase reward must age before the

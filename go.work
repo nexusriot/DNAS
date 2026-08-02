@@ -8,6 +8,7 @@ use (
 	./api
 	./cmd
 	./core
+	./e2e
 	./node
 	./wallet
 )

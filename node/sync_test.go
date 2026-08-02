@@ -30,30 +30,37 @@ func sentMsgs(t *testing.T, buf *bytes.Buffer) []Message {
 	return out
 }
 
-// mineBlocks mines n blocks (coinbase to w) onto bc and returns them.
+// mineWith mines one block onto bc carrying txs, with the coinbase paid to w.
+func mineWith(t *testing.T, bc *core.Blockchain, w *wallet.Wallet, txs []core.Transaction) core.Block {
+	t.Helper()
+	tip := bc.Tip()
+	baseFee := bc.NextBaseFee()
+	cb := core.NewCoinbase(w.Address(), core.CoinbaseAmount(tip.Index+1, txs, baseFee))
+	b := core.Block{
+		Index:        tip.Index + 1,
+		Timestamp:    tip.Timestamp + 1,
+		Transactions: append([]core.Transaction{cb}, txs...),
+		PrevHash:     tip.Hash,
+		BaseFee:      baseFee,
+		Bits:         bc.NextBits(),
+	}
+	b.StateRoot, _ = bc.NextStateRoot(b)
+	mined, ok := core.Mine(b, nil)
+	if !ok {
+		t.Fatal("mining aborted")
+	}
+	if err := bc.AddBlock(mined); err != nil {
+		t.Fatalf("add block: %v", err)
+	}
+	return mined
+}
+
+// mineBlocks mines n empty blocks (coinbase to w) onto bc and returns them.
 func mineBlocks(t *testing.T, bc *core.Blockchain, w *wallet.Wallet, n int) []core.Block {
 	t.Helper()
-	var out []core.Block
+	out := make([]core.Block, 0, n)
 	for i := 0; i < n; i++ {
-		tip := bc.Tip()
-		cb := core.NewCoinbase(w.Address(), core.BlockReward(tip.Index+1))
-		b := core.Block{
-			Index:        tip.Index + 1,
-			Timestamp:    tip.Timestamp + 1,
-			Transactions: []core.Transaction{cb},
-			PrevHash:     tip.Hash,
-			BaseFee:      bc.NextBaseFee(),
-			Bits:         bc.NextBits(),
-		}
-		b.StateRoot, _ = bc.NextStateRoot(b)
-		mined, ok := core.Mine(b, nil)
-		if !ok {
-			t.Fatal("mining aborted")
-		}
-		if err := bc.AddBlock(mined); err != nil {
-			t.Fatalf("add block: %v", err)
-		}
-		out = append(out, mined)
+		out = append(out, mineWith(t, bc, w, nil))
 	}
 	return out
 }

@@ -40,9 +40,21 @@ jobs:
       - name: test (race detector)
         run: make test-race
 
+  e2e:
+    name: end-to-end (containerized)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Runs the black-box suite exactly as `make e2e-docker` does locally: the
+      # binary is built and driven inside the container, so this job needs no Go
+      # toolchain and cannot be affected by the runner's state.
+      - name: e2e suite in a container
+        run: make e2e-docker
+
   release:
     name: release artifacts
-    needs: test
+    needs: [test, e2e]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:

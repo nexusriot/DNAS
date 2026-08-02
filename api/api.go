@@ -54,6 +54,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/peers", s.peers)
 	mux.HandleFunc("/address", s.address)
 	mux.HandleFunc("/tx", s.guard(s.submitTx))             // POST a fully signed transaction
+	mux.HandleFunc("/tx/", s.txByHash)                     // GET /tx/HASH; confirmed or pending lookup
+	mux.HandleFunc("/supply", s.supply)                    // GET coin supply: minted, burned, circulating
 	mux.HandleFunc("/send", s.guard(s.send))               // POST {to, amount, fee, expiry?, nonce?}; signed by node wallet
 	mux.HandleFunc("/mine", s.guard(s.mine))               // POST {on: bool}; toggle mining at runtime
 	mux.HandleFunc("/generate", s.guard(s.generate))       // POST {n}; regtest-only on-demand mining
@@ -371,6 +373,54 @@ func (s *Server) account(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) mempool(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.node.Mempool().All())
+}
+
+// txByHash looks a transaction up by id: GET /tx/HASH. It answers for both
+// stages of a transaction's life — "confirmed" (with the block that holds it and
+// its confirmation count, resolved through the chain's transaction index) and
+// "pending" (still in this node's mempool) — so a wallet can poll one endpoint
+// from submission to confirmation instead of guessing which to ask.
+func (s *Server) txByHash(w http.ResponseWriter, r *http.Request) {
+	hash := strings.TrimPrefix(r.URL.Path, "/tx/")
+	if hash == "" {
+		writeErr(w, http.StatusBadRequest, "transaction hash required")
+		return
+	}
+	if tx, loc, ok := s.node.Chain().FindTx(hash); ok {
+		tip := s.node.Chain().Tip()
+		body := map[string]any{
+			"status":        "confirmed",
+			"hash":          hash,
+			"height":        loc.Height,
+			"index":         loc.Index,
+			"confirmations": tip.Index - loc.Height + 1,
+			"tx":            tx,
+		}
+		if b, ok := s.node.Chain().BlockAt(loc.Height); ok {
+			body["block_hash"] = b.Hash
+		}
+		writeJSON(w, http.StatusOK, body)
+		return
+	}
+	if tx, ok := s.node.Mempool().Get(hash); ok {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":        "pending",
+			"hash":          hash,
+			"confirmations": 0,
+			"tx":            tx,
+		})
+		return
+	}
+	writeErr(w, http.StatusNotFound, "transaction not found (neither confirmed nor pending)")
+}
+
+// supply reports coin issuance: how much has ever been minted by block
+// subsidies, how much the per-byte base fee has burned, and how much is actually
+// held in accounts. `consistent` is the conservation check minted − burned ==
+// circulating; false means coin has been created or destroyed outside those two
+// paths, which would be an accounting bug.
+func (s *Server) supply(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.node.Chain().Supply())
 }
 
 func (s *Server) peers(w http.ResponseWriter, r *http.Request) {

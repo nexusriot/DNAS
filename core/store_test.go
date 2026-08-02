@@ -73,7 +73,7 @@ func TestStoreReorgPersistsAcrossReopen(t *testing.T) {
 	if err := y.AddBlock(mineOn(t, y, other.Address(), nil)); err != nil {
 		t.Fatal(err)
 	}
-	if ok, err := bc.ReplaceChain(y.Blocks()); !ok || err != nil {
+	if ok, _, err := bc.ReplaceChain(y.Blocks()); !ok || err != nil {
 		t.Fatalf("reorg: ok=%v err=%v", ok, err)
 	}
 	tip := bc.Tip().Hash

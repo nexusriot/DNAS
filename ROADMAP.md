@@ -42,10 +42,22 @@ sections matter most for "toy → real".
   at fixed activation heights, like checkpoints. Version-bits in the block header
   would let hashpower signal readiness and activate on a threshold instead of a
   hard-coded flag day.
-- **`[S/M]` Explicit supply-conservation invariant.** Assert per block that
-  `Σ outputs + fees == Σ inputs + subsidy` (and per-asset issue/transfer
-  conservation), ideally committed, so an accounting bug can't silently inflate
-  supply.
+- **`[S]` Enforce supply conservation in consensus.** The accounting now exists:
+  minted (a function of height) and burned (accumulated per block) are tracked
+  independently, `Blockchain.Supply()` reports `minted − burned == circulating`,
+  and the tests assert it across mining, reorgs, reopen and fast-sync
+  ([core/supply.go](core/supply.go), §9). What remains is making it a *rule* —
+  checked per block during application, ideally committed in the header — plus the
+  same treatment for per-asset issue/transfer conservation, so an accounting bug
+  is rejected rather than merely reported.
+- **`[M]` Unique coinbase transactions (BIP34).** A coinbase commits only
+  (recipient, amount), so two blocks paying the same miner the same subsidy have
+  the same txid. Lookups work around it by resolving to the first occurrence
+  ([core/txindex.go](core/txindex.go)), but the duplication is real: an inclusion
+  proof for such a coinbase can only point at one of the blocks. Binding the block
+  height into the coinbase fixes it at the cost of a consensus change (existing
+  stores would not replay), so it wants an activation height via
+  [core/upgrade.go](core/upgrade.go).
 
 ## 2. Networking hardening & reach
 

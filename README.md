@@ -67,6 +67,18 @@ it would go next, see [ROADMAP.md](ROADMAP.md).
   only mineable within a window and is dropped from mempools outside it, plus an
   optional bounded `Memo`. A stuck (low-fee) transaction can be replaced by
   re-sending it at the *same nonce* with a strictly higher fee (replace-by-fee).
+- **Transactions survive a reorg.** Losing a race is not the same as being
+  invalid. When a node reorgs, the payments confirmed only in the branch it
+  abandoned are returned to its mempool to be mined again, instead of silently
+  vanishing until their sender notices; anything the winning branch already
+  confirms, or whose nonce it has since spent, is dropped instead. Confirmed
+  transactions are located through an index (`GET /tx/{hash}` answers for both a
+  mined and a still-pending transaction), so this costs one map lookup, not a scan.
+- **Auditable supply.** Coin enters only through block subsidies and leaves only
+  through the burned base fee, and both are tracked: `GET /supply` (or
+  `dnas supply`) reports how much has ever been minted, how much has been burned,
+  and how much accounts actually hold — plus the conservation check
+  `minted − burned == circulating`, which must hold for every valid chain.
 - **Light-client proofs (SPV) + compact filters.** Block hashes commit only to
   header fields plus a merkle root, so a client with headers alone can verify
   proof-of-work and the hash chain, then confirm a transaction is included via a
@@ -198,6 +210,8 @@ The quickest path is the **Makefile**:
 make build          # compile dnas + dnas-tui into bin/ (version stamped from git)
 make test           # go tests (all modules + tui) + the GUI tests
 make test-race      # the same under the race detector
+make e2e            # black-box end-to-end suite: drives the real binary (see e2e/)
+make e2e-docker     # the same suite isolated in a container (needs only Docker)
 make dist           # cross-compiled release tarballs (linux/amd64 + arm64) → dist/
 make deb            # .deb packages (amd64 + arm64) → dist/
 make install        # install dnas + dnas-tui to /usr/local/bin (PREFIX overridable)
@@ -298,6 +312,8 @@ go run ./cmd/dnas node -listen :3001 -api :8081 -peers localhost:3000 -mine \
 | GET    | `/balance/{addr}` | balance (raw + formatted)                                     |
 | GET    | `/account/{addr}` | balance, nonce, and any native-asset balances                 |
 | GET    | `/mempool`        | pending transactions                                          |
+| GET    | `/tx/{txhash}`    | one transaction, confirmed (block + confirmations) or pending |
+| GET    | `/supply`         | coin supply: minted, burned, circulating, conservation check  |
 | GET    | `/peers`          | connected peers                                               |
 | GET    | `/address`        | this node's wallet address                                    |
 | GET    | `/estimatefee`    | `?blocks=N` → recommended fee **rate** per byte (base fee + estimated tip) |
@@ -331,6 +347,9 @@ accepts optional `expiry`/`lock_until` heights and a `memo`.
 ```sh
 curl -s localhost:8080/info
 curl -s -X POST localhost:8080/send -d '{"to":"dnas...","amount":300000000,"fee":10000000}'
+
+# follow one transaction from submission to confirmation (same endpoint for both)
+curl -s localhost:8080/tx/<txhash>
 
 # SPV: fetch a proof and the header it commits to
 curl -s localhost:8080/proof/<txhash>

@@ -55,7 +55,7 @@ func TestReorgRollsBackState(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ok, err := bc.ReplaceChain(y.Blocks())
+	ok, _, err := bc.ReplaceChain(y.Blocks())
 	if !ok || err != nil {
 		t.Fatalf("reorg to heavier chain: ok=%v err=%v", ok, err)
 	}
@@ -117,7 +117,7 @@ func TestReorgRejectsInvalidSuffixLeavesChainIntact(t *testing.T) {
 	bad, _ = Mine(bad, nil)
 	badChain := append(y.Blocks(), bad)
 
-	ok, err := bc.ReplaceChain(badChain)
+	ok, _, err := bc.ReplaceChain(badChain)
 	if ok || err == nil {
 		t.Fatalf("invalid reorg should be rejected: ok=%v err=%v", ok, err)
 	}

@@ -15,7 +15,7 @@ ARCHES    ?= amd64 arm64
 # Pass computed settings down to the build/packaging scripts.
 export VERSION PLATFORMS ARCHES GO
 
-.PHONY: all build dnas tui test test-race vet fmt dist deb demo install uninstall clean version help
+.PHONY: all build dnas tui test test-race e2e e2e-docker vet fmt dist deb demo install uninstall clean version help
 
 all: build
 
@@ -45,6 +45,15 @@ test:
 test-race:
 	$(GO) test -race $(GOMODS)
 	cd tui && $(GO) test -race ./...
+
+## e2e: run the black-box end-to-end suite against a binary built from this tree
+e2e:
+	$(GO) test -tags e2e -count=1 -timeout 20m ./e2e/...
+
+## e2e-docker: run the same suite isolated in a container (needs only Docker)
+e2e-docker:
+	docker build -f e2e/Dockerfile -t dnas-e2e .
+	docker run --rm dnas-e2e
 
 ## vet: go vet across all modules
 vet:

@@ -67,7 +67,7 @@ func TestBaseFeeBurnedAndEnforced(t *testing.T) {
 
 	// One paying base fee × size + a tip: the miner gets reward + tip; the base
 	// fee (× size) burns. Pick a fee comfortably above the per-byte minimum.
-	tip := uint64(7 * Coin)
+	tip := 7 * Coin
 	fee := baseFee*2000 + tip // 2000 exceeds the tx's byte size, so the tip is well-defined
 	good := signedTx(t, alice, bob.Address(), Coin, fee, 0)
 	burned := BaseFeeFor(good, baseFee)

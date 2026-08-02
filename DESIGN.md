@@ -215,6 +215,23 @@ an odd level duplicates its last node (Bitcoin's rule), and proof and root use t
 same rule so they agree. `core/state.go` reuses that fold over the sorted account
 set to produce the `StateRoot` and account-membership proofs.
 
+**Transaction index.** Finding *which* block holds a txid used to mean scanning
+every block body on every lookup, which put an O(chain × txs) walk behind
+`/proof/{txhash}` and the explorer. [`core/txindex.go`](core/txindex.go) keeps a
+`txid → (height, position)` map maintained as blocks connect, so a lookup is one
+map hit. It is derived state — `buildTxIndex` rebuilds it from the chain, and
+replaying a store on open rebuilds it for free — and it follows reorgs: blocks are
+unindexed from the tip downwards before the winning suffix is indexed upwards.
+
+One wrinkle it has to absorb: a coinbase commits only (recipient, amount), so two
+blocks paying the same miner the same subsidy carry a byte-identical coinbase and
+therefore **the same txid**. The index keeps the *first* (lowest) occurrence,
+which is exactly what the linear scan it replaces returned, and only deletes an
+entry when the block being disconnected is the one it points at. Since blocks are
+only ever disconnected from the top, the surviving first occurrence is never
+dropped by mistake. The underlying duplication is a real wart — Bitcoin removed it
+by putting the height in the coinbase (BIP34) — and is listed in §21.
+
 ---
 
 ## 7. Proof of work and difficulty
@@ -309,6 +326,21 @@ Because it is derived from block history, it reverses naturally on a reorg — n
 extra state to roll back. This is what stops a reorg from letting someone spend a
 reward that has since vanished.
 
+**Transaction resurrection.** A reorg un-confirms every transaction in the branch
+it discards, but those transactions are not *invalid* — they are validly signed
+transfers that happened to be mined on the losing side. `ReorgFrom`/`ReplaceChain`
+therefore return the discarded blocks, and the node feeds their non-coinbase
+transactions back into its mempool (`Node.resurrectTxs`) so they can be mined
+again. Without this, a payment confirmed only in the orphaned branch would drop
+out of the network entirely until its sender noticed and re-broadcast it.
+
+Two things are deliberately *not* resurrected: coinbases (minted by a block that
+no longer exists, so they can never be re-mined) and anything the winning branch
+already confirms, which the transaction index answers in O(1). Resurrection runs
+*before* `reconcileMempool`, so a transfer whose nonce the winning branch has
+since spent — a double-spend that lost — is re-queued and then immediately dropped
+rather than sitting in the pool forever as unmineable.
+
 ---
 
 ## 9. Issuance and monetary policy
@@ -337,6 +369,35 @@ the base fee is in the header, light clients see it and it is covered by proof o
 work. (The *congestion signal* that moves the base fee is transaction count, not
 bytes — a deliberate simplification that keeps the retarget cheap to reason about
 and test; the *payment* is per byte.)
+
+**Supply accounting.** Because those are the only two ways coin moves in or out of
+existence, the total is auditable, and `core/supply.go` tracks the two sides
+*independently* so they can be checked against each other rather than derived from
+one another:
+
+- **minted** is a pure function of height — `CumulativeSubsidy(height)` sums the
+  subsidy of every block, walking halving epochs rather than blocks, so it is
+  O(halvings) at any chain length. Nothing else mints.
+- **burned** is accumulated from block bodies as they connect (`blockBurned` =
+  `BaseFee × size` summed over a block's transactions) and un-accumulated when a
+  reorg disconnects them, so it tracks the canonical chain exactly.
+- **circulating** is read straight out of the account state.
+
+`Blockchain.Supply()` reports all three plus `Consistent`, the identity
+`minted − burned == circulating`, which must hold for every valid chain — a false
+there means coin was created or destroyed outside the subsidy and the burn, i.e. an
+accounting bug. It is exposed as `GET /supply` and `dnas supply`, and asserted
+across mining, reorgs, reopening a store, and snapshot bootstrap in the tests.
+(This is the *observable* half of the supply-conservation item in
+[ROADMAP.md](ROADMAP.md) §1; enforcing the identity as a consensus rule per block
+is still open.)
+
+A fast-synced node is the one case that cannot sum the burn directly, because the
+bodies below its snapshot are pruned. It derives the seed instead: everything
+minted through the snapshot height that accounts no longer hold must have been
+burned. That comes from the snapshot's account set, whose state root the node has
+already verified against a proof-of-work-checked header, so it is exactly as
+trustworthy as the balances themselves.
 
 ---
 
@@ -619,8 +680,13 @@ with `httptest`). Highlights:
 
 - **Read:** `/info` (height, tip, work, mempool, `min_relay_fee`, `base_fee`,
   peers, mining), `/chain`, `/balance/{addr}`, `/account/{addr}`, `/mempool`,
-  `/peers`, `/address`, `/estimatefee?blocks=N` (recommended fee = base fee +
-  estimated tip), `/metrics` (Prometheus text).
+  `/tx/{txhash}` (one transaction by id, answering for both stages of its life —
+  `confirmed` with block and confirmation count via the transaction index, or
+  `pending` from the mempool — so a wallet polls one endpoint from submission to
+  confirmation instead of guessing which to ask), `/supply` (minted, burned,
+  circulating and the conservation check, §9), `/peers`, `/address`,
+  `/estimatefee?blocks=N` (recommended fee = base fee + estimated tip),
+  `/metrics` (Prometheus text).
 - **SPV / filters / state:** `/headers`, `/header/{index}`, `/block/{index}`,
   `/proof/{txhash}`, `/cfilters`, `/cfilter/{index}`, `/cfheaders`,
   `/stateproof/{addr}` (a balance proof against the header state root), and
@@ -767,12 +833,22 @@ All in [`core/params.go`](core/params.go). Every node must agree on these.
   fork choice and sync under conditions the plain integration tests don't reach.
 - **GUI tests** (`gui/test_dnas_gui.py`) run headless (`QT_QPA_PLATFORM=offscreen`)
   against a stub HTTP server.
+- **Black-box end-to-end suite** (`e2e/`, behind the `e2e` build tag) starts the
+  shipped `dnas` binary and drives it over HTTP and the CLI, importing no DNAS
+  package. Everything above tests the code; this tests the *product* — wire
+  formats, CLI output, startup flags, persistence across a restart — so it fails
+  on breaks the unit tests cannot see. Each node gets a kernel-assigned port and
+  its own temp directory, and runs in regtest so blocks are mined on demand
+  (deterministic heights, no race with a miner). `make e2e-docker` runs the same
+  suite entirely inside a container, which is how CI runs it.
 - **End-to-end demo** (`scripts/demo.sh`) runs a three-node network exercising
   auth, discovery, a converging transfer, expiry, the fee floor, multisig, HD,
   and SPV.
 
 `make test` runs the Go suites plus the GUI tests (skipped if PyQt6 is absent);
-`make test-race` runs the Go suites under the race detector.
+`make test-race` runs the Go suites under the race detector; `make e2e` /
+`make e2e-docker` run the end-to-end suite, which the tagged build keeps out of
+the default runs.
 
 ---
 
@@ -820,6 +896,13 @@ See [scripts/README.md](scripts/README.md) for the script details.
   under the honest-node/multi-peer assumption (they aren't header-committed).
   State proofs prove account *membership* (a present balance/nonce) against the
   header state root, not account *absence*.
+- A coinbase transaction commits only its recipient and amount, so two blocks
+  paying the same miner the same subsidy share a **txid** (Bitcoin's pre-BIP34
+  problem). Lookups therefore resolve a duplicated coinbase to its first
+  occurrence (§6); binding the height into the coinbase would remove the
+  duplication but is a consensus change, so it is deliberately not done here.
+- Supply conservation (`minted − burned == circulating`, §9) is *reported* and
+  asserted in tests, not enforced per block as a consensus rule.
 - HTLC refund timing and coinbase maturity are enforced at block application, not
   in signature verification. HD is not SLIP-0010. Proof of work is a continuous
   256-bit target (nBits) retargeted by an LWMA with **no hard difficulty cap**, so

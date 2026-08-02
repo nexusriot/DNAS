@@ -47,10 +47,10 @@ func TestLocatorFindsCommonAncestor(t *testing.T) {
 	// A divergent chain sharing only genesis+b1+b2.
 	other := NewBlockchain()
 	o, _ := wallet.New()
-	other.AddBlock(b1)
-	other.AddBlock(b2)
-	other.AddBlock(mineOn(t, other, o.Address(), nil))
-	other.AddBlock(mineOn(t, other, o.Address(), nil))
+	mustAdd(t, other, b1)
+	mustAdd(t, other, b2)
+	mustAdd(t, other, mineOn(t, other, o.Address(), nil))
+	mustAdd(t, other, mineOn(t, other, o.Address(), nil))
 
 	if h := bc.LocatorFork(other.Locator()); h != 2 {
 		t.Fatalf("common ancestor height = %d, want 2 (b2)", h)
@@ -80,11 +80,11 @@ func TestReorgFromSuffix(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	y.AddBlock(mineOn(t, y, carol.Address(), nil))
-	y.AddBlock(mineOn(t, y, carol.Address(), nil))
+	mustAdd(t, y, mineOn(t, y, carol.Address(), nil))
+	mustAdd(t, y, mineOn(t, y, carol.Address(), nil))
 	suffix := y.Blocks()[forkHeight+1:] // the two blocks past the fork point
 
-	adopted, err := bc.ReorgFrom(forkHeight, suffix)
+	adopted, _, err := bc.ReorgFrom(forkHeight, suffix)
 	if !adopted || err != nil {
 		t.Fatalf("reorg from suffix: adopted=%v err=%v", adopted, err)
 	}
@@ -115,11 +115,11 @@ func TestReorgFromLosingSuffixRejected(t *testing.T) {
 	}
 
 	y := NewBlockchain()
-	y.AddBlock(b1)
-	y.AddBlock(mineOn(t, y, c.Address(), nil)) // only reaches height 2
+	mustAdd(t, y, b1)
+	mustAdd(t, y, mineOn(t, y, c.Address(), nil)) // only reaches height 2
 	suffix := y.Blocks()[2:]
 
-	adopted, err := bc.ReorgFrom(1, suffix)
+	adopted, _, err := bc.ReorgFrom(1, suffix)
 	if adopted || err != nil {
 		t.Fatalf("a lighter fork must not be adopted: adopted=%v err=%v", adopted, err)
 	}

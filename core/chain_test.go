@@ -33,6 +33,15 @@ func mineOn(t *testing.T, bc *Blockchain, minerAddr string, txs []Transaction) B
 	return mined
 }
 
+// mustAdd appends a block the test expects to be valid, failing loudly rather
+// than letting a rejected block quietly shorten the chain under an assertion.
+func mustAdd(t *testing.T, bc *Blockchain, b Block) {
+	t.Helper()
+	if err := bc.AddBlock(b); err != nil {
+		t.Fatalf("add block %d: %v", b.Index, err)
+	}
+}
+
 func signedTx(t *testing.T, from *wallet.Wallet, to string, amount, fee, nonce uint64) Transaction {
 	t.Helper()
 	tx := Transaction{From: from.Address(), To: to, Amount: amount, Fee: fee, Nonce: nonce}
@@ -288,7 +297,7 @@ func TestReplaceChainRejectsForeignGenesis(t *testing.T) {
 	foreign := GenesisBlock()
 	foreign.Bits = MinTargetBits
 	foreign.Hash = "not-our-genesis"
-	adopted, err := bc.ReplaceChain([]Block{foreign})
+	adopted, _, err := bc.ReplaceChain([]Block{foreign})
 	if adopted || err == nil {
 		t.Fatalf("foreign genesis should be rejected: adopted=%v err=%v", adopted, err)
 	}
@@ -328,10 +337,10 @@ func TestForkChoiceTieBreakConverges(t *testing.T) {
 
 	// A node already on `high`, offered the equal-work `low` (smaller tip): adopts.
 	onHigh := NewBlockchain()
-	if ok, err := onHigh.ReplaceChain(high); !ok || err != nil {
+	if ok, _, err := onHigh.ReplaceChain(high); !ok || err != nil {
 		t.Fatalf("seed high: ok=%v err=%v", ok, err)
 	}
-	if ok, err := onHigh.ReplaceChain(low); !ok || err != nil {
+	if ok, _, err := onHigh.ReplaceChain(low); !ok || err != nil {
 		t.Fatalf("should adopt smaller-tip chain: ok=%v err=%v", ok, err)
 	}
 	if onHigh.Tip().Hash != lowTip {
@@ -340,10 +349,10 @@ func TestForkChoiceTieBreakConverges(t *testing.T) {
 
 	// A node already on `low`, offered the equal-work `high` (larger tip): keeps low.
 	onLow := NewBlockchain()
-	if _, err := onLow.ReplaceChain(low); err != nil {
+	if _, _, err := onLow.ReplaceChain(low); err != nil {
 		t.Fatal(err)
 	}
-	if ok, err := onLow.ReplaceChain(high); ok || err != nil {
+	if ok, _, err := onLow.ReplaceChain(high); ok || err != nil {
 		t.Fatalf("should keep smaller-tip chain: ok=%v err=%v", ok, err)
 	}
 	if onLow.Tip().Hash != lowTip {
@@ -362,7 +371,7 @@ func TestReplaceChainLongestWins(t *testing.T) {
 	}
 
 	dst := NewBlockchain()
-	adopted, err := dst.ReplaceChain(src.Blocks())
+	adopted, _, err := dst.ReplaceChain(src.Blocks())
 	if err != nil || !adopted {
 		t.Fatalf("adopt longer chain: adopted=%v err=%v", adopted, err)
 	}
@@ -375,7 +384,7 @@ func TestReplaceChainLongestWins(t *testing.T) {
 	if err := shorter.AddBlock(mineOn(t, shorter, miner.Address(), nil)); err != nil {
 		t.Fatal(err)
 	}
-	adopted, err = dst.ReplaceChain(shorter.Blocks())
+	adopted, _, err = dst.ReplaceChain(shorter.Blocks())
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}

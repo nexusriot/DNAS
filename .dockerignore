@@ -1,0 +1,34 @@
+# Keep the e2e build context to source only. Two reasons beyond speed: a stale
+# chain.db or peers.json copied into the image would make a "fresh" node in the
+# container start with someone else's state, and wallet.json is a private key
+# that has no business inside an image.
+
+.git
+.github
+
+# Build outputs
+bin/
+dist/
+/dnas
+/dnas-tui
+/dnas-race
+tui/tui
+
+# Node/wallet state from local runs
+*.db
+*.db.tmp
+wallet.json
+wallet*.json
+w*.json
+alice.json
+bob.json
+peers.json
+bans.json
+mempool.json
+spvwallet.json
+node.json
+
+# Editor / tooling noise
+.claude
+__pycache__/
+*.pyc

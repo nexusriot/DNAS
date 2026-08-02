@@ -86,11 +86,23 @@ func NewFromSnapshot(s Snapshot, headers []Header) (*Blockchain, error) {
 		blocks[i] = blockFromHeader(h) // header-only placeholder (pruned body)
 		work.Add(work, BlockWork(h.Bits))
 	}
+	state := cloneState(s.Accounts)
+	// The bodies below the snapshot are pruned, so the burn they contain cannot be
+	// summed directly. It is implied instead: everything minted that is no longer
+	// held by an account was burned. The accounts come from the snapshot, whose
+	// state root the caller has already verified against a PoW-checked header, so
+	// this seed is as trustworthy as the balances themselves.
+	var burned uint64
+	if minted := CumulativeSubsidy(s.Height); minted > totalBalance(state) {
+		burned = minted - totalBalance(state)
+	}
 	return &Blockchain{
-		blocks: blocks,
-		state:  cloneState(s.Accounts),
-		work:   work,
-		undos:  undos, // all nil: no reorg below the snapshot is permitted
+		blocks:  blocks,
+		state:   state,
+		work:    work,
+		undos:   undos, // all nil: no reorg below the snapshot is permitted
+		txIndex: buildTxIndex(blocks),
+		burned:  burned,
 	}, nil
 }
 

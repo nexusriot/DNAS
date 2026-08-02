@@ -25,12 +25,14 @@ type Account struct {
 // replaying every transaction. All exported methods take the lock, so it is
 // safe to share one *Blockchain across the miner, P2P handlers and API.
 type Blockchain struct {
-	mu     sync.RWMutex
-	blocks []Block
-	state  map[string]Account
-	work   *big.Int      // cumulative proof-of-work of blocks
-	undos  [][]undoEntry // undos[i] reverts blocks[i]'s state changes (undos[0] is nil)
-	store  *blockStore   // append-only persistence (nil = in-memory only)
+	mu      sync.RWMutex
+	blocks  []Block
+	state   map[string]Account
+	work    *big.Int         // cumulative proof-of-work of blocks
+	undos   [][]undoEntry    // undos[i] reverts blocks[i]'s state changes (undos[0] is nil)
+	store   *blockStore      // append-only persistence (nil = in-memory only)
+	txIndex map[string]TxLoc // txid -> where it is confirmed (see txindex.go)
+	burned  uint64           // cumulative base fee burned by connected blocks (see supply.go)
 }
 
 // undoEntry records an account's prior value so a block's effect can be
@@ -61,10 +63,11 @@ func GenesisBlock() Block {
 func NewBlockchain() *Blockchain {
 	genesis := GenesisBlock()
 	return &Blockchain{
-		blocks: []Block{genesis},
-		state:  map[string]Account{},
-		work:   BlockWork(genesis.Bits),
-		undos:  [][]undoEntry{nil}, // genesis has no undo (it is never rolled back)
+		blocks:  []Block{genesis},
+		state:   map[string]Account{},
+		work:    BlockWork(genesis.Bits),
+		undos:   [][]undoEntry{nil}, // genesis has no undo (it is never rolled back)
+		txIndex: map[string]TxLoc{}, // genesis carries no transactions
 	}
 }
 
@@ -218,28 +221,26 @@ type TxProof struct {
 }
 
 // FindTxProof locates a confirmed transaction by hash and builds its inclusion
-// proof. The bool is false if the transaction is not in the chain.
+// proof. The bool is false if the transaction is not in the chain. The lookup is
+// a single index hit (see txindex.go), not a scan of every block body.
 func (bc *Blockchain) FindTxProof(txHash string) (TxProof, bool) {
 	bc.mu.RLock()
 	defer bc.mu.RUnlock()
-	tip := bc.blocks[len(bc.blocks)-1].Index
-	for _, b := range bc.blocks {
-		for i, tx := range b.Transactions {
-			if tx.Hash() == txHash {
-				proof, _ := MerkleProof(b.Transactions, i)
-				return TxProof{
-					Found:         true,
-					BlockIndex:    b.Index,
-					BlockHash:     b.Hash,
-					MerkleRoot:    b.MerkleRoot,
-					Confirmations: tip - b.Index + 1,
-					Tx:            tx,
-					Proof:         proof,
-				}, true
-			}
-		}
+	tx, loc, ok := bc.findTxLocked(txHash)
+	if !ok {
+		return TxProof{Found: false}, false
 	}
-	return TxProof{Found: false}, false
+	b := bc.blocks[loc.Height]
+	proof, _ := MerkleProof(b.Transactions, loc.Index)
+	return TxProof{
+		Found:         true,
+		BlockIndex:    b.Index,
+		BlockHash:     b.Hash,
+		MerkleRoot:    b.MerkleRoot,
+		Confirmations: bc.blocks[len(bc.blocks)-1].Index - b.Index + 1,
+		Tx:            tx,
+		Proof:         proof,
+	}, true
 }
 
 // AddBlock validates a block against the current tip and, if valid, appends it
@@ -263,11 +264,14 @@ func (bc *Blockchain) AddBlock(block Block) error {
 	bc.blocks = append(bc.blocks, block)
 	bc.undos = append(bc.undos, undo)
 	bc.work.Add(bc.work, BlockWork(block.Bits))
+	bc.indexBlock(block)
+	bc.burned += blockBurned(block)
 	return nil
 }
 
 // ReplaceChain adopts an incoming chain when it wins the fork-choice rule and is
-// fully valid from genesis. Returns whether it was adopted. The rule is:
+// fully valid from genesis. It returns whether it was adopted and, if so, the
+// blocks the switch discarded (see ReorgFrom). The rule is:
 //
 //  1. more cumulative work wins;
 //  2. on equal work, the chain with the lexicographically smaller tip hash wins.
@@ -278,14 +282,14 @@ func (bc *Blockchain) AddBlock(block Block) error {
 // immediately instead of lingering until one side happens to extend. It is also
 // monotonic — a node only ever switches toward a smaller tip hash — so ties
 // cannot cause it to flap back and forth.
-func (bc *Blockchain) ReplaceChain(incoming []Block) (bool, error) {
+func (bc *Blockchain) ReplaceChain(incoming []Block) (bool, []Block, error) {
 	if len(incoming) == 0 {
-		return false, errors.New("empty chain")
+		return false, nil, errors.New("empty chain")
 	}
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
 	if incoming[0].Hash != GenesisBlock().Hash {
-		return false, errors.New("genesis mismatch")
+		return false, nil, errors.New("genesis mismatch")
 	}
 	fork := commonPrefix(bc.blocks, incoming) - 1 // last shared block (>= 0)
 	return bc.reorgLocked(fork, incoming[fork+1:])
@@ -295,14 +299,19 @@ func (bc *Blockchain) ReplaceChain(incoming []Block) (bool, error) {
 // must build on our block at forkHeight), adopting it if it wins the fork-choice
 // rule. Block-locator sync uses this to transfer only the divergent suffix
 // rather than a whole competing chain. Callers must not hold bc.mu.
-func (bc *Blockchain) ReorgFrom(forkHeight uint64, suffix []Block) (bool, error) {
+//
+// When a reorg is adopted it also returns the blocks it discarded, oldest first.
+// Their transactions are not invalid — they simply lost the race — so the caller
+// (the node) returns the still-spendable ones to the mempool rather than letting
+// confirmed payments vanish with the losing branch.
+func (bc *Blockchain) ReorgFrom(forkHeight uint64, suffix []Block) (bool, []Block, error) {
 	if len(suffix) == 0 {
-		return false, nil
+		return false, nil, nil
 	}
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
 	if forkHeight >= uint64(len(bc.blocks)) {
-		return false, errors.New("fork height beyond tip")
+		return false, nil, errors.New("fork height beyond tip")
 	}
 	return bc.reorgLocked(int(forkHeight), suffix)
 }
@@ -310,8 +319,9 @@ func (bc *Blockchain) ReorgFrom(forkHeight uint64, suffix []Block) (bool, error)
 // reorgLocked replaces the blocks above `fork` with `suffix`, applying the
 // fork-choice rule (most work; ties broken by the smaller tip hash). It
 // validates the suffix on a rolled-back copy of state — so a bad suffix cannot
-// corrupt the live chain — then persists and commits atomically. bc.mu held.
-func (bc *Blockchain) reorgLocked(fork int, suffix []Block) (bool, error) {
+// corrupt the live chain — then persists and commits atomically. On success it
+// returns the discarded blocks, oldest first. bc.mu held.
+func (bc *Blockchain) reorgLocked(fork int, suffix []Block) (bool, []Block, error) {
 	// Finality guards, checked before fork choice so a deep or checkpoint-violating
 	// reorg is refused regardless of how much work it claims:
 	//   - never roll back a block at or below the highest checkpoint;
@@ -319,10 +329,10 @@ func (bc *Blockchain) reorgLocked(fork int, suffix []Block) (bool, error) {
 	// Neither affects initial sync or forward extension (fork == our tip, so
 	// nothing is discarded).
 	if hc := highestCheckpoint(); uint64(fork) < hc {
-		return false, fmt.Errorf("reorg would discard the checkpointed block at height %d", hc)
+		return false, nil, fmt.Errorf("reorg would discard the checkpointed block at height %d", hc)
 	}
 	if removed := len(bc.blocks) - 1 - fork; removed > MaxReorgDepth {
-		return false, fmt.Errorf("reorg too deep: would discard %d blocks (max %d)", removed, MaxReorgDepth)
+		return false, nil, fmt.Errorf("reorg too deep: would discard %d blocks (max %d)", removed, MaxReorgDepth)
 	}
 
 	// Candidate cumulative work = shared prefix + suffix.
@@ -332,14 +342,14 @@ func (bc *Blockchain) reorgLocked(fork int, suffix []Block) (bool, error) {
 	}
 	switch candWork.Cmp(bc.work) {
 	case -1: // less work
-		return false, nil
+		return false, nil, nil
 	case 0: // equal work: adopt only if the candidate tip hash is smaller
 		candTip := bc.blocks[fork].Hash
 		if len(suffix) > 0 {
 			candTip = suffix[len(suffix)-1].Hash
 		}
 		if candTip >= bc.blocks[len(bc.blocks)-1].Hash {
-			return false, nil
+			return false, nil, nil
 		}
 	}
 
@@ -352,7 +362,7 @@ func (bc *Blockchain) reorgLocked(fork int, suffix []Block) (bool, error) {
 	for i, b := range suffix {
 		undo, err := applyBlock(state, blocks, b)
 		if err != nil {
-			return false, fmt.Errorf("block %d: %w", fork+1+i, err)
+			return false, nil, fmt.Errorf("block %d: %w", fork+1+i, err)
 		}
 		blocks = append(blocks, b)
 		undos = append(undos, undo)
@@ -362,20 +372,32 @@ func (bc *Blockchain) reorgLocked(fork int, suffix []Block) (bool, error) {
 	// memory, so disk and memory stay consistent.
 	if bc.store != nil {
 		if err := bc.store.truncateAfter(uint64(fork)); err != nil {
-			return false, fmt.Errorf("persist reorg: %w", err)
+			return false, nil, fmt.Errorf("persist reorg: %w", err)
 		}
 		for i := fork + 1; i < len(blocks); i++ {
 			if err := bc.store.append(blocks[i]); err != nil {
-				return false, fmt.Errorf("persist reorg: %w", err)
+				return false, nil, fmt.Errorf("persist reorg: %w", err)
 			}
 		}
 	}
 
+	// Committed: swap the chain in and bring the derived indexes with it. Blocks
+	// are unindexed from the tip down and the new suffix indexed from the fork up,
+	// which keeps the "first occurrence wins" rule of the transaction index intact.
+	disconnected := append([]Block(nil), bc.blocks[fork+1:]...)
+	for i := len(bc.blocks) - 1; i > fork; i-- {
+		bc.unindexBlock(bc.blocks[i])
+		bc.burned -= blockBurned(bc.blocks[i])
+	}
 	bc.blocks = blocks
 	bc.state = state
 	bc.undos = undos
 	bc.work = candWork
-	return true, nil
+	for i := fork + 1; i < len(blocks); i++ {
+		bc.indexBlock(blocks[i])
+		bc.burned += blockBurned(blocks[i])
+	}
+	return true, disconnected, nil
 }
 
 // Locator returns block hashes from the tip backwards at exponentially growing
@@ -527,7 +549,7 @@ func Load(path string) (*Blockchain, error) {
 	if len(blocks) == 1 {
 		return bc, nil // just genesis
 	}
-	ok, err := bc.ReplaceChain(blocks)
+	ok, _, err := bc.ReplaceChain(blocks)
 	if err != nil {
 		return nil, err
 	}

@@ -611,8 +611,9 @@ func (n *Node) handleMessage(p *peer, m Message) {
 		p.send(Message{Type: MsgChain, Chain: n.chain.Blocks()})
 
 	case MsgChain:
-		if replaced, err := n.chain.ReplaceChain(m.Chain); err == nil && replaced {
+		if replaced, disconnected, err := n.chain.ReplaceChain(m.Chain); err == nil && replaced {
 			log.Printf("adopted chain via fallback (height=%d)", n.chain.Height())
+			n.resurrectTxs(disconnected)
 			n.afterNewBlock(true)
 		}
 
@@ -658,7 +659,7 @@ func (n *Node) onBlocks(p *peer, blocks []core.Block) {
 
 	if first <= n.chain.Height() {
 		// Fork suffix: reorg from the common ancestor (first-1).
-		adopted, err := n.chain.ReorgFrom(first-1, blocks)
+		adopted, disconnected, err := n.chain.ReorgFrom(first-1, blocks)
 		if err != nil || !adopted {
 			p.send(Message{Type: MsgGetChain}) // deep/losing fork: fall back
 			return
@@ -666,6 +667,7 @@ func (n *Node) onBlocks(p *peer, blocks []core.Block) {
 		for _, b := range blocks {
 			n.markSeenBlock(b.Hash)
 		}
+		n.resurrectTxs(disconnected)
 		n.afterNewBlock(true)
 		tip := n.chain.Tip()
 		log.Printf("reorged onto fork, height=%d %s", tip.Index, short(tip.Hash))
@@ -962,6 +964,36 @@ func (n *Node) sleepInterruptible(d time.Duration) bool {
 		time.Sleep(50 * time.Millisecond)
 	}
 	return true
+}
+
+// resurrectTxs returns the transactions of blocks a reorg discarded to the
+// mempool, and reports how many were re-queued. Losing a race is not the same as
+// being invalid: a payment confirmed only in the orphaned branch is still a valid
+// signed transfer, and without this it would silently vanish from the network
+// until its sender noticed and re-broadcast it.
+//
+// Coinbases are skipped — they are minted by the block that died, so they cannot
+// be re-mined. So is anything the winning branch already confirms, which the
+// transaction index answers in O(1). Callers run this BEFORE reconcileMempool, so
+// a resurrected transaction whose nonce the winning branch has since consumed is
+// dropped again immediately.
+func (n *Node) resurrectTxs(disconnected []core.Block) int {
+	count := 0
+	for _, b := range disconnected {
+		for i := 1; i < len(b.Transactions); i++ {
+			tx := b.Transactions[i]
+			if n.chain.HasTx(tx.Hash()) {
+				continue // also in the winning branch: still confirmed, nothing to do
+			}
+			if added, err := n.mempool.Add(tx); err == nil && added {
+				count++
+			}
+		}
+	}
+	if count > 0 {
+		log.Printf("returned %d transaction(s) from %d orphaned block(s) to the mempool", count, len(disconnected))
+	}
+	return count
 }
 
 // reconcileMempool drops transactions that a new block made unmineable: those

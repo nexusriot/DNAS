@@ -2,6 +2,7 @@ package core
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 
 	"github.com/nexusriot/DNAS/wallet"
@@ -40,8 +41,14 @@ func TestSigningBytesExcludeAuthorization(t *testing.T) {
 	bob, _ := wallet.New()
 	tx := signedTx(t, w, bob.Address(), Coin, 1000, 0)
 
+	// Flip the last signature byte rather than forcing it to a constant, which
+	// would be a no-op (and a 1-in-256 flake) when the byte already holds it.
 	tampered := tx
-	tampered.Signature = tx.Signature[:len(tx.Signature)-2] + "00" // different signature bytes
+	flipped := "00"
+	if strings.HasSuffix(tx.Signature, flipped) {
+		flipped = "01"
+	}
+	tampered.Signature = tx.Signature[:len(tx.Signature)-2] + flipped
 	if !bytes.Equal(tx.signingBytes(), tampered.signingBytes()) {
 		t.Fatal("signing bytes must not depend on the signature field")
 	}

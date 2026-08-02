@@ -123,7 +123,7 @@ async function j(url, opts) {
   return r.json();
 }
 
-// --- SHA-256 helpers so the browser can verify proofs like a light client ---
+// SHA-256 helpers so the browser can verify proofs like a light client.
 async function sha256hex(str) {
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(str));
   return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
@@ -191,8 +191,8 @@ function renderMempool(txs) {
 async function refresh() {
   const st = document.getElementById("status");
   try {
-    const [info, chain, mp] = await Promise.all([j("/info"), j("/chain"), j("/mempool")]);
-    document.getElementById("chips").innerHTML = [
+    const [info, chain, mp, supply] = await Promise.all([j("/info"), j("/chain"), j("/mempool"), j("/supply")]);
+    const chips = [
       ["height", info.height],
       ["tip", short(info.tip, 10)],
       ["next diff", Number(info.next_difficulty).toFixed(2)],
@@ -200,7 +200,13 @@ async function refresh() {
       ["mempool", info.mempool],
       ["base fee", fmt(info.base_fee)],
       ["peers", (info.peers || []).length],
-    ].map(([k, v]) => `<div class="chip"><div class="k">${k}</div><div class="v">${esc(v)}</div></div>`).join("");
+      ["circulating", supply.circulating_fmt],
+      ["burned", supply.burned_fmt],
+    ];
+    // minted − burned == circulating holds for every valid chain; surface a break.
+    if (!supply.consistent) chips.push(["supply", "INCONSISTENT"]);
+    document.getElementById("chips").innerHTML =
+      chips.map(([k, v]) => `<div class="chip"><div class="k">${k}</div><div class="v">${esc(v)}</div></div>`).join("");
     renderBlocks(chain);
     renderMempool(mp || []);
     st.textContent = "● live";
@@ -251,6 +257,13 @@ async function verifyTx() {
   const txh = document.getElementById("lookTx").value.trim();
   out.textContent = "verifying…";
   try {
+    // A transaction the node has only seen, not mined, has no inclusion proof yet.
+    const st = await j("/tx/" + txh);
+    if (st.status === "pending") {
+      out.innerHTML = `<span class="ok">pending</span> in the mempool · 0 confirmations\n`
+        + `<span class="muted">no inclusion proof until it is mined</span>`;
+      return;
+    }
     const pr = await j("/proof/" + txh);                 // full node supplies proof
     const hd = await j("/header/" + pr.block_index);     // ...and the block header
     const powOK = (await headerHash(hd)) === hd.hash && meetsTarget(hd.hash, hd.bits);

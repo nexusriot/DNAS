@@ -54,6 +54,8 @@ func main() {
 		runMiner(args[1:])
 	case "htlc":
 		runHTLC(args[1:])
+	case "supply":
+		runSupply(args[1:])
 	case "help", "-h", "--help":
 		usage()
 	case "version", "-v", "--version":
@@ -82,6 +84,7 @@ Usage:
   dnas miner -api URL -address ADDR   external miner (get template, mine, submit)
   dnas htlc new                       mint a preimage + hash for an atomic swap
   dnas htlc <address|claim|refund>    build hash-time-locked contract spends
+  dnas supply [-api URL]              coin supply: minted, burned, circulating
   dnas version                        print the build version
 
 Node flags:

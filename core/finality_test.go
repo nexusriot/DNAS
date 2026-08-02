@@ -22,7 +22,7 @@ func TestReorgDepthLimit(t *testing.T) {
 	}
 
 	// Fork at height 1 would discard MaxReorgDepth+1 blocks -> refused as too deep.
-	if _, err := bc.ReorgFrom(1, []Block{{Index: 2}}); err == nil || !strings.Contains(err.Error(), "too deep") {
+	if _, _, err := bc.ReorgFrom(1, []Block{{Index: 2}}); err == nil || !strings.Contains(err.Error(), "too deep") {
 		t.Fatalf("a fork discarding %d blocks should be refused as too deep, got %v", MaxReorgDepth+1, err)
 	}
 	if bc.Height() != uint64(MaxReorgDepth+2) {
@@ -31,7 +31,7 @@ func TestReorgDepthLimit(t *testing.T) {
 
 	// Fork at height 2 would discard exactly MaxReorgDepth blocks -> passes the
 	// depth guard (then simply loses fork choice, with no error).
-	if _, err := bc.ReorgFrom(2, []Block{{Index: 3}}); err != nil {
+	if _, _, err := bc.ReorgFrom(2, []Block{{Index: 3}}); err != nil {
 		t.Fatalf("a fork at the depth boundary should pass the guard, got %v", err)
 	}
 }
@@ -79,11 +79,11 @@ func TestReorgBelowCheckpointRejected(t *testing.T) {
 	AddCheckpoint(2, cp.Hash)
 
 	// Forking at height 1 would discard the checkpointed block at height 2.
-	if _, err := bc.ReorgFrom(1, []Block{{Index: 2}}); err == nil || !strings.Contains(err.Error(), "checkpoint") {
+	if _, _, err := bc.ReorgFrom(1, []Block{{Index: 2}}); err == nil || !strings.Contains(err.Error(), "checkpoint") {
 		t.Fatalf("a reorg below a checkpoint must be rejected, got %v", err)
 	}
 	// Forking at the checkpoint height is allowed past the guard.
-	if _, err := bc.ReorgFrom(2, []Block{{Index: 3}}); err != nil {
+	if _, _, err := bc.ReorgFrom(2, []Block{{Index: 3}}); err != nil {
 		t.Fatalf("a reorg at the checkpoint height should pass the guard, got %v", err)
 	}
 }

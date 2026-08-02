@@ -91,7 +91,7 @@ func htlcSpend(args []string, claim bool) {
 	hash := fs.String("hash", "", "sha256(preimage) hex")
 	timeout := fs.Uint64("timeout", 0, "refund timeout height")
 	to := fs.String("to", "", "address to sweep the contract balance to")
-	fee := fs.Uint64("fee", uint64(core.DefaultMinRelayFee), "fee in base units")
+	fee := fs.Uint64("fee", core.DefaultMinRelayFee, "fee in base units")
 	preimage := fs.String("preimage", "", "preimage hex (claim only)")
 	sender := fs.String("sender", "", "sender public key hex (claim only; the counterparty)")
 	recipient := fs.String("recipient", "", "recipient public key hex (refund only; the counterparty)")
