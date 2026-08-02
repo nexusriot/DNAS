@@ -21,11 +21,18 @@ func freeAddr(t *testing.T) string {
 	return addr
 }
 
+// testEmptyBlockInterval all but removes the miner's idle throttle, so a test
+// miner only pays for proof of work rather than a full TargetBlockTime per empty
+// block. With the production default (5s) three blocks cost 15s of pure waiting,
+// which under -race on a loaded CI runner does not fit in these deadlines.
+const testEmptyBlockInterval = 10 * time.Millisecond
+
 func startTestNode(t *testing.T, listen string, peers []string, mine bool) *Node {
 	t.Helper()
 	w, _ := wallet.New()
 	n := New(Config{
 		ListenAddr: listen, AdvertiseAddr: listen, Peers: peers, Mine: mine, MaxPeers: 8,
+		EmptyBlockInterval: testEmptyBlockInterval,
 	}, core.NewBlockchain(), core.NewMempool(), w)
 	n.Start()
 	t.Cleanup(n.Shutdown)
@@ -54,13 +61,14 @@ func TestTwoNodeSync(t *testing.T) {
 	nodeA := startTestNode(t, addrA, nil, true)                    // miner
 	nodeB := startTestNode(t, freeAddr(t), []string{addrA}, false) // syncs from A
 
-	if !waitFor(20*time.Second, func() bool { return nodeA.chain.Height() >= 3 }) {
+	if !waitFor(40*time.Second, func() bool { return nodeA.chain.Height() >= 3 }) {
 		t.Fatalf("miner did not produce blocks (height %d)", nodeA.chain.Height())
 	}
 	nodeA.SetMining(false) // freeze A's tip so B can converge to a stable target
-	target := nodeA.chain.Tip().Hash
 
-	if !waitFor(20*time.Second, func() bool { return nodeB.chain.Tip().Hash == target }) {
+	// Compare against A's live tip: a block already in flight when mining was
+	// turned off may still land, which would strand a snapshotted target.
+	if !waitFor(40*time.Second, func() bool { return nodeB.chain.Tip().Hash == nodeA.chain.Tip().Hash }) {
 		t.Fatalf("peer did not sync: A tip @%d, B @%d", nodeA.chain.Height(), nodeB.chain.Height())
 	}
 }
@@ -77,14 +85,13 @@ func TestThreeNodeDiscoveryAndSync(t *testing.T) {
 	_ = startTestNode(t, addrB, []string{addrA}, false)            // knows A
 	nodeC := startTestNode(t, freeAddr(t), []string{addrB}, false) // knows only B
 
-	if !waitFor(25*time.Second, func() bool { return nodeA.chain.Height() >= 3 }) {
+	if !waitFor(40*time.Second, func() bool { return nodeA.chain.Height() >= 3 }) {
 		t.Fatalf("miner did not produce blocks (height %d)", nodeA.chain.Height())
 	}
 	nodeA.SetMining(false)
-	target := nodeA.chain.Tip().Hash
 
 	// C (seeded only with B) must still reach A's chain.
-	if !waitFor(25*time.Second, func() bool { return nodeC.chain.Tip().Hash == target }) {
+	if !waitFor(40*time.Second, func() bool { return nodeC.chain.Tip().Hash == nodeA.chain.Tip().Hash }) {
 		t.Fatalf("node C did not converge: A @%d, C @%d", nodeA.chain.Height(), nodeC.chain.Height())
 	}
 }

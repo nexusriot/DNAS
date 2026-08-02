@@ -43,6 +43,15 @@ const (
 
 	// getChainCooldown throttles the expensive whole-chain request per peer.
 	getChainCooldown = 10 * time.Second
+
+	// dialRetryInterval is how long a dial loop waits before redialing a peer,
+	// whether the dial failed or an established connection dropped.
+	dialRetryInterval = 3 * time.Second
+	// minePollInterval is how often a paused miner re-checks the mining toggle.
+	minePollInterval = 200 * time.Millisecond
+	// acceptRetryDelay backs the accept loop off after a transient accept error,
+	// so a broken listener can't spin a core.
+	acceptRetryDelay = 50 * time.Millisecond
 )
 
 // Config holds a node's network and mining settings.
@@ -56,6 +65,13 @@ type Config struct {
 	StateDir      string   // directory for persisted peer/ban/mempool state ("" = in-memory only)
 	Regtest       bool     // regtest mode: enable on-demand block generation (POST /generate)
 	Dandelion     bool     // relay new transactions via Dandelion++ stem/fluff (origin privacy)
+
+	// EmptyBlockInterval is how long the miner waits before minting a block with
+	// no transactions in it, so an idle network isn't flooded with empty blocks.
+	// Zero means one TargetBlockTime, which is what a real network wants; devnets
+	// and tests set it low to get blocks as fast as proof of work allows. It is
+	// local mining policy, not consensus — peers need not agree on it.
+	EmptyBlockInterval time.Duration
 }
 
 type peer struct {
@@ -106,6 +122,14 @@ type Node struct {
 	tipGen int64       // atomic; bumped whenever the tip changes to interrupt mining
 	txGen  int64       // atomic; bumped when a new tx enters the mempool, to wake an idle miner
 
+	// Lifecycle: quit is closed once by Shutdown, which every background loop
+	// (accept, dial, mine) selects on so the node leaves nothing running behind
+	// it. ln is the accept listener, kept so Shutdown can unblock Accept.
+	quit     chan struct{}
+	stopOnce sync.Once
+	lnMu     sync.Mutex
+	ln       net.Listener
+
 	// Transport, injectable so tests can drive nodes over an in-memory network
 	// with controllable latency and partitions. Production uses TCP.
 	dialFn   func(string) (net.Conn, error)
@@ -146,6 +170,7 @@ func New(cfg Config, chain *core.Blockchain, mp *core.Mempool, w *wallet.Wallet)
 		bans:         newBanbook(banThreshold),
 		events:       newEventBus(),
 		dand:         newDandelion(),
+		quit:         make(chan struct{}),
 	}
 	n.dialFn = func(addr string) (net.Conn, error) { return net.Dial("tcp", addr) }
 	n.listenFn = func(addr string) (net.Listener, error) { return net.Listen("tcp", addr) }
@@ -169,10 +194,19 @@ func (n *Node) Mining() bool { return n.mining.Load() }
 // generation via Generate / POST /generate is available).
 func (n *Node) Regtest() bool { return n.cfg.Regtest }
 
-// Shutdown stops mining and closes all peer connections. The chain's store is
-// closed separately by the owner (Blockchain.Close).
+// Shutdown stops the node: it halts mining, stops accepting and redialing peers,
+// and closes all peer connections. It is safe to call more than once, and after
+// it returns the node's background loops wind down rather than lingering (a
+// leaked dial loop would keep reconnecting forever). The chain's store is closed
+// separately by the owner (Blockchain.Close).
 func (n *Node) Shutdown() {
+	n.stopOnce.Do(func() { close(n.quit) })
 	n.mining.Store(false)
+	n.lnMu.Lock()
+	if n.ln != nil {
+		_ = n.ln.Close() // unblocks the accept loop
+	}
+	n.lnMu.Unlock()
 	n.dand.stopAll() // cancel any pending Dandelion++ embargo timers
 	n.peersMu.Lock()
 	ps := make([]*peer, 0, len(n.peers))
@@ -204,6 +238,45 @@ func (n *Node) Start() {
 	} else if n.cfg.Mine {
 		log.Print("mining requested but no wallet; disabled")
 	}
+}
+
+// stopped reports whether Shutdown has been called.
+func (n *Node) stopped() bool {
+	select {
+	case <-n.quit:
+		return true
+	default:
+		return false
+	}
+}
+
+// wait sleeps for d, returning false if the node shuts down first. Background
+// loops use it instead of time.Sleep so Shutdown doesn't have to wait out a
+// retry interval.
+func (n *Node) wait(d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-n.quit:
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+// setListener publishes the accept listener so Shutdown can close it. It reports
+// false if the node was already shut down, in which case the listener is closed
+// here and the caller must stop — otherwise a Shutdown racing startup would
+// leave the socket open forever.
+func (n *Node) setListener(ln net.Listener) bool {
+	n.lnMu.Lock()
+	defer n.lnMu.Unlock()
+	if n.stopped() {
+		_ = ln.Close()
+		return false
+	}
+	n.ln = ln
+	return true
 }
 
 func (n *Node) Chain() *core.Blockchain { return n.chain }
@@ -293,10 +366,17 @@ func (n *Node) listen() {
 	if err != nil {
 		log.Fatalf("listen %s: %v", n.cfg.ListenAddr, err)
 	}
+	if !n.setListener(ln) {
+		return
+	}
 	log.Printf("p2p listening on %s (advertising %s)", n.cfg.ListenAddr, n.cfg.AdvertiseAddr)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
+			if n.stopped() { // Shutdown closed the listener
+				return
+			}
+			time.Sleep(acceptRetryDelay) // transient (e.g. fd exhaustion): back off, don't spin
 			continue
 		}
 		// Eclipse/DoS guard: reject the connection before the handshake if it would
@@ -375,14 +455,13 @@ func (n *Node) maybeDial(addr string) {
 }
 
 func (n *Node) dialLoop(addr string) {
-	for {
-		conn, err := n.dialFn(addr)
-		if err != nil {
-			time.Sleep(3 * time.Second)
-			continue
+	for !n.stopped() {
+		if conn, err := n.dialFn(addr); err == nil {
+			n.handleConn(conn) // blocks until the connection drops
 		}
-		n.handleConn(conn) // blocks until the connection drops
-		time.Sleep(3 * time.Second)
+		if !n.wait(dialRetryInterval) {
+			return
+		}
 	}
 }
 
@@ -890,25 +969,37 @@ func (n *Node) commitMined(mined core.Block, txs []core.Transaction) error {
 	return nil
 }
 
+// emptyBlockInterval is how long the miner idles before minting a block with no
+// transactions in it (Config.EmptyBlockInterval, defaulting to one target block
+// time).
+func (n *Node) emptyBlockInterval() time.Duration {
+	if n.cfg.EmptyBlockInterval > 0 {
+		return n.cfg.EmptyBlockInterval
+	}
+	return time.Duration(core.TargetBlockTime) * time.Second
+}
+
 func (n *Node) mineLoop() {
 	log.Printf("miner ready for %s (mining=%v)", n.wallet.Address(), n.Mining())
-	for {
+	for !n.stopped() {
 		if !n.mining.Load() {
-			time.Sleep(200 * time.Millisecond) // paused; poll for the toggle
+			if !n.wait(minePollInterval) { // paused; poll for the toggle
+				return
+			}
 			continue
 		}
 		candidate, txs := n.buildBlock()
 
-		// When idle, wait roughly one target interval before minting an empty
-		// (coinbase-only) block, so we don't spam the network. Interruptible if
-		// a new tip arrives meanwhile.
-		if len(txs) == 0 && !n.sleepInterruptible(time.Duration(core.TargetBlockTime)*time.Second) {
+		// When idle, wait out the empty-block interval before minting a
+		// coinbase-only block, so we don't spam the network. Interruptible if a
+		// new tip arrives meanwhile.
+		if len(txs) == 0 && !n.sleepInterruptible(n.emptyBlockInterval()) {
 			continue
 		}
 
 		startGen := atomic.LoadInt64(&n.tipGen)
 		mined, ok := core.Mine(candidate, func() bool {
-			return atomic.LoadInt64(&n.tipGen) != startGen
+			return atomic.LoadInt64(&n.tipGen) != startGen || n.stopped()
 		})
 		if !ok {
 			continue // tip changed; rebuild on the new tip
@@ -950,18 +1041,20 @@ func (n *Node) Generate(count int) ([]string, error) {
 	return hashes, nil
 }
 
-// sleepInterruptible sleeps up to d, returning false early if the tip changes or
-// a new transaction arrives (so the idle miner rebuilds promptly rather than
-// waiting out the whole interval).
+// sleepInterruptible sleeps up to d, returning false early if the tip changes, a
+// new transaction arrives (so the idle miner rebuilds promptly rather than
+// waiting out the whole interval), or the node shuts down.
 func (n *Node) sleepInterruptible(d time.Duration) bool {
 	tip := atomic.LoadInt64(&n.tipGen)
 	tx := atomic.LoadInt64(&n.txGen)
-	steps := int(d / (50 * time.Millisecond))
-	for i := 0; i < steps; i++ {
+	const step = 50 * time.Millisecond
+	for left := d; left > 0; left -= step {
 		if atomic.LoadInt64(&n.tipGen) != tip || atomic.LoadInt64(&n.txGen) != tx {
 			return false
 		}
-		time.Sleep(50 * time.Millisecond)
+		if !n.wait(min(step, left)) {
+			return false
+		}
 	}
 	return true
 }
