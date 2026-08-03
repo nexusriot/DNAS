@@ -22,9 +22,9 @@ jobs:
 
       - name: gofmt
         run: |
-          # node/integration_test.go is intentionally left non-gofmt-clean, so it
-          # is exempt; every other file must be formatted.
-          unformatted=$(gofmt -l core node api cmd wallet | grep -v 'node/integration_test.go' || true)
+          # Every file must be formatted (node/integration_test.go used to be
+          # exempt; it is gofmt-clean now, so nothing is).
+          unformatted=$(gofmt -l core node api cmd wallet)
           tui_unformatted=$(cd tui && gofmt -l .)
           if [ -n "$unformatted$tui_unformatted" ]; then
             echo "These files need gofmt:"; echo "$unformatted"; echo "$tui_unformatted"

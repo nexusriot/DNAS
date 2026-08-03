@@ -530,6 +530,33 @@ deep forks and initial bootstrap.
 **Bounded memory.** The gossip de-duplication sets are bounded FIFOs and the
 mempool is capped, so a long-running node's memory doesn't grow without limit.
 
+**The miner (`mineLoop`).** The miner runs whenever the node has a wallet; an
+atomic flag (`SetMining`, `POST /mine`) gates whether it actually produces
+blocks, so it can be toggled at runtime. Each round it builds a candidate
+(`buildBlock`), then searches for a nonce. Two counters make the search
+interruptible: `tipGen` (bumped whenever the tip changes) aborts the hash loop so
+work is rebuilt on the new tip instead of racing a block that already won, and
+`txGen` (bumped when a transaction enters the mempool) wakes an idle miner so a
+payment isn't left waiting for the next interval.
+
+A block with **no transactions in it** is deliberately throttled: the miner waits
+`Config.EmptyBlockInterval` (default one `TargetBlockTime`) before minting one, so
+an idle network isn't flooded with empty blocks. This is *local mining policy*,
+not consensus — peers needn't agree on it — which is why it is a knob: a devnet
+or a test lowers it so proof of work is the only thing pacing block production.
+(Regtest goes further and mines on demand via `Node.Generate`, bypassing both the
+interval and the toggle.)
+
+**Node lifecycle.** `Start` launches the accept loop, a dial loop per known peer,
+and the miner. `Shutdown` closes a `quit` channel that every one of those loops
+selects on — including the nonce search's abort check — and closes the listener to
+unblock `Accept`, so a stopped node leaves nothing running behind it. It is
+idempotent (`sync.Once`), which matters because the daemon shuts down explicitly
+on a signal while embedders and tests also register it as cleanup. Without it a
+"stopped" node went on redialing its peers every `dialRetryInterval` forever —
+wasted work in production, and in tests a finished node that could wander into the
+next one once the OS recycled its port.
+
 ---
 
 ## 12. Persistence
@@ -806,6 +833,7 @@ All in [`core/params.go`](core/params.go). Every node must agree on these.
 | Adversarial sim via an injected transport | Stress reorg/finality/sync/partitions in-process, deterministically | Test-only; a reliable stream transport models latency/partitions, not packet loss |
 | State root in the header (balance proofs) | Light clients prove balances, not just inclusion | Another header field; proves membership only, not account absence |
 | Regtest = on-demand `/generate`, not fast continuous mining | Deterministic, controlled block production; no runaway chain | A separate mode; isolated by netkey rather than a distinct genesis |
+| Miner throttles empty blocks by one `TargetBlockTime`, overridable per node | An idle network doesn't fill with coinbase-only blocks | It caps how fast an idle chain advances regardless of hashpower, so devnets and tests must lower `EmptyBlockInterval` rather than wait it out |
 | Checksums client-side only | Avoids a consensus validation cascade | A malicious client can still burn its own coins |
 | HMAC-SHA512 HD, not SLIP-0010 | Small and self-contained | Not interoperable with standard wallets |
 | TUI as its own module | Keeps external deps' `go.sum` off the internal v0.0.0 modules | It can't import `wallet`; multisig/HD go through API helpers |
@@ -825,7 +853,12 @@ All in [`core/params.go`](core/params.go). Every node must agree on these.
 - **Native Go fuzzers** (`core/fuzz_test.go`, `wallet/fuzz_test.go`) over
   transaction/header/Merkle/amount decoding and address/mnemonic validation.
 - **In-process integration tests** (`node/integration_test.go`) spin up multiple
-  nodes on ephemeral ports and assert sync/discovery/convergence.
+  nodes on ephemeral ports and assert sync/discovery/convergence. They run the real
+  miner, so they shorten `EmptyBlockInterval`: at the production default, three
+  blocks cost 15 s of waiting before any hashing, which under `-race` on a loaded CI
+  runner ate the entire deadline. `node/lifecycle_test.go` covers the other half of
+  that story — that `Shutdown` really stops the node's loops, so nodes left behind
+  by a finished test can't slow down or interfere with the next one.
 - **Adversarial network simulation** (`node/simnet_test.go`) wires nodes through a
   switchboard (injected via `Node.dialFn`/`listenFn`) that adds latency and can
   partition links on demand, then asserts that a network which forks under a

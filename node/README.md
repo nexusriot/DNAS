@@ -9,9 +9,19 @@ Module `github.com/nexusriot/DNAS/node` — the peer-to-peer daemon.
   txs, setting its `StateRoot` via `chain.NextStateRoot` and `BaseFee` via
   `chain.NextBaseFee`, and paying the coinbase `reward + tips` with the base fee
   burned) and `commitMined` applies and gossips it; both are shared by the miner
-  loop and `Node.Generate`. In **regtest** mode (`Config.Regtest`, `Node.Regtest`)
-  `Node.Generate(n)` mines N blocks immediately to the node wallet — bypassing the
-  idle interval and the mining toggle — the primitive behind `POST /generate`.
+  loop and `Node.Generate`. The nonce search aborts when the tip moves (rebuild on
+  the winner) and an idle miner wakes on a new mempool transaction. A block with no
+  transactions in it waits `Config.EmptyBlockInterval` first (default one
+  `TargetBlockTime`) so an idle network isn't flooded with empty blocks — local
+  mining policy, not consensus, which is why a devnet or test can lower it. In
+  **regtest** mode (`Config.Regtest`, `Node.Regtest`) `Node.Generate(n)` mines N
+  blocks immediately to the node wallet — bypassing the interval and the mining
+  toggle — the primitive behind `POST /generate`.
+- **Lifecycle** — `Start` launches the accept loop, a dial loop per known peer and
+  the miner; `Shutdown` closes an internal quit channel they all select on (plus the
+  listener, to unblock `Accept`), so a stopped node stops mining, accepting and
+  redialing rather than leaving loops running. It is idempotent, so a daemon that
+  shuts down on a signal and a test that registers it as cleanup can both call it.
 - `secure.go` — `secureConn`: an X25519 handshake + AES-256-GCM encrypted,
   length-framed message stream. **Permissionless by default** — with no network key
   the handshake is anonymous (anyone may connect); a non-empty key authenticates a

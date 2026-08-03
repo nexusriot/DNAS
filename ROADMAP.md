@@ -130,6 +130,10 @@ sections matter most for "toy → real".
   default `dist` targets.
 - **`[S/M]` Richer web explorer.** Supply / difficulty / fee-rate charts, a rich
   list, and per-address history on top of the existing in-browser SPV explorer.
+- **`[S]` Expose the empty-block interval to operators.** The miner's idle throttle
+  is a `node.Config` field (`EmptyBlockInterval`, default one `TargetBlockTime`),
+  reachable only in Go — there is no `-emptyinterval` flag or `node.json` key, so a
+  devnet that wants faster empty blocks has to use `-regtest`/`/generate` instead.
 
 ## 7. Assurance & testing
 
