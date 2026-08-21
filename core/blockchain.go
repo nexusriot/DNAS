@@ -772,6 +772,76 @@ func validateBlockStructure(blocks []Block, block Block) error {
 	if coinbase.To == "" {
 		return errors.New("coinbase has no recipient")
 	}
+	return validateCoinbaseShape(coinbase)
+}
+
+// validateCoinbaseShape pins the coinbase to the one form it is allowed to take:
+// a recipient and an amount, nothing else. The coinbase is exempt from the
+// per-byte base fee and from MaxBlockBytes (both meter the paid transactions), so
+// its size needs its own cap or a miner could bloat every node's storage for
+// free. The unused fields must be empty for the same reason a transaction may
+// carry only one kind of authorization — they are committed by the block hash but
+// mean nothing, so leaving them free only invites divergence between
+// implementations. Every coinbase this code has ever produced (NewCoinbase sets
+// exactly From/To/Amount) satisfies this.
+func validateCoinbaseShape(cb Transaction) error {
+	if n := cb.Size(); n > MaxCoinbaseBytes {
+		return fmt.Errorf("coinbase too large: %d bytes (max %d)", n, MaxCoinbaseBytes)
+	}
+	if len(cb.To) > MaxAddressBytes {
+		return fmt.Errorf("coinbase recipient too long (%d > %d)", len(cb.To), MaxAddressBytes)
+	}
+	if cb.Fee != 0 || cb.Nonce != 0 || cb.Expiry != 0 || cb.LockUntil != 0 {
+		return errors.New("coinbase must not set fee, nonce, expiry or lock_until")
+	}
+	if cb.AssetID != "" || cb.Issue != nil {
+		return errors.New("coinbase must not carry an asset")
+	}
+	if cb.PubKey != "" || cb.Signature != "" || len(cb.Signatures) > 0 {
+		return errors.New("coinbase must not carry signatures")
+	}
+	if cb.Multisig != nil || cb.HTLC != nil || cb.Preimage != "" {
+		return errors.New("coinbase must not carry an authorization script")
+	}
+	if len(cb.Memo) > MaxMemoBytes {
+		return fmt.Errorf("coinbase memo too long (%d > %d)", len(cb.Memo), MaxMemoBytes)
+	}
+	return nil
+}
+
+// TxRejection identifies which transaction in a candidate block consensus
+// refused, and why. Returning the position rather than just a message is what
+// lets a miner recover: if a mempool transaction turns out to be unmineable,
+// every block built on it is invalid, so the miner must be able to find and drop
+// the offender instead of rebuilding the same doomed candidate forever.
+type TxRejection struct {
+	Index int // position in the block's transaction list
+	Err   error
+}
+
+func (e *TxRejection) Error() string { return fmt.Sprintf("tx %d: %v", e.Index, e.Err) }
+func (e *TxRejection) Unwrap() error { return e.Err }
+
+// checkTxAtHeight applies the consensus rules that depend on the height a
+// transaction is being included at, as opposed to the context-free ones in
+// CheckTxSanity. Mempool.Select mirrors these for the block it is building, so
+// the miner never selects a transaction its own rules would reject.
+func checkTxAtHeight(tx Transaction, height uint64) error {
+	if tx.IsExpiredAt(height) {
+		return fmt.Errorf("expired (expiry %d < height %d)", tx.Expiry, height)
+	}
+	if tx.IsLockedAt(height) {
+		return fmt.Errorf("not yet valid (lock_until %d > height %d)", tx.LockUntil, height)
+	}
+	if tx.HTLCRefundNotReady(height) {
+		return fmt.Errorf("htlc refund before timeout (timeout %d > height %d)", tx.HTLC.Timeout, height)
+	}
+	// Height-activated rule (consensus upgrade): once UpgradeDustLimit is in
+	// force, coin transfers below DustThreshold are rejected. Off until an
+	// activation height is scheduled, and never applies to asset/issue txs.
+	if IsUpgradeActive(UpgradeDustLimit, height) && !tx.IsIssue() && !tx.IsAssetTransfer() && tx.Amount > 0 && tx.Amount < DustThreshold {
+		return fmt.Errorf("dust output: amount %d below dust threshold %d", tx.Amount, DustThreshold)
+	}
 	return nil
 }
 
@@ -803,38 +873,26 @@ func applyTxsAndCoinbase(state map[string]Account, blocks []Block, block Block) 
 	for i := 1; i < len(block.Transactions); i++ {
 		tx := block.Transactions[i]
 		if tx.IsCoinbase() {
-			return fail(errors.New("only one coinbase transaction allowed"))
+			return fail(&TxRejection{Index: i, Err: errors.New("only one coinbase transaction allowed")})
 		}
-		if tx.IsExpiredAt(height) {
-			return fail(fmt.Errorf("tx %d expired (expiry %d < height %d)", i, tx.Expiry, height))
+		if err := CheckTxSanity(tx); err != nil {
+			return fail(&TxRejection{Index: i, Err: err})
 		}
-		if tx.IsLockedAt(height) {
-			return fail(fmt.Errorf("tx %d not yet valid (lock_until %d > height %d)", i, tx.LockUntil, height))
-		}
-		if tx.HTLCRefundNotReady(height) {
-			return fail(fmt.Errorf("tx %d htlc refund before timeout (timeout %d > height %d)", i, tx.HTLC.Timeout, height))
+		if err := checkTxAtHeight(tx, height); err != nil {
+			return fail(&TxRejection{Index: i, Err: err})
 		}
 		minFee := BaseFeeFor(tx, baseFee)
 		if tx.Fee < minFee {
-			return fail(fmt.Errorf("tx %d fee %d below per-byte base fee %d (%d bytes × %d)", i, tx.Fee, minFee, tx.Size(), baseFee))
-		}
-		if len(tx.Memo) > MaxMemoBytes {
-			return fail(fmt.Errorf("tx %d memo too long (%d > %d)", i, len(tx.Memo), MaxMemoBytes))
-		}
-		// Height-activated rule (consensus upgrade): once UpgradeDustLimit is in
-		// force, coin transfers below DustThreshold are rejected. Off until an
-		// activation height is scheduled, and never applies to asset/issue txs.
-		if IsUpgradeActive(UpgradeDustLimit, height) && !tx.IsIssue() && !tx.IsAssetTransfer() && tx.Amount > 0 && tx.Amount < DustThreshold {
-			return fail(fmt.Errorf("tx %d dust output: amount %d below dust threshold %d", i, tx.Amount, DustThreshold))
+			return fail(&TxRejection{Index: i, Err: fmt.Errorf("fee %d below per-byte base fee %d (%d bytes × %d)", tx.Fee, minFee, tx.Size(), baseFee)})
 		}
 		h := tx.Hash()
 		if seen[h] {
-			return fail(errors.New("duplicate transaction in block"))
+			return fail(&TxRejection{Index: i, Err: errors.New("duplicate transaction in block")})
 		}
 		seen[h] = true
 		reserve := immatureCoinbase(blocks, height, tx.From)
 		if err := applyTxTo(state, tx, reserve, set); err != nil {
-			return fail(fmt.Errorf("tx %d: %w", i, err))
+			return fail(&TxRejection{Index: i, Err: err})
 		}
 		tips += tx.Fee - minFee // base fee × size is burned; miner keeps only the tip
 	}

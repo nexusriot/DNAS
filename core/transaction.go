@@ -75,6 +75,103 @@ type HTLCScript struct {
 	Timeout   uint64 `json:"timeout"`   // height at/after which the refund path opens
 }
 
+// CheckTxSanity validates every consensus rule about a non-coinbase transaction
+// that depends on nothing but the transaction itself — no chain state, no height.
+//
+// It exists so the mempool and block validation cannot disagree. A transaction
+// the mempool admits but consensus rejects is not merely wasted space: the miner
+// selects it, every candidate block it builds is then invalid, and block
+// production stops until the transaction is evicted. Sharing one function makes
+// that divergence impossible for this class of rule, so both callers use it —
+// Mempool.Add at admission and applyTxsAndCoinbase at application.
+//
+// The rules that need context live elsewhere: height-dependent ones (expiry,
+// lock-time, the HTLC timeout, the dust limit) in checkTxAtHeight, which is
+// shared the same way, and state-dependent ones (nonces, balances) in applyTxTo.
+func CheckTxSanity(tx Transaction) error {
+	if tx.IsCoinbase() {
+		return errors.New("coinbase transaction is not valid here")
+	}
+	if len(tx.From) > MaxAddressBytes {
+		return fmt.Errorf("sender address too long (%d > %d)", len(tx.From), MaxAddressBytes)
+	}
+	if len(tx.To) > MaxAddressBytes {
+		return fmt.Errorf("recipient address too long (%d > %d)", len(tx.To), MaxAddressBytes)
+	}
+	if len(tx.Memo) > MaxMemoBytes {
+		return fmt.Errorf("memo too long (%d > %d)", len(tx.Memo), MaxMemoBytes)
+	}
+	if err := tx.checkAuthShape(); err != nil {
+		return err
+	}
+	switch {
+	case tx.IsIssue():
+		if tx.AssetID != "" {
+			return errors.New("an issuance cannot also carry an asset id")
+		}
+		if err := validTicker(tx.Issue.Ticker); err != nil {
+			return err
+		}
+		if tx.Issue.Supply == 0 || tx.Issue.Supply > MaxAssetSupply {
+			return fmt.Errorf("asset supply must be in 1..%d", MaxAssetSupply)
+		}
+	case tx.IsAssetTransfer():
+		if tx.To == "" {
+			return errors.New("asset transfer has no recipient")
+		}
+		if tx.Amount == 0 {
+			return errors.New("empty asset transfer")
+		}
+	default:
+		if tx.To == "" {
+			return errors.New("transfer has no recipient")
+		}
+		if tx.Amount == 0 && tx.Fee == 0 {
+			return errors.New("empty transfer")
+		}
+		if tx.Amount+tx.Fee < tx.Amount {
+			return errors.New("amount+fee overflow")
+		}
+	}
+	return nil
+}
+
+// checkAuthShape rejects transactions carrying more than one kind of
+// authorization. Exactly one of single-key, multisig or HTLC applies, and
+// VerifySignature picks by precedence; leaving the unused fields free would make
+// them a malleability handle (they are covered by the txid but not by any
+// signature) and would let two implementations disagree about which branch a
+// transaction meant to take.
+func (t Transaction) checkAuthShape() error {
+	switch {
+	case t.IsMultisig():
+		if t.HTLC != nil {
+			return errors.New("transaction carries both a multisig and an htlc script")
+		}
+		if t.PubKey != "" || t.Signature != "" {
+			return errors.New("multisig transaction must not carry a single-key signature")
+		}
+		if t.Preimage != "" {
+			return errors.New("multisig transaction must not carry a preimage")
+		}
+	case t.IsHTLC():
+		if t.PubKey != "" {
+			return errors.New("htlc transaction must not carry a public key")
+		}
+		if len(t.Signatures) > 0 {
+			return errors.New("htlc transaction must not carry multisig signatures")
+		}
+	default:
+		if len(t.Signatures) > 0 {
+			return errors.New("single-key transaction must not carry multisig signatures")
+		}
+		if t.Preimage != "" {
+			return errors.New("single-key transaction must not carry a preimage")
+		}
+	}
+	return nil
+}
+
 // IsMultisig reports whether the transaction is authorized by a multisig script.
 func (t Transaction) IsMultisig() bool { return t.Multisig != nil }
 
@@ -182,6 +279,14 @@ func (t Transaction) VerifySignature() error {
 
 // verifyMultisig checks the script hashes to From and that at least Threshold
 // distinct listed members produced a valid signature over the signing bytes.
+//
+// Every supplied signature must match some member: a transaction carrying junk
+// signatures alongside the required ones is rejected rather than ignored. That
+// keeps the cost of a *failed* verification linear (the first junk signature
+// ends it) instead of quadratic, and it removes a malleability handle — a relay
+// cannot pad the Signatures list to change the txid or inflate the byte size the
+// per-byte base fee is charged on. Together with wallet.MaxMultisigKeys bounding
+// N, the worst case is N² verifications for a bounded, small N.
 func (t Transaction) verifyMultisig() error {
 	ms := t.Multisig
 	addr, err := wallet.MultisigAddress(ms.Threshold, ms.PubKeys)
@@ -194,23 +299,29 @@ func (t Transaction) verifyMultisig() error {
 	if len(t.Signatures) < ms.Threshold {
 		return errors.New("not enough signatures for the threshold")
 	}
+	if len(t.Signatures) > len(ms.PubKeys) {
+		return errors.New("more signatures than multisig members")
+	}
 	msg := t.signingBytes()
 	used := make(map[string]bool)
-	valid := 0
 	for _, sig := range t.Signatures {
+		matched := false
 		for _, pk := range ms.PubKeys {
 			if used[pk] {
 				continue
 			}
 			if wallet.Verify(pk, sig, msg) {
 				used[pk] = true
-				valid++
+				matched = true
 				break
 			}
 		}
+		if !matched {
+			return errors.New("signature does not verify against any unused multisig member")
+		}
 	}
-	if valid < ms.Threshold {
-		return fmt.Errorf("only %d of %d required signatures are valid", valid, ms.Threshold)
+	if len(used) < ms.Threshold {
+		return fmt.Errorf("only %d of %d required signatures are valid", len(used), ms.Threshold)
 	}
 	return nil
 }

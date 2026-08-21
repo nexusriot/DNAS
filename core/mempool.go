@@ -87,21 +87,35 @@ func (m *Mempool) Add(tx Transaction) (bool, error) {
 	if tx.IsCoinbase() {
 		return false, errors.New("cannot add coinbase to mempool")
 	}
+	// Consensus sanity first: a transaction no block can ever contain must not be
+	// queued, or the miner will keep selecting it and every block it builds will be
+	// rejected — block production stops until the transaction is evicted. This is
+	// the same function block application uses, so the two cannot drift apart.
+	if err := CheckTxSanity(tx); err != nil {
+		return false, err
+	}
+	// Then the cheap policy checks, and only then the signature — verification is
+	// by far the most expensive step, and an unauthenticated peer must not be able
+	// to make us pay for it on a transaction we would refuse anyway.
+	size := tx.Size()
+	if size > MaxRelayTxBytes {
+		return false, fmt.Errorf("transaction too large to relay: %d bytes (max %d)", size, MaxRelayTxBytes)
+	}
+	// Relay policy: refuse anything paying below the current per-byte floor for its
+	// size (floor is a rate; a bigger transaction must pay proportionally more).
+	if floor := m.MinFee(); floor > 0 && tx.Fee < floor*uint64(size) {
+		return false, fmt.Errorf("fee %d below current relay floor %d/byte × %d bytes = %d",
+			tx.Fee, floor, size, floor*uint64(size))
+	}
 	if err := tx.VerifySignature(); err != nil {
 		return false, err
 	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	h := tx.Hash()
 	if _, ok := m.txs[h]; ok {
 		return false, nil
-	}
-
-	// Relay policy: refuse anything paying below the current per-byte floor for its
-	// size (floor is a rate; a bigger transaction must pay proportionally more).
-	if floor := m.minFeeLocked(); floor > 0 && tx.Fee < floor*uint64(tx.Size()) {
-		return false, fmt.Errorf("fee %d below current relay floor %d/byte × %d bytes = %d",
-			tx.Fee, floor, tx.Size(), floor*uint64(tx.Size()))
 	}
 
 	// Replace-by-fee: a conflicting tx (same sender+nonce) may only be replaced
@@ -310,7 +324,14 @@ func (m *Mempool) Select(bc *Blockchain, max int) []Transaction {
 	for len(selected) < max {
 		var candidates []Transaction
 		for _, tx := range all {
-			if used[tx.Hash()] || tx.IsExpiredAt(mineHeight) || tx.IsLockedAt(mineHeight) || tx.HTLCRefundNotReady(mineHeight) || tx.Fee < BaseFeeFor(tx, baseFee) {
+			if used[tx.Hash()] || tx.Fee < BaseFeeFor(tx, baseFee) {
+				continue
+			}
+			// Every consensus rule the block we are building will apply is checked
+			// here too. Selecting a transaction the chain then rejects does not just
+			// waste a slot: it invalidates the whole candidate, so the miner would
+			// hash and lose block after block while the transaction sat in the queue.
+			if CheckTxSanity(tx) != nil || checkTxAtHeight(tx, mineHeight) != nil {
 				continue
 			}
 			if weight+tx.Size() > MaxBlockBytes { // wouldn't fit the block's byte budget

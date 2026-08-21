@@ -6,6 +6,7 @@ package node
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -887,10 +888,44 @@ func (n *Node) buildBlock() (core.Block, []core.Transaction) {
 	return n.buildBlockFor(n.wallet.Address())
 }
 
+// maxBuildAttempts bounds how many times buildBlockFor will drop an unmineable
+// transaction and reassemble before giving up on this round.
+const maxBuildAttempts = 4
+
 // buildBlockFor assembles the next candidate block paying the coinbase to
-// minerAddr. The internal miner passes its own wallet; BuildTemplate passes an
-// external miner's address.
+// minerAddr, retrying if a selected transaction turns out to be unmineable.
+//
+// The mempool and Mempool.Select apply the same rules block validation does, so
+// this should not happen — but if it ever did, the consequence is severe out of
+// proportion to the cause: the same transaction would be selected into every
+// candidate, each candidate would be rejected after being mined, and the node
+// would stop producing blocks entirely while burning CPU. So the state root is
+// computed here, and a transaction consensus refuses is dropped from the mempool
+// and the block reassembled without it.
 func (n *Node) buildBlockFor(minerAddr string) (core.Block, []core.Transaction) {
+	for attempt := 0; ; attempt++ {
+		candidate, txs := n.assembleBlock(minerAddr)
+		root, err := n.chain.NextStateRoot(candidate)
+		if err == nil {
+			candidate.StateRoot = root
+			return candidate, txs
+		}
+		var rej *core.TxRejection
+		if attempt+1 >= maxBuildAttempts || !errors.As(err, &rej) || rej.Index < 1 || rej.Index > len(txs) {
+			// Not attributable to one transaction (or too many tries): leave the state
+			// root empty, which the miner treats as "do not mine this".
+			log.Printf("cannot build a block on the current tip: %v", err)
+			return candidate, txs
+		}
+		bad := txs[rej.Index-1] // Transactions[0] is the coinbase
+		log.Printf("dropping unmineable transaction %s from the mempool: %v", short(bad.Hash()), rej.Err)
+		n.mempool.Remove([]core.Transaction{bad})
+	}
+}
+
+// assembleBlock builds the candidate block body — coinbase plus mempool-selected
+// transactions — with everything filled in except the state root and the nonce.
+func (n *Node) assembleBlock(minerAddr string) (core.Block, []core.Transaction) {
 	tip := n.chain.Tip()
 	height := tip.Index + 1
 	baseFee := n.chain.NextBaseFee()
@@ -911,10 +946,6 @@ func (n *Node) buildBlockFor(minerAddr string) (core.Block, []core.Transaction) 
 		Bits:         n.chain.NextBits(),
 	}
 	candidate.MerkleRoot = core.MerkleRoot(candidate.Transactions)
-	// Commit the post-block account state root (part of the PoW-hashed header).
-	// On error the candidate keeps an empty root and AddBlock will reject it, so
-	// the miner simply rebuilds — no invalid block escapes.
-	candidate.StateRoot, _ = n.chain.NextStateRoot(candidate)
 	return candidate, txs
 }
 
@@ -989,6 +1020,14 @@ func (n *Node) mineLoop() {
 			continue
 		}
 		candidate, txs := n.buildBlock()
+		if candidate.StateRoot == "" {
+			// The candidate is already known-invalid (see buildBlockFor). Hashing it
+			// would burn a core to produce a block the chain will refuse, so wait for
+			// something to change instead of spinning.
+			log.Print("no valid block can be built on the current tip; waiting")
+			n.sleepInterruptible(n.emptyBlockInterval())
+			continue
+		}
 
 		// When idle, wait out the empty-block interval before minting a
 		// coinbase-only block, so we don't spam the network. Interruptible if a
@@ -1005,7 +1044,15 @@ func (n *Node) mineLoop() {
 			continue // tip changed; rebuild on the new tip
 		}
 		if err := n.commitMined(mined, txs); err != nil {
-			log.Printf("discarded our block %d (lost the race): %v", mined.Index, err)
+			log.Printf("discarded our block %d: %v", mined.Index, err)
+			// Usually this means we lost the race and the tip already moved, in which
+			// case the next round rebuilds on it. If the tip did NOT move, the block
+			// was refused for a reason rebuilding won't change (an operator pinning a
+			// checkpoint at a future height, say), and retrying immediately would spin
+			// a core forever — so back off and let something change first.
+			if atomic.LoadInt64(&n.tipGen) == startGen {
+				n.sleepInterruptible(n.emptyBlockInterval())
+			}
 		}
 	}
 }
@@ -1024,6 +1071,9 @@ func (n *Node) Generate(count int) ([]string, error) {
 		committed := false
 		for attempt := 0; attempt < 5 && !committed; attempt++ {
 			candidate, txs := n.buildBlock()
+			if candidate.StateRoot == "" {
+				return hashes, fmt.Errorf("no valid block can be built on the current tip")
+			}
 			mined, ok := core.Mine(candidate, nil)
 			if !ok {
 				continue

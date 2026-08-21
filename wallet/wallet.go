@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"sort"
 	"strings"
@@ -70,11 +71,29 @@ func addressChecksum(body []byte) []byte {
 	return h[:addressChecksumLen]
 }
 
+// MaxMultisigKeys bounds N in an M-of-N multisig script. Two independent reasons
+// make a bound mandatory rather than cosmetic:
+//
+//   - Verification cost. Matching signatures against members is inherently
+//     O(signatures × keys) Ed25519 verifications, and that work is done by every
+//     node that merely *relays* the transaction, before any fee is charged. Left
+//     unbounded, one large transaction costs the whole network minutes of CPU for
+//     free.
+//   - Address uniqueness. The threshold is folded into the address as a single
+//     byte (see below), so N above 255 would let two different thresholds hash to
+//     the same address — a 1-of-N signer could then spend an M-of-N account.
+//
+// Bitcoin's bare CHECKMULTISIG limit is 20 for the same first reason.
+const MaxMultisigKeys = 16
+
 // MultisigAddress derives the address of an M-of-N multisig account from its
 // threshold and the N member public keys (hex). The public keys are sorted so
 // the address is independent of ordering; the same format/checksum as a normal
 // address is used, so it validates and spends like any other address.
 func MultisigAddress(threshold int, pubKeysHex []string) (string, error) {
+	if len(pubKeysHex) > MaxMultisigKeys {
+		return "", fmt.Errorf("at most %d multisig members are allowed, got %d", MaxMultisigKeys, len(pubKeysHex))
+	}
 	if threshold < 1 || threshold > len(pubKeysHex) {
 		return "", errors.New("threshold must be between 1 and the number of keys")
 	}
@@ -82,7 +101,7 @@ func MultisigAddress(threshold int, pubKeysHex []string) (string, error) {
 	sort.Strings(sorted)
 	h := sha256.New()
 	h.Write([]byte("dnas-multisig"))
-	h.Write([]byte{byte(threshold)})
+	h.Write([]byte{byte(threshold)}) // unambiguous: threshold <= N <= MaxMultisigKeys
 	seen := map[string]bool{}
 	for _, pk := range sorted {
 		raw, err := hex.DecodeString(pk)

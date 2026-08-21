@@ -38,6 +38,19 @@ sections matter most for "toy → real".
   codec makes a spec *possible*; only a second client (or, cheaper first step, a
   golden-vector suite — serialized tx/block/state hex → expected hash/validity)
   actually *proves* it. One implementation is one implementation, however careful.
+- **`[S/M]` Make a failed reorg persist atomic.** `reorgLocked` truncates the block
+  store and appends the winning suffix *before* swapping the chain in memory
+  ([core/blockchain.go](core/blockchain.go)). If an append fails partway (a full or
+  failing disk), it returns an error and the node keeps running on the old
+  in-memory chain while the store already holds a prefix of the new one — the two
+  have diverged, and the next `AddBlock` appends the old chain's continuation on
+  top of the new suffix, leaving a log that will not replay on restart. Writing the
+  suffix to a side region and switching atomically, or marking the store poisoned
+  and refusing further writes, keeps a disk error recoverable.
+- **`[M]` Consensus-checked addresses.** Nothing in consensus validates that `To`
+  is a well-formed, checksummed address, so a buggy client can still burn coins to
+  a typo, and `MaxAddressBytes` is only a length bound on how much junk can become
+  a permanent state key. See the bech32 item in §5.
 - **`[M]` BIP9-style miner signaling for upgrades.** `core/upgrade.go` flips rules
   at fixed activation heights, like checkpoints. Version-bits in the block header
   would let hashpower signal readiness and activate on a threshold instead of a
@@ -80,6 +93,13 @@ sections matter most for "toy → real".
 - **`[M]` Network-adjusted time.** Timestamp checks use the local clock; a
   median-of-peers offset (bounded, bitcoind-style) resists a node with a skewed
   clock being fooled on MTP/timestamp rules.
+- **`[S]` Bound P2P and HTTP request sizes.** A peer frame may be up to 64 MiB
+  (`maxFrame`, [node/secure.go](node/secure.go)) and the API decodes request bodies
+  with no cap, so one message can force a large allocation before anything
+  validates it. Per-message-type limits plus an `http.MaxBytesReader` on the write
+  endpoints would price that properly. The `MsgGetChain` fallback is the same shape
+  of problem: it serializes the whole chain (throttled per peer, but unbounded in
+  size) where a ranged request would do.
 
 ## 3. Programmability
 
@@ -104,6 +124,12 @@ sections matter most for "toy → real".
 - **`[S/M]` Weight-based congestion signal.** The EIP-1559 base fee currently
   responds to transaction *count* (§9); switching the signal to block weight/bytes
   makes it track real demand.
+- **`[S]` Index the mempool for selection.** `Mempool.Select` rescans the whole
+  pool once per chosen transaction, recomputing each candidate's hash and canonical
+  size every pass — O(txs × block txs) sha256 work, which on a full pool makes
+  building one block far more expensive than mining it should be. Keeping
+  candidates in a fee-rate-ordered structure keyed by `(From, Nonce)`, with sizes
+  and hashes cached on admission, makes selection linear.
 
 ## 5. Wallet & UX
 

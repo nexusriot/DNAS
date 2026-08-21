@@ -49,6 +49,22 @@ const (
 	MaxBlockBytes = 1_000_000
 	// MaxMemoBytes caps the optional per-transaction memo.
 	MaxMemoBytes = 256
+	// MaxAddressBytes caps the length of a transaction's From/To strings. Addresses
+	// are not checksum-validated in consensus (see the ROADMAP), so without a bound
+	// a funded sender could pay a small fee to write a megabyte-long key into the
+	// account state, which every node then keeps forever. The limit is far above
+	// any real address format (a DNAS address is 52 characters).
+	MaxAddressBytes = 90
+	// MaxCoinbaseBytes caps the serialized size of the coinbase. The per-byte base
+	// fee and MaxBlockBytes meter the *paid* transactions in a block; the coinbase
+	// pays no fee, so it needs its own bound or a miner could commit an arbitrarily
+	// large block that every node must store and relay.
+	MaxCoinbaseBytes = 1024
+	// MaxRelayTxBytes is the largest transaction a node will queue and gossip. It
+	// is relay policy, not consensus (a bigger one is still valid inside a block):
+	// with a bounded mempool, an unbounded per-transaction size would let a
+	// spammer pin gigabytes of memory for the price of one fee.
+	MaxRelayTxBytes = 100_000
 
 	// DustThreshold is the smallest coin transfer allowed once the UpgradeDustLimit
 	// consensus upgrade is active (a worked example of a height-activated rule; the

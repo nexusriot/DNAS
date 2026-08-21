@@ -167,7 +167,19 @@ canonical bytes.
 - **M-of-N multisig:** `From` must equal `MultisigAddress(Threshold, PubKeys)`
   (so the script is bound to the address it spends), and at least `Threshold`
   signatures from *distinct* listed members must verify. `verifyMultisig`
-  enforces distinctness so one member can't satisfy a 2-of-N alone.
+  enforces distinctness so one member can't satisfy a 2-of-N alone. Two further
+  rules exist for reasons that are not cosmetic:
+  - **`N ≤ MaxMultisigKeys` (16).** Matching signatures to members is inherently
+    `O(signatures × keys)` Ed25519 verifications, and that work is done by every
+    node that merely *relays* the transaction, before any fee is charged — an
+    unbounded `N` is a free network-wide CPU exhaustion. The bound also makes the
+    address unambiguous: the threshold is folded in as a single byte, so an `N`
+    above 255 would let a 1-of-N script hash to the same address as an M-of-N one.
+  - **Every supplied signature must match a member.** Padding the list with junk
+    is rejected rather than ignored, which keeps a *failed* verification linear
+    instead of quadratic and removes a malleability handle — `Signatures` is
+    covered by the txid but by no signature, so a relay could otherwise change a
+    transaction's id and inflate the byte size its base fee is charged on.
 - **Hash-time-locked contract (HTLC):** `From` must equal the hash of the
   `HTLCScript{Hash, Recipient, Sender, Timeout}`. Two spend branches unlock it:
   the *claim* branch needs a `Preimage` where `sha256(Preimage) == Hash` plus a
@@ -191,7 +203,25 @@ one (§10).
 
 **Coinbase.** The block's first transaction mints `reward + tips` to the miner
 and has no signature (`IsCoinbase`) — the base-fee portion of every fee is burned
-rather than paid to the miner (§9).
+rather than paid to the miner (§9). Its *shape* is pinned by
+`validateCoinbaseShape`: a recipient and an amount, nothing else, and at most
+`MaxCoinbaseBytes`. The coinbase pays no per-byte base fee and is excluded from
+`MaxBlockBytes` (both meter the paid transactions), so without its own cap a miner
+could commit an arbitrarily large block that every node must store and relay; and
+fields that mean nothing in a coinbase are required to be empty rather than left
+as somewhere for two implementations to disagree.
+
+**Context-free validity.** Every rule about a transaction that depends on neither
+chain state nor height lives in one exported function, `CheckTxSanity` — memo and
+address lengths, `Amount + Fee` overflow, asset/issuance shape, and the rule that
+a transaction carries exactly one kind of authorization. Both the mempool
+(`Mempool.Add`) and block application (`applyTxsAndCoinbase`) call it, and the
+height-dependent rules are shared the same way through `checkTxAtHeight`. That
+sharing is a correctness requirement, not tidiness: a transaction the mempool
+admits but a block cannot contain is selected into every candidate the miner
+builds, so every candidate is invalid and **block production stops** until the
+transaction is evicted. One function for both callers makes that divergence
+impossible for this class of rule.
 
 ---
 
@@ -411,6 +441,13 @@ trustworthy as the balances themselves.
   block space, a per-byte resource, goes to the highest-paying bytes.
 - **Replace-by-fee.** A conflicting `(From, Nonce)` may be replaced only by a
   strictly higher fee.
+- **Consensus sanity before anything else.** `Add` runs `CheckTxSanity` (§5) first,
+  so a transaction no block can contain is never queued — otherwise the miner would
+  select it into every candidate and stop producing blocks. Only then come the
+  cheap policy checks (`MaxRelayTxBytes`, the fee floor), and the Ed25519
+  verification comes **last**: it is by far the most expensive step, and an
+  unauthenticated peer must not be able to make a node pay for it on a transaction
+  it would refuse anyway.
 - **Dynamic minimum relay fee — *policy, not consensus*, priced per byte.**
   `MinFee()` is a *rate* (base units per byte): it starts at a configurable base
   (`NewMempoolWithPolicy`, `-minrelayfee`, default `DefaultMinRelayFee = 10`/byte)
@@ -432,8 +469,17 @@ trustworthy as the balances themselves.
   (so immature coinbase is never spent); recipients are credited within the
   simulation so chained spends can share a block; the highest fee *rate* wins among
   ready candidates, and selection stops at `MaxBlockBytes` of total size as well as
-  the transaction-count cap.
+  the transaction-count cap. It also re-applies `CheckTxSanity` and
+  `checkTxAtHeight` for the height being built, so a rule that activates *after*
+  admission (the dust limit, §16) cannot make the miner select a transaction its
+  own consensus rules would then reject.
 - **Expiry pruning** drops transactions that can no longer be mined.
+- **A doomed candidate is never hashed.** `buildBlockFor` computes the candidate's
+  state root before mining; if a selected transaction is refused, the
+  `core.TxRejection` names it, so the node drops it from the mempool and
+  reassembles rather than mining a block the chain will reject. If no valid block
+  can be built at all, the miner backs off instead of spinning a core on
+  candidates that cannot connect.
 
 ---
 
@@ -794,11 +840,15 @@ All in [`core/params.go`](core/params.go). Every node must agree on these.
 | `MaxBlockTxs`         | 1000             | non-coinbase txs per block                |
 | `MaxBlockBytes`       | 1 000 000        | total non-coinbase tx bytes per block     |
 | `MaxMemoBytes`        | 256              | per-tx memo cap                           |
+| `MaxAddressBytes`     | 90               | per-tx From/To length cap (bounds state-key bloat) |
+| `MaxCoinbaseBytes`    | 1024             | serialized coinbase cap (it pays no per-byte fee) |
+| `MaxMultisigKeys`     | 16               | N in an M-of-N script (bounds verification cost) |
 | `MaxTickerLen`        | 8                | native-asset ticker length cap            |
 | `MaxAssetSupply`      | 2^62             | native-asset supply cap (overflow-safe)   |
 | `DustThreshold`       | 1000             | min coin transfer once UpgradeDustLimit is active |
 | `MaxFutureDrift`      | 120 s            | how far ahead a timestamp may be          |
 | `DefaultMinRelayFee`  | 10 /byte         | base of the dynamic fee floor (policy, per byte) |
+| `MaxRelayTxBytes`     | 100 000          | largest tx a node will queue/gossip (policy, not consensus) |
 | `InitialBaseFee`      | 10 /byte         | EIP-1559 base fee at genesis (consensus, per byte) |
 | `MinBaseFee`          | 1 /byte          | base-fee floor (per byte)                 |
 | `BaseFeeTargetTxs`    | MaxBlockTxs / 2  | per-block tx count the base fee targets    |
