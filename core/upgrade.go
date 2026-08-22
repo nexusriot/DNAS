@@ -18,10 +18,37 @@ import "sync"
 // worked example of a height-activated consensus rule.
 const UpgradeDustLimit = "dustlimit"
 
+// UpgradeMultiOutput, once active, allows multi-recipient transfers
+// (Transaction.Outputs). Until then a transaction carrying outputs is rejected,
+// so the whole network starts accepting them at the same height instead of some
+// nodes treating a block as valid while others reject it. Because the outputs are
+// encoded only when present (see codec.go), enabling the rule changes no existing
+// transaction's id and no stored chain's validity.
+const UpgradeMultiOutput = "multioutput"
+
 var (
 	upgradesMu sync.RWMutex
 	upgrades   = map[string]uint64{}
 )
+
+// knownUpgrades is every upgrade this build understands. An operator scheduling
+// one by name is told immediately if it is misspelled, rather than running with a
+// rule that silently never activates — which on a network where the others did
+// activate means being forked off it.
+var knownUpgrades = []string{UpgradeDustLimit, UpgradeMultiOutput}
+
+// Upgrades lists the upgrade names this build understands.
+func Upgrades() []string { return append([]string(nil), knownUpgrades...) }
+
+// KnownUpgrade reports whether name is an upgrade this build understands.
+func KnownUpgrade(name string) bool {
+	for _, u := range knownUpgrades {
+		if u == name {
+			return true
+		}
+	}
+	return false
+}
 
 // SetUpgradeHeight schedules an upgrade to activate at the given block height.
 // Call it at startup, before syncing, with the same values on every node.

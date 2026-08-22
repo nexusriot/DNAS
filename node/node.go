@@ -118,6 +118,14 @@ type Node struct {
 	bans    *banbook
 	events  *eventBus
 	dand    *dandelion
+	orphans *orphanPool
+
+	// Sync state (see sync.go): what ranged block requests are outstanding and to
+	// whom, and the highest height any peer has announced. Without this a peer that
+	// accepts a request and never answers stalls catch-up forever.
+	syncMu     sync.Mutex
+	inflight   map[*peer]*blockRequest
+	bestHeight int64 // atomic
 
 	mining atomic.Bool // whether the miner is currently active (toggle at runtime)
 	tipGen int64       // atomic; bumped whenever the tip changes to interrupt mining
@@ -171,8 +179,16 @@ func New(cfg Config, chain *core.Blockchain, mp *core.Mempool, w *wallet.Wallet)
 		bans:         newBanbook(banThreshold),
 		events:       newEventBus(),
 		dand:         newDandelion(),
+		orphans:      newOrphanPool(orphanPoolCapacity),
+		inflight:     map[*peer]*blockRequest{},
 		quit:         make(chan struct{}),
 	}
+	// Bind the mempool to the chain so admission can check what a sender has
+	// actually confirmed and can actually spend. Without this the pool would accept
+	// transactions that can never be mined — see core.Mempool. Sharing the chain's
+	// validation cache means a transaction's signatures are verified once, on
+	// admission, rather than again when the block carrying it is applied.
+	mp.UseAccounts(chain).UseValidationCache(chain.ValidationCache())
 	n.dialFn = func(addr string) (net.Conn, error) { return net.Dial("tcp", addr) }
 	n.listenFn = func(addr string) (net.Listener, error) { return net.Listen("tcp", addr) }
 	n.mining.Store(cfg.Mine)
@@ -232,6 +248,7 @@ func (n *Node) Start() {
 	for _, a := range n.book.all() { // seed peers + any restored from disk
 		n.maybeDial(a)
 	}
+	go n.syncLoop() // times out unanswered block requests and keeps ranges in flight
 	// The miner runs whenever the node has a wallet; the atomic flag gates
 	// whether it actually produces blocks, so it can be toggled at runtime.
 	if n.wallet != nil {
@@ -300,9 +317,17 @@ func (n *Node) publishBlock(reorg bool) {
 	n.events.publish(Event{Type: typ, Height: tip.Index, Hash: tip.Hash, Txs: len(tip.Transactions)})
 }
 
-// publishTx emits a mempool-transaction event.
+// publishTx emits a mempool-transaction event. A multi-recipient transfer is
+// summarized by its total and recipient count, since one event carries one
+// To/Amount pair.
 func (n *Node) publishTx(tx core.Transaction) {
-	n.events.publish(Event{Type: "tx", Hash: tx.Hash(), From: tx.From, To: tx.To, Amount: tx.Amount, Fee: tx.Fee})
+	e := Event{Type: "tx", Hash: tx.Hash(), From: tx.From, To: tx.To, Amount: tx.Amount, Fee: tx.Fee}
+	if tx.IsMultiOutput() {
+		total, _ := tx.TotalOut()
+		e.Amount = total
+		e.Outputs = len(tx.Outputs)
+	}
+	n.events.publish(e)
 }
 
 // PeerAddrs returns the distinct advertised addresses of connected peers.
@@ -626,6 +651,7 @@ func (n *Node) handleMessage(p *peer, m Message) {
 
 	// block propagation: announce a hash, pull the body we lack
 	case MsgInv:
+		n.noteBestHeight(m.Index)
 		switch {
 		case m.Index == n.chain.Height()+1:
 			p.send(Message{Type: MsgGetData, Index: m.Index})
@@ -651,12 +677,17 @@ func (n *Node) handleMessage(p *peer, m Message) {
 			}
 			return
 		}
+		n.noteBestHeight(m.Block.Index)
 		if err := n.chain.AddBlock(*m.Block); err != nil {
-			// Behind or on a fork: let the locator find where we diverged.
+			// Ahead of our tip: keep it, so it connects the moment its parent lands
+			// instead of costing another round trip. Otherwise we are behind or on a
+			// fork, and the locator finds where we diverged.
+			n.bufferOrphan(*m.Block)
 			p.send(n.getHeadersMsg())
 			return
 		}
 		log.Printf("accepted block %d %s", m.Block.Index, short(m.Block.Hash))
+		n.connectOrphans()
 		n.afterNewBlock(false)
 		n.broadcastExcept(Message{Type: MsgInv, Index: m.Block.Index, Hash: m.Block.Hash}, p)
 
@@ -724,7 +755,12 @@ func (n *Node) onHeaders(p *peer, headers []core.Header) {
 		}
 		return
 	}
-	p.send(Message{Type: MsgGetBlocks, From: headers[0].Index, To: headers[len(headers)-1].Index})
+	from, to := headers[0].Index, headers[len(headers)-1].Index
+	n.noteBestHeight(to)
+	p.send(Message{Type: MsgGetBlocks, From: from, To: to})
+	// Remember what we asked for: if the bodies never arrive, the sync loop gives
+	// up on this peer rather than waiting forever (see sync.go).
+	n.trackRequest(p, from, to)
 }
 
 // onBlocks applies a downloaded batch of block bodies. A batch that extends our
@@ -732,9 +768,11 @@ func (n *Node) onHeaders(p *peer, headers []core.Header) {
 // suffix, applied as a reorg (transferring only the divergent blocks). Deep or
 // losing forks fall back to a whole-chain exchange.
 func (n *Node) onBlocks(p *peer, blocks []core.Block) {
+	n.clearRequest(p) // it answered; the slot is free for the next range
 	if len(blocks) == 0 {
 		return
 	}
+	n.noteBestHeight(blocks[len(blocks)-1].Index)
 	first := blocks[0].Index
 
 	if first <= n.chain.Height() {
@@ -758,24 +796,33 @@ func (n *Node) onBlocks(p *peer, blocks []core.Block) {
 		return
 	}
 
-	// Extension: append the batch in order.
-	applied := 0
+	// Extension: append what links to our tip, and buffer what does not. Ranges
+	// are downloaded from several peers at once, so a later window can arrive
+	// before the one before it; the orphan pool holds those until their parent
+	// lands rather than throwing away a download we already paid for.
+	applied, buffered := 0, 0
 	for i := range blocks {
 		if err := n.chain.AddBlock(blocks[i]); err != nil {
-			break
+			if n.bufferOrphan(blocks[i]) {
+				buffered++
+			}
+			continue
 		}
 		n.markSeenBlock(blocks[i].Hash)
 		applied++
 	}
+	applied += n.connectOrphans()
 	if applied == 0 {
-		p.send(n.getHeadersMsg()) // our tip moved under us; re-sync
+		if buffered == 0 {
+			p.send(n.getHeadersMsg()) // our tip moved under us; re-sync
+		}
 		return
 	}
 	n.afterNewBlock(false)
 	tip := n.chain.Tip()
 	log.Printf("synced %d block(s), height=%d", applied, tip.Index)
 	n.broadcastExcept(Message{Type: MsgInv, Index: tip.Index, Hash: tip.Hash}, p)
-	if applied == len(blocks) { // a full batch: there may be more
+	if applied >= len(blocks) { // a full batch: there may be more
 		p.send(n.getHeadersMsg())
 	}
 }
@@ -795,6 +842,7 @@ func (n *Node) removePeer(p *peer) {
 	n.peersMu.Lock()
 	delete(n.peers, p)
 	n.peersMu.Unlock()
+	n.clearRequest(p) // whatever we asked it for will have to come from someone else
 	_ = p.conn.Close()
 }
 
@@ -1139,15 +1187,11 @@ func (n *Node) resurrectTxs(disconnected []core.Block) int {
 	return count
 }
 
-// reconcileMempool drops transactions that a new block made unmineable: those
-// whose nonce is already confirmed, and those that have expired.
+// reconcileMempool drops transactions a new block made unmineable — expired ones,
+// nonces the block confirmed, and anything the sender can no longer reach or
+// afford. See core.Mempool.Reconcile.
 func (n *Node) reconcileMempool() {
-	n.mempool.PruneExpired(n.chain.Height())
-	for _, tx := range n.mempool.All() {
-		if tx.Nonce < n.chain.Account(tx.From).Nonce {
-			n.mempool.Remove([]core.Transaction{tx})
-		}
-	}
+	n.mempool.Reconcile(n.chain.Height())
 }
 
 func short(h string) string {

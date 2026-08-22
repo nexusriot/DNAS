@@ -47,6 +47,18 @@ const (
 	// metered resource: a block is bounded by bytes, not just transaction count,
 	// and each byte is priced.
 	MaxBlockBytes = 1_000_000
+	// MaxBlockVerifyOps caps a block's worst-case signature-verification cost (see
+	// VerifyOps). Bytes alone do not bound it: a 16-key multisig spend can cost 256
+	// verifications in a couple of kilobytes, so a byte-legal block could take
+	// longer for the network to check than for its miner to produce. The limit
+	// comfortably fits a full block of ordinary payments (MaxBlockTxs = 1000, one
+	// each) or of small multisig spends, and rejects only pathological ones.
+	MaxBlockVerifyOps = 8000
+	// MaxTxOutputs caps recipients in a multi-recipient transfer. Each output is a
+	// permanent state key and a credit the block must apply, so the count is bounded
+	// like every other per-transaction resource; the byte and verification budgets
+	// bound how many such transactions fit in a block.
+	MaxTxOutputs = 64
 	// MaxMemoBytes caps the optional per-transaction memo.
 	MaxMemoBytes = 256
 	// MaxAddressBytes caps the length of a transaction's From/To strings. Addresses

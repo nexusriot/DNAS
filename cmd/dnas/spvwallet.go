@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"net/http"
@@ -349,6 +350,13 @@ func runSPVWallet(base string, args []string) {
 			return
 		}
 		sw.send(base, *keyFile, *asset, rest[1:], func() { saveOr(sw) })
+	case "sendmany":
+		// One transaction paying several addresses: one fee, one nonce, one signature.
+		if *keyFile == "" || len(rest) < 2 {
+			fmt.Println("usage: dnas spv -api URL wallet -key FILE sendmany <addr:amount> [addr:amount ...] [-fee AMOUNT]")
+			return
+		}
+		sw.sendMany(base, *keyFile, rest[1:], func() { saveOr(sw) })
 	case "issue":
 		// Mint a new native asset, signed locally.
 		if *keyFile == "" || len(rest) < 3 {
@@ -357,7 +365,7 @@ func runSPVWallet(base string, args []string) {
 		}
 		sw.issue(base, *keyFile, rest[1:], func() { saveOr(sw) })
 	default:
-		fmt.Println("unknown wallet command:", cmd, "(new | add | update | status | list | forget | send | issue)")
+		fmt.Println("unknown wallet command:", cmd, "(new | add | update | status | list | forget | send | sendmany | issue)")
 	}
 }
 
@@ -473,6 +481,108 @@ func (sw *SPVWallet) send(base, keyFile, assetID string, args []string, save fun
 	} else {
 		fmt.Printf("submitted %s → %s  %s (fee %s, nonce %d)\n",
 			tx.Hash()[:12], short(args[0]), core.FormatAmount(amount), core.FormatAmount(fee), nonce)
+	}
+}
+
+// buildSendMany builds and signs a multi-recipient coin transfer: one fee, one
+// nonce and one signature covering every output. Pure (no network), so it is
+// unit-tested directly.
+func buildSendMany(w *wallet.Wallet, outputs []core.Output, fee, nonce uint64) (core.Transaction, error) {
+	tx := core.Transaction{From: w.Address(), Outputs: outputs, Fee: fee, Nonce: nonce}
+	if err := tx.Sign(w); err != nil {
+		return core.Transaction{}, err
+	}
+	return tx, nil
+}
+
+// parseOutputs parses "address:amount" pairs (amounts in decimal DNAS) into
+// outputs, and returns their total. Every address is checksum-validated and every
+// amount parsed before anything is signed, so one typo in a batch of fifty
+// payments fails loudly instead of sending coin nowhere.
+func parseOutputs(args []string) ([]core.Output, uint64, error) {
+	if len(args) == 0 {
+		return nil, 0, errors.New("no recipients given")
+	}
+	if len(args) > core.MaxTxOutputs {
+		return nil, 0, fmt.Errorf("too many recipients: %d (max %d)", len(args), core.MaxTxOutputs)
+	}
+	outputs := make([]core.Output, 0, len(args))
+	var total uint64
+	for _, arg := range args {
+		addr, amountStr, ok := strings.Cut(arg, ":")
+		if !ok {
+			return nil, 0, fmt.Errorf("bad recipient %q (want address:amount)", arg)
+		}
+		if err := wallet.ValidateAddress(addr); err != nil {
+			return nil, 0, fmt.Errorf("bad recipient %q: %w", addr, err)
+		}
+		amount, err := core.ParseAmount(amountStr)
+		if err != nil {
+			return nil, 0, fmt.Errorf("bad amount in %q: %w", arg, err)
+		}
+		if amount == 0 {
+			return nil, 0, fmt.Errorf("recipient %q pays nothing", arg)
+		}
+		outputs = append(outputs, core.Output{To: addr, Amount: amount})
+		total += amount
+	}
+	return outputs, total, nil
+}
+
+// sendMany pays several addresses in one transaction, signed locally with the
+// wallet's key file. A trailing "-fee AMOUNT" overrides the estimated fee.
+func (sw *SPVWallet) sendMany(base, keyFile string, args []string, save func()) {
+	w, _, err := wallet.LoadOrCreateEncrypted(keyFile, walletPassphrase())
+	if err != nil {
+		fmt.Println("key error:", err)
+		return
+	}
+	feeStr := ""
+	if n := len(args); n >= 2 && args[n-2] == "-fee" {
+		feeStr, args = args[n-1], args[:n-2]
+	}
+	outputs, total, err := parseOutputs(args)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	acc, err := provenAccount(base, w.Address())
+	if err != nil {
+		fmt.Println("could not prove account state:", err)
+		return
+	}
+	var fee uint64
+	if feeStr != "" {
+		if fee, err = core.ParseAmount(feeStr); err != nil {
+			fmt.Println("bad fee:", err)
+			return
+		}
+	} else {
+		// Each output adds bytes, so budget by recipient count rather than a flat size.
+		fee = feePerByte(base) * uint64(1000+100*len(outputs))
+	}
+	if total+fee > acc.Balance {
+		fmt.Printf("insufficient proven balance: have %s, need %s\n",
+			core.FormatAmount(acc.Balance), core.FormatAmount(total+fee))
+		return
+	}
+	nonce := sw.nextNonce(w.Address(), acc.Nonce)
+	tx, err := buildSendMany(w, outputs, fee, nonce)
+	if err != nil {
+		fmt.Println("sign:", err)
+		return
+	}
+	if err := postJSON(base+"/tx", tx); err != nil {
+		fmt.Println("rejected:", err)
+		return
+	}
+	sw.recordSent(w.Address(), nonce)
+	sw.addAddress(w.Address())
+	save()
+	fmt.Printf("submitted %s  %d recipients, %s total (fee %s, nonce %d)\n",
+		tx.Hash()[:12], len(outputs), core.FormatAmount(total), core.FormatAmount(fee), nonce)
+	for _, o := range outputs {
+		fmt.Printf("  → %s  %s\n", short(o.To), core.FormatAmount(o.Amount))
 	}
 }
 

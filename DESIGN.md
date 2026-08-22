@@ -130,6 +130,7 @@ type Transaction struct {
     Expiry           uint64          // highest valid height (0 = none)
     LockUntil        uint64          // lowest valid height (time-lock)
     Memo             string          // ≤ MaxMemoBytes
+    Outputs          []Output        // OR pay many recipients at once (see below)
     AssetID          string          // move this native asset instead of coin (§4)
     Issue            *AssetIssue     // OR mint a new native asset to From (§4)
     Signature        []byte          // single-key authorization
@@ -192,6 +193,27 @@ canonical bytes.
   other. Same address format as any account, so it is funded by an ordinary
   transfer.
 
+**Multi-recipient transfers.** `Outputs []Output{To, Amount}` pays several
+addresses from one transaction: one fee, one nonce, one signature, and one copy of
+the sender's address and public key in the block, instead of N of each. It is coin
+only (an asset move or an issuance uses the single-recipient form), bounded by
+`MaxTxOutputs`, and every rule that applies to a recipient applies to each output
+individually — the dust limit included, so a batch cannot smuggle dust past it.
+Credits are applied one at a time against live state, so a repeated recipient
+accumulates and a sender paying itself nets correctly.
+
+Two properties are worth spelling out, because they are what make the change safe
+to add to a running chain:
+
+- **Existing transactions are untouched.** The outputs are appended to the
+  canonical encoding *only when present* ([core/codec.go](core/codec.go)), so a
+  single-recipient transaction's signing bytes, txid and fee-bearing size are
+  byte-for-byte what they always were, and a stored chain still replays.
+- **The rule is height-activated.** `UpgradeMultiOutput` (§16) gates acceptance,
+  so the whole network starts allowing the new form at one agreed height instead
+  of some nodes treating a block as valid while others reject it. Operators
+  schedule it with `-upgrades multioutput:HEIGHT`.
+
 **Time windows.** `Expiry` (upper bound) and `LockUntil` (lower bound) constrain
 the height range in which a transaction is valid; both are signed. Expired
 transactions are pruned from the mempool and rejected at submission; locked ones
@@ -210,6 +232,25 @@ rather than paid to the miner (§9). Its *shape* is pinned by
 could commit an arbitrarily large block that every node must store and relay; and
 fields that mean nothing in a coinbase are required to be empty rather than left
 as somewhere for two implementations to disagree.
+
+**Verification cost is metered and paid once.** Matching signatures is the most
+expensive thing a node does per transaction, and bytes do not bound it: a 16-key
+multisig spend costs up to 256 verifications in a couple of kilobytes, so a
+byte-legal block could take longer for the network to check than for its miner to
+produce. `VerifyOps` prices that worst case per transaction and
+`MaxBlockVerifyOps` caps it per block (Bitcoin meters the same thing as sigops),
+with `Mempool.Select` honouring the same budget so the miner never builds a block
+over it.
+
+The work is also paid only once. A `ValidationCache`
+([core/valcache.go](core/valcache.go)) records which txids have had their
+authorization verified; the node shares one between the mempool and the chain, so
+a payment verified on admission costs a map lookup when the block carrying it
+applies. Because the cache is keyed on the txid — which commits to the signatures
+themselves — a mutated copy is a different transaction and is still checked in
+full. Before the serial application pass, a block's signatures are verified across
+all cores, so initial sync is not bound to one. Measured on a 400-signature block:
+18.7 ms serial, 7.4 ms in parallel, 0.5 ms when already cached.
 
 **Context-free validity.** Every rule about a transaction that depends on neither
 chain state nor height lives in one exported function, `CheckTxSanity` — memo and
@@ -336,10 +377,13 @@ guards itself with `IsUpgradeActive(name, blockHeight)`, so blocks below the
 activation height keep the old rule and blocks at/after it enforce the new one —
 the whole network switching together on a coordinated flag-day instead of forking
 uncoordinated. Heights are configuration, set identically on every node at startup
-(like checkpoints). `UpgradeDustLimit` is a worked example (once active, coin
-transfers below `DustThreshold` are rejected). This is *height* activation; miner
-version-bit *signaling* (BIP9) would additionally need a header version field and
-is left as future work.
+(like checkpoints) via `-upgrades name:height` (or the `upgrades` key in the JSON
+config), which refuses an unknown name outright — a misspelled upgrade that
+silently never activates means being forked off a network where the others did.
+Two exist: `UpgradeMultiOutput` gates multi-recipient transfers (§5), and
+`UpgradeDustLimit` is a worked example that rejects coin transfers below
+`DustThreshold`. This is *height* activation; miner version-bit *signaling* (BIP9)
+would additionally need a header version field and is left as future work.
 
 **Coinbase maturity.** A coinbase mined at height `C` is spendable only once the
 chain reaches `C + CoinbaseMaturity`. In an account model there are no coins to
@@ -441,6 +485,26 @@ trustworthy as the balances themselves.
   block space, a per-byte resource, goes to the highest-paying bytes.
 - **Replace-by-fee.** A conflicting `(From, Nonce)` may be replaced only by a
   strictly higher fee.
+- **Admission requires a transaction that could plausibly be mined.** The pool
+  holds, per sender, a **contiguous run of nonces starting at that sender's
+  confirmed nonce**, whose **total cost the sender can afford** from its spendable
+  balance, up to `MaxPerSender` entries. Both halves are load-bearing rather than
+  tidiness: without them an address holding *nothing* can sign transactions at
+  nonces the chain will never reach, and they are admitted, never selected, never
+  expire and never pay a fee — filling the pool for free and pricing out every
+  real payment. The rules need chain state, so `Mempool` is bound to an
+  `AccountSource` (`node.New` does it); an unbound pool is permissive, which only
+  affects tests exercising it in isolation.
+- **Eviction never breaks a run.** Only the *last* entry in a sender's nonce run
+  is an eligible victim, since dropping from the middle would strand every higher
+  nonce behind a gap it can never cross — the exact state admission exists to
+  prevent. Among those, the lowest fee per byte goes first. A sender cannot make
+  room for its own next nonce by dropping its predecessor, so in that case the
+  newcomer loses however much it pays.
+- **`Reconcile` is the counterpart to admission.** A new block moves nonces and
+  balances, so entries that were admissible on arrival may not be mineable any
+  more. After every tip change the node keeps each sender's affordable contiguous
+  run and drops the rest, so the pool cannot silently accumulate dead weight.
 - **Consensus sanity before anything else.** `Add` runs `CheckTxSanity` (§5) first,
   so a transaction no block can contain is never queued — otherwise the miner would
   select it into every candidate and stop producing blocks. Only then come the
@@ -468,8 +532,8 @@ trustworthy as the balances themselves.
   nonce, cover its per-byte base fee, and be affordable *from spendable balance*
   (so immature coinbase is never spent); recipients are credited within the
   simulation so chained spends can share a block; the highest fee *rate* wins among
-  ready candidates, and selection stops at `MaxBlockBytes` of total size as well as
-  the transaction-count cap. It also re-applies `CheckTxSanity` and
+  ready candidates, and selection stops at `MaxBlockBytes` of total size, the
+  `MaxBlockVerifyOps` verification budget (§5), and the transaction-count cap. It also re-applies `CheckTxSanity` and
   `checkTxAtHeight` for the height being built, so a rule that activates *after*
   admission (the dust limit, §16) cannot make the miner select a transaction its
   own consensus rules would then reject.
@@ -564,7 +628,7 @@ is headers-first; forks transfer only the divergent suffix:
 | Tx gossip          | `MsgTx`                                    |
 | Block announce/pull| `MsgInv` → `MsgGetData` → `MsgBlock`       |
 | Headers-first sync | `MsgGetHeaders` (+ block locator) → `MsgHeaders` |
-| Ranged body sync   | `MsgGetBlocks` → `MsgBlocks`               |
+| Ranged body sync   | `MsgGetBlocks` → `MsgBlocks` (several ranges in flight, tracked and timed out) |
 | Deep-fork/bootstrap fallback | `MsgGetChain` → `MsgChain`       |
 | Discovery          | `MsgGetPeers` → `MsgPeers`                 |
 
@@ -573,8 +637,37 @@ finds the last common block and only the suffix is transferred and applied via
 `ReorgFrom`. Whole-chain exchange (`getchain`) remains only for pathologically
 deep forks and initial bootstrap.
 
-**Bounded memory.** The gossip de-duplication sets are bounded FIFOs and the
-mempool is capped, so a long-running node's memory doesn't grow without limit.
+**Sync liveness ([node/sync.go](node/sync.go)).** Catch-up used to be purely
+reactive — an announcement triggered headers, headers triggered bodies, bodies
+were applied — with *nothing watching whether the answers ever came*. A peer that
+keeps replying to pings (so the idle timeout never fires) but silently stops
+serving bodies would stall a node's sync indefinitely, and a mining node in that
+state keeps building on its stale tip, forking itself off the network. So the node
+now tracks what it asked for, from whom and when:
+
+- every ranged block request is recorded against its peer, and a `syncLoop` tick
+  disconnects (and ban-scores) a peer that has not answered within
+  `blockRequestTimeout`, freeing the slot for someone else;
+- `bestHeight` records the highest height any peer has announced, so the loop can
+  tell it is behind and restart the headers-first pipeline when nothing is
+  outstanding — announcements are only hints, and nothing is trusted until the
+  blocks themselves validate;
+- with a request already in flight and a long way still to go, up to
+  `maxSyncPeers` *other* peers are asked for the windows beyond it, so catch-up is
+  not limited to one peer's upload speed.
+
+**Orphan blocks ([node/orphan.go](node/orphan.go)).** A block whose parent has not
+arrived yet is buffered rather than discarded, and connected the moment the parent
+lands. This happens constantly — a gossip race announces N+1 while N is in flight,
+and parallel ranges arrive out of order — and without the buffer each occurrence
+costs a full headers-then-bodies round trip to fetch again. The pool is bounded
+and only accepts blocks that are valid on their own terms (`SelfValid`: proof of
+work, merkle root, leading coinbase), so a peer cannot fill a node's memory with
+cheap junk.
+
+**Bounded memory.** The gossip de-duplication sets, the orphan pool and the
+validation cache are all bounded FIFOs, and the mempool is capped, so a
+long-running node's memory doesn't grow without limit.
 
 **The miner (`mineLoop`).** The miner runs whenever the node has a wallet; an
 atomic flag (`SetMining`, `POST /mine`) gates whether it actually produces
@@ -594,7 +687,7 @@ or a test lowers it so proof of work is the only thing pacing block production.
 interval and the toggle.)
 
 **Node lifecycle.** `Start` launches the accept loop, a dial loop per known peer,
-and the miner. `Shutdown` closes a `quit` channel that every one of those loops
+the sync loop, and the miner. `Shutdown` closes a `quit` channel that every one of those loops
 selects on — including the nonce search's abort check — and closes the listener to
 unblock `Accept`, so a stopped node leaves nothing running behind it. It is
 idempotent (`sync.Once`), which matters because the daemon shuts down explicitly
@@ -839,6 +932,8 @@ All in [`core/params.go`](core/params.go). Every node must agree on these.
 | `MaxReorgDepth`       | 100              | deepest reorg allowed (finality guard)    |
 | `MaxBlockTxs`         | 1000             | non-coinbase txs per block                |
 | `MaxBlockBytes`       | 1 000 000        | total non-coinbase tx bytes per block     |
+| `MaxBlockVerifyOps`   | 8000             | worst-case signature verifications per block |
+| `MaxTxOutputs`        | 64               | recipients in a multi-recipient transfer  |
 | `MaxMemoBytes`        | 256              | per-tx memo cap                           |
 | `MaxAddressBytes`     | 90               | per-tx From/To length cap (bounds state-key bloat) |
 | `MaxCoinbaseBytes`    | 1024             | serialized coinbase cap (it pays no per-byte fee) |
@@ -849,6 +944,7 @@ All in [`core/params.go`](core/params.go). Every node must agree on these.
 | `MaxFutureDrift`      | 120 s            | how far ahead a timestamp may be          |
 | `DefaultMinRelayFee`  | 10 /byte         | base of the dynamic fee floor (policy, per byte) |
 | `MaxRelayTxBytes`     | 100 000          | largest tx a node will queue/gossip (policy, not consensus) |
+| `MaxPerSender`        | 64               | queued txs one address may hold (policy)  |
 | `InitialBaseFee`      | 10 /byte         | EIP-1559 base fee at genesis (consensus, per byte) |
 | `MinBaseFee`          | 1 /byte          | base-fee floor (per byte)                 |
 | `BaseFeeTargetTxs`    | MaxBlockTxs / 2  | per-block tx count the base fee targets    |
@@ -864,6 +960,9 @@ All in [`core/params.go`](core/params.go). Every node must agree on these.
 | Unbounded PoW difficulty (LWMA, no hard cap) + `NoRetarget` for devnet | Real economic security — rewriting history costs ever-growing work; a devnet still gets instant blocks | Genesis starts easy; security only exists once real hashpower is present |
 | Canonical binary consensus encoding (not JSON) | txid/size/signing are reproducible by any implementation, so a second client can't silently fork | The wire transport is still JSON (a separate efficiency concern) |
 | Height-activated consensus upgrades | Rule changes roll out on a coordinated flag-day, not an uncoordinated fork | No miner version-bit signaling yet (needs a header version field) |
+| Mempool admission checks the sender's confirmed state | Occupying the pool costs real balance, so it cannot be filled for free by an account holding nothing | A recipient cannot spend funds that are still unconfirmed (§21) |
+| Multi-recipient outputs encoded only when present | The new form costs nothing to add: every existing txid, signature and stored chain stays valid | One transaction shape has two encodings to reason about |
+| Verification cost metered per block, and cached across mempool and chain | A block cannot cost more to check than to produce, and a signature is verified once rather than twice | Another consensus limit to agree on; the cache is memory |
 | Permissionless by default; `-netkey` opt-in for a private net | Anyone can join — the defining property of a cryptocurrency | The open handshake is anonymous (no MITM authentication); safety rests on many peers + identity + eclipse caps |
 | Inbound caps (total + per-IP-group) + per-peer rate limiting | Eclipse/DoS resistance for an open network | Heuristic caps, not a full addrman/ASN-diversity scheme |
 | Account+nonce, not UTXO | Simpler state & replay logic to read | Coinbase maturity needs a history scan instead of per-coin locks |
@@ -975,6 +1074,17 @@ See [scripts/README.md](scripts/README.md) for the script details.
 - The fee market is a burned, **per-byte** EIP-1559 base fee (consensus) plus
   rate-based eviction, replace-by-fee, and a per-byte relay-policy floor; its
   congestion signal is transaction count, not weight (§9).
+- Mempool admission measures a sender against its **confirmed** state (§10), so a
+  recipient cannot queue a spend of coin that is still unconfirmed — even though
+  `Select` would happily put both in one block. This is the account-model norm
+  (Ethereum behaves the same way), and it is what makes occupying the pool cost
+  real balance; lifting it properly means package/ancestor tracking, which is the
+  package-relay item in the ROADMAP. Chained spends still work within a *single
+  sender's* nonce run, and for a recipient whose funds have confirmed.
+- Transactions are relayed in full to every peer rather than announced by hash and
+  pulled (there is `MsgInv`/`MsgGetData` for blocks but not for transactions), so
+  each transaction crosses each link once per peer regardless of who already has
+  it.
 - Merkle SPV proves inclusion trustlessly; compact filters add non-inclusion but
   under the honest-node/multi-peer assumption (they aren't header-committed).
   State proofs prove account *membership* (a present balance/nonce) against the

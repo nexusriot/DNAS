@@ -52,6 +52,14 @@ func blockAddresses(b Block) []string {
 		if tx.To != "" {
 			set[tx.To] = struct{}{}
 		}
+		// Every recipient of a multi-output transfer must be in the filter too, or a
+		// light client would be told its address is provably absent from a block that
+		// in fact paid it.
+		for _, o := range tx.Outputs {
+			if o.To != "" {
+				set[o.To] = struct{}{}
+			}
+		}
 	}
 	out := make([]string, 0, len(set))
 	for a := range set {

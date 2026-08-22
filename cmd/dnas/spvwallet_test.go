@@ -167,3 +167,70 @@ func TestSPVWalletBlockAuthentication(t *testing.T) {
 		t.Fatal("a block body that fails header authentication must be rejected")
 	}
 }
+
+// parseOutputs is what stands between a fifty-payment batch and a typo, so it has
+// to reject anything malformed before a signature is ever produced.
+func TestParseOutputs(t *testing.T) {
+	a, _ := wallet.New()
+	b, _ := wallet.New()
+
+	outs, total, err := parseOutputs([]string{a.Address() + ":1.5", b.Address() + ":0.25"})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(outs) != 2 {
+		t.Fatalf("parsed %d outputs, want 2", len(outs))
+	}
+	if want := core.Coin*3/2 + core.Coin/4; total != want {
+		t.Fatalf("total = %d, want %d", total, want)
+	}
+	if outs[0].To != a.Address() || outs[0].Amount != core.Coin*3/2 {
+		t.Fatalf("first output = %+v", outs[0])
+	}
+
+	bad := [][]string{
+		{},                              // no recipients
+		{a.Address()},                   // missing the amount
+		{"dnasdeadbeef:1"},              // bad checksum
+		{a.Address() + ":0"},            // pays nothing
+		{a.Address() + ":not-a-number"}, // unparseable amount
+	}
+	for _, args := range bad {
+		if _, _, err := parseOutputs(args); err == nil {
+			t.Errorf("parseOutputs(%v) was accepted", args)
+		}
+	}
+	// The recipient cap is enforced here too, before anything is signed.
+	many := make([]string, core.MaxTxOutputs+1)
+	for i := range many {
+		many[i] = a.Address() + ":1"
+	}
+	if _, _, err := parseOutputs(many); err == nil {
+		t.Error("parseOutputs accepted more than the maximum number of recipients")
+	}
+}
+
+// buildSendMany signs the whole batch once, and the signature must cover every
+// output — changing any of them invalidates it.
+func TestBuildSendManyIsSignedOverEveryOutput(t *testing.T) {
+	w, _ := wallet.New()
+	a, _ := wallet.New()
+	b, _ := wallet.New()
+	outs := []core.Output{{To: a.Address(), Amount: 100}, {To: b.Address(), Amount: 200}}
+
+	tx, err := buildSendMany(w, outs, 5000, 3)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if err := tx.VerifySignature(); err != nil {
+		t.Fatalf("signature does not verify: %v", err)
+	}
+	if err := core.CheckTxSanity(tx); err != nil {
+		t.Fatalf("built transaction is not valid: %v", err)
+	}
+	tampered := tx
+	tampered.Outputs = []core.Output{{To: a.Address(), Amount: 100}, {To: b.Address(), Amount: 999}}
+	if err := tampered.VerifySignature(); err == nil {
+		t.Error("the signature still verifies after an output amount was changed")
+	}
+}

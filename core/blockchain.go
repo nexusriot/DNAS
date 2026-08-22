@@ -33,7 +33,16 @@ type Blockchain struct {
 	store   *blockStore      // append-only persistence (nil = in-memory only)
 	txIndex map[string]TxLoc // txid -> where it is confirmed (see txindex.go)
 	burned  uint64           // cumulative base fee burned by connected blocks (see supply.go)
+	// sigCache remembers which transactions have already had their authorization
+	// verified, so a payment's signature is not re-checked when the block carrying
+	// it arrives (see valcache.go). Shared with the mempool by the node.
+	sigCache *ValidationCache
 }
+
+// ValidationCache returns the chain's signature-verification cache, so the
+// mempool can share it: a transaction verified on admission is then free to
+// apply when its block arrives.
+func (bc *Blockchain) ValidationCache() *ValidationCache { return bc.sigCache }
 
 // undoEntry records an account's prior value so a block's effect can be
 // reversed during a reorg without replaying the chain from genesis.
@@ -63,11 +72,12 @@ func GenesisBlock() Block {
 func NewBlockchain() *Blockchain {
 	genesis := GenesisBlock()
 	return &Blockchain{
-		blocks:  []Block{genesis},
-		state:   map[string]Account{},
-		work:    BlockWork(genesis.Bits),
-		undos:   [][]undoEntry{nil}, // genesis has no undo (it is never rolled back)
-		txIndex: map[string]TxLoc{}, // genesis carries no transactions
+		blocks:   []Block{genesis},
+		state:    map[string]Account{},
+		work:     BlockWork(genesis.Bits),
+		undos:    [][]undoEntry{nil}, // genesis has no undo (it is never rolled back)
+		txIndex:  map[string]TxLoc{}, // genesis carries no transactions
+		sigCache: NewValidationCache(DefaultValidationCacheSize),
 	}
 }
 
@@ -251,7 +261,7 @@ func (bc *Blockchain) FindTxProof(txHash string) (TxProof, bool) {
 func (bc *Blockchain) AddBlock(block Block) error {
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
-	undo, err := applyBlock(bc.state, bc.blocks, block)
+	undo, err := applyBlock(bc.state, bc.blocks, block, bc.sigCache)
 	if err != nil {
 		return err
 	}
@@ -360,7 +370,7 @@ func (bc *Blockchain) reorgLocked(fork int, suffix []Block) (bool, []Block, erro
 	blocks := append([]Block(nil), bc.blocks[:fork+1]...)
 	undos := append([][]undoEntry(nil), bc.undos[:fork+1]...)
 	for i, b := range suffix {
-		undo, err := applyBlock(state, blocks, b)
+		undo, err := applyBlock(state, blocks, b, bc.sigCache)
 		if err != nil {
 			return false, nil, fmt.Errorf("block %d: %w", fork+1+i, err)
 		}
@@ -708,11 +718,14 @@ func medianTimePast(blocks []Block) int64 {
 // On any error the state is rolled back so it is left exactly as it was. It also
 // verifies the committed state root: the post-block account state must hash to
 // block.StateRoot.
-func applyBlock(state map[string]Account, blocks []Block, block Block) ([]undoEntry, error) {
+func applyBlock(state map[string]Account, blocks []Block, block Block, cache *ValidationCache) ([]undoEntry, error) {
 	if err := validateBlockStructure(blocks, block); err != nil {
 		return nil, err
 	}
-	undo, err := applyTxsAndCoinbase(state, blocks, block)
+	// Warm the signature cache across all cores before the serial pass below, so
+	// initial sync is not bound to one core verifying one signature at a time.
+	cache.verifyAllAuthorized(block.Transactions)
+	undo, err := applyTxsAndCoinbase(state, blocks, block, cache)
 	if err != nil {
 		return nil, err
 	}
@@ -764,6 +777,14 @@ func validateBlockStructure(blocks []Block, block Block) error {
 	}
 	if w := blockWeight(block); w > MaxBlockBytes {
 		return fmt.Errorf("block too large: %d transaction bytes (max %d)", w, MaxBlockBytes)
+	}
+	// Bytes are not the only scarce resource a block spends: signature
+	// verification is, and one multisig spend can cost as much of it as hundreds
+	// of ordinary payments. Without a budget a block could take longer to check
+	// than to produce, which every node on the network pays for (Bitcoin meters
+	// the same thing as sigops).
+	if ops := BlockVerifyOps(block.Transactions); ops > MaxBlockVerifyOps {
+		return fmt.Errorf("block too expensive to verify: %d signature operations (max %d)", ops, MaxBlockVerifyOps)
 	}
 	coinbase := block.Transactions[0]
 	if !coinbase.IsCoinbase() {
@@ -836,11 +857,21 @@ func checkTxAtHeight(tx Transaction, height uint64) error {
 	if tx.HTLCRefundNotReady(height) {
 		return fmt.Errorf("htlc refund before timeout (timeout %d > height %d)", tx.HTLC.Timeout, height)
 	}
+	// Height-activated rule (consensus upgrade): multi-recipient transfers are
+	// only valid from their activation height, so the whole network starts
+	// accepting them together rather than splitting over whether a block is valid.
+	if tx.IsMultiOutput() && !IsUpgradeActive(UpgradeMultiOutput, height) {
+		return errors.New("multi-output transfers are not active at this height")
+	}
 	// Height-activated rule (consensus upgrade): once UpgradeDustLimit is in
 	// force, coin transfers below DustThreshold are rejected. Off until an
 	// activation height is scheduled, and never applies to asset/issue txs.
-	if IsUpgradeActive(UpgradeDustLimit, height) && !tx.IsIssue() && !tx.IsAssetTransfer() && tx.Amount > 0 && tx.Amount < DustThreshold {
-		return fmt.Errorf("dust output: amount %d below dust threshold %d", tx.Amount, DustThreshold)
+	if IsUpgradeActive(UpgradeDustLimit, height) && !tx.IsIssue() && !tx.IsAssetTransfer() {
+		for _, amount := range tx.coinAmounts() {
+			if amount > 0 && amount < DustThreshold {
+				return fmt.Errorf("dust output: amount %d below dust threshold %d", amount, DustThreshold)
+			}
+		}
 	}
 	return nil
 }
@@ -850,7 +881,7 @@ func checkTxAtHeight(tx Transaction, height uint64) error {
 // state-dependent checks (nonces, balances, coinbase amount) but NOT the
 // structural ones (see validateBlockStructure) — so it can also be run on a
 // state copy to compute a candidate block's resulting state root before mining.
-func applyTxsAndCoinbase(state map[string]Account, blocks []Block, block Block) ([]undoEntry, error) {
+func applyTxsAndCoinbase(state map[string]Account, blocks []Block, block Block, cache *ValidationCache) ([]undoEntry, error) {
 	height := block.Index
 	coinbase := block.Transactions[0]
 
@@ -891,7 +922,7 @@ func applyTxsAndCoinbase(state map[string]Account, blocks []Block, block Block) 
 		}
 		seen[h] = true
 		reserve := immatureCoinbase(blocks, height, tx.From)
-		if err := applyTxTo(state, tx, reserve, set); err != nil {
+		if err := applyTxTo(state, tx, reserve, set, cache); err != nil {
 			return fail(&TxRejection{Index: i, Err: err})
 		}
 		tips += tx.Fee - minFee // base fee × size is burned; miner keeps only the tip
@@ -921,7 +952,7 @@ func (bc *Blockchain) NextStateRoot(candidate Block) (string, error) {
 	bc.mu.RLock()
 	defer bc.mu.RUnlock()
 	s := cloneState(bc.state)
-	if _, err := applyTxsAndCoinbase(s, bc.blocks, candidate); err != nil {
+	if _, err := applyTxsAndCoinbase(s, bc.blocks, candidate, bc.sigCache); err != nil {
 		return "", err
 	}
 	return stateRoot(s), nil
@@ -930,8 +961,8 @@ func (bc *Blockchain) NextStateRoot(candidate Block) (string, error) {
 // applyTxTo validates a single signed transfer against state and applies it via
 // set (which records undo information). reserve is the sender's immature
 // coinbase amount that must remain unspent (coinbase maturity).
-func applyTxTo(state map[string]Account, tx Transaction, reserve uint64, set func(string, Account)) error {
-	if err := tx.VerifySignature(); err != nil {
+func applyTxTo(state map[string]Account, tx Transaction, reserve uint64, set func(string, Account), cache *ValidationCache) error {
+	if err := cache.Verify(tx); err != nil {
 		return err
 	}
 	if tx.IsIssue() {
@@ -940,11 +971,15 @@ func applyTxTo(state map[string]Account, tx Transaction, reserve uint64, set fun
 	if tx.IsAssetTransfer() {
 		return applyAssetTransfer(state, tx, reserve, set)
 	}
-	if tx.Amount == 0 && tx.Fee == 0 {
+	out, ok := tx.TotalOut()
+	if !ok {
+		return errors.New("outputs overflow")
+	}
+	if out == 0 && tx.Fee == 0 {
 		return errors.New("empty transfer")
 	}
-	total := tx.Amount + tx.Fee
-	if total < tx.Amount {
+	total := out + tx.Fee
+	if total < out {
 		return errors.New("amount+fee overflow")
 	}
 	sender := state[tx.From]
@@ -962,12 +997,16 @@ func applyTxTo(state map[string]Account, tx Transaction, reserve uint64, set fun
 	sender.Nonce++
 	set(tx.From, sender)
 
-	recip := state[tx.To]
-	if recip.Balance+tx.Amount < recip.Balance {
-		return errors.New("recipient balance overflow")
+	// Credit each recipient in turn, reading state back every time so a repeated
+	// recipient accumulates and a transaction paying its own sender nets correctly.
+	for _, o := range tx.outputs() {
+		recip := state[o.To]
+		if recip.Balance+o.Amount < recip.Balance {
+			return errors.New("recipient balance overflow")
+		}
+		recip.Balance += o.Amount
+		set(o.To, recip)
 	}
-	recip.Balance += tx.Amount
-	set(tx.To, recip)
 	return nil
 }
 

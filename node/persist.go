@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 
 	"github.com/nexusriot/DNAS/core"
 )
@@ -40,6 +41,15 @@ func (n *Node) loadState() {
 	}
 	var txs []core.Transaction
 	if readJSONFile(n.statePath(mempoolFile), &txs) == nil {
+		// Restore each sender's transactions in nonce order: the mempool refuses a
+		// nonce that would leave a gap, and the saved file is in map-iteration order,
+		// so an unsorted replay would drop most of a sender's queue.
+		sort.Slice(txs, func(i, j int) bool {
+			if txs[i].From != txs[j].From {
+				return txs[i].From < txs[j].From
+			}
+			return txs[i].Nonce < txs[j].Nonce
+		})
 		restored := 0
 		for _, tx := range txs {
 			if added, err := n.mempool.Add(tx); err == nil && added {

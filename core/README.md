@@ -7,6 +7,23 @@ Module `github.com/nexusriot/DNAS/core` — the ledger and consensus rules.
   transactions mint the block reward. Authorization is a single signature, an
   M-of-N `MultisigScript`, or a hash-time-locked `HTLCScript` (all resolved by
   `VerifySignature`).
+- `Output` / `Transaction.Outputs` — a multi-recipient coin transfer: many
+  recipients under one fee, one nonce and one signature, bounded by
+  `MaxTxOutputs` and gated by the height-activated `UpgradeMultiOutput`. The
+  outputs are appended to the canonical encoding *only when present*, so a
+  single-recipient transaction's txid, signature and size are unchanged.
+- `CheckTxSanity` / `checkTxAtHeight` — the context-free and height-dependent
+  consensus rules, shared by `Mempool.Add`, `Mempool.Select` and block
+  application, so the mempool cannot admit or the miner select a transaction the
+  chain would then reject (which would stop block production, not merely waste a
+  slot). `TxRejection` names which transaction in a block failed.
+- `valcache.go` — `ValidationCache`: a bounded set of transaction ids whose
+  authorization has been verified, shared between the mempool and the chain so a
+  signature is checked once rather than twice, plus a parallel pre-warm of a whole
+  block's signatures. `VerifyOps`/`BlockVerifyOps` price the worst-case
+  verification cost, capped per block by `MaxBlockVerifyOps` — bytes alone do not
+  bound it, since a 16-key multisig spend costs up to 256 verifications in a
+  couple of kilobytes.
 - `HTLCScript{Hash, Recipient, Sender, Timeout}` — a hash-time-locked contract.
   `From` is the hash of the script (like multisig); coins unlock either via the
   *claim* branch (a `Preimage` with `sha256(Preimage) == Hash` plus a `Recipient`
@@ -87,7 +104,14 @@ Module `github.com/nexusriot/DNAS/core` — the ledger and consensus rules.
   account is unchanged and asset balances are light-client-provable.
 - `Mempool` — bounded pool of pending transactions with lowest-*rate* eviction
   (fee per byte), replace-by-fee (fee-bumping), expiry pruning, and nonce-aware,
-  rate-ordered, byte-bounded block selection (`Select`, capped at `MaxBlockBytes`).
+  rate-ordered, byte-bounded block selection (`Select`, capped at `MaxBlockBytes`
+  and `MaxBlockVerifyOps`). Admission requires a transaction that could plausibly
+  be mined: per sender it keeps a contiguous run of nonces from that sender's
+  confirmed nonce whose total the sender can afford (needs a bound
+  `AccountSource`; `MaxPerSender` caps the count), eviction never breaks a run,
+  and `Reconcile` re-checks the pool after each tip change. Without those rules an
+  address holding nothing fills the pool for free with work that can never be
+  mined.
   Enforces a **dynamic minimum relay fee** (`MinFee`, a per-byte rate): a
   configurable base (`NewMempoolWithPolicy`) that rises quadratically with
   occupancy toward `feeFloorMaxMultiplier×base` when full; a tx is admitted when
@@ -97,7 +121,7 @@ Module `github.com/nexusriot/DNAS/core` — the ledger and consensus rules.
   next `capacityBytes` of block space (0 when uncongested).
 - `params.go` — monetary and consensus constants (coin, reward/halving,
   difficulty bounds and retarget, `CoinbaseMaturity`, `MaxReorgDepth`,
-  `MaxBlockBytes`, `DefaultMinRelayFee`, the per-byte base-fee params
+  `MaxBlockBytes`, `MaxBlockVerifyOps`, `MaxTxOutputs`, `DefaultMinRelayFee`, the per-byte base-fee params
   `InitialBaseFee`/`MinBaseFee`/`BaseFeeTargetTxs`/`BaseFeeMaxChangeDenominator`,
   genesis) plus the `BaseFeeFor`, `Tips`, and `CoinbaseAmount` fee helpers.
 

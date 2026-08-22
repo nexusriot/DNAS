@@ -216,6 +216,14 @@ func spvScan(base, addr string) error {
 	return nil
 }
 
+// txOutputs presents either transaction form as a list of recipients.
+func txOutputs(tx core.Transaction) []core.Output {
+	if len(tx.Outputs) > 0 {
+		return tx.Outputs
+	}
+	return []core.Output{{To: tx.To, Amount: tx.Amount}}
+}
+
 // HistoryEntry is one wallet-relevant event reconstructed from the chain.
 type HistoryEntry struct {
 	Block         uint64
@@ -240,14 +248,20 @@ func walletHistory(addr string, blocks []core.Block, tipHeight uint64) (entries 
 				}
 				continue
 			}
+			// A multi-recipient transfer is reported per recipient, so the totals stay
+			// right whichever form the payment took.
 			if tx.From == addr {
-				entries = append(entries, HistoryEntry{b.Index, "sent", tx.To, tx.Amount, tx.Fee, confs})
-				sent += tx.Amount
+				for _, o := range txOutputs(tx) {
+					entries = append(entries, HistoryEntry{b.Index, "sent", o.To, o.Amount, 0, confs})
+					sent += o.Amount
+				}
 				fees += tx.Fee
 			}
-			if tx.To == addr {
-				entries = append(entries, HistoryEntry{b.Index, "received", tx.From, tx.Amount, 0, confs})
-				received += tx.Amount
+			for _, o := range txOutputs(tx) {
+				if o.To == addr {
+					entries = append(entries, HistoryEntry{b.Index, "received", tx.From, o.Amount, 0, confs})
+					received += o.Amount
+				}
 			}
 		}
 	}

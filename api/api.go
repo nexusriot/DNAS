@@ -469,21 +469,39 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) {
 	// (with a higher fee) to fee-bump a stuck transaction. Expiry/LockUntil bound
 	// the height window in which the tx is valid; Memo is optional data.
 	var req struct {
-		To        string  `json:"to"`
-		Amount    uint64  `json:"amount"`
-		Fee       uint64  `json:"fee"`
-		Expiry    uint64  `json:"expiry"`
-		LockUntil uint64  `json:"lock_until"`
-		Memo      string  `json:"memo"`
-		Nonce     *uint64 `json:"nonce"`
+		To        string        `json:"to"`
+		Amount    uint64        `json:"amount"`
+		Outputs   []core.Output `json:"outputs"`
+		Fee       uint64        `json:"fee"`
+		Expiry    uint64        `json:"expiry"`
+		LockUntil uint64        `json:"lock_until"`
+		Memo      string        `json:"memo"`
+		Nonce     *uint64       `json:"nonce"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := wallet.ValidateAddress(req.To); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid recipient: "+err.Error())
+	// Either one recipient (to/amount) or many (outputs), never both. Every
+	// recipient's checksum is validated here so a typo is refused before signing
+	// rather than burning the coin.
+	if len(req.Outputs) > 0 && (req.To != "" || req.Amount != 0) {
+		writeErr(w, http.StatusBadRequest, "give either to/amount or outputs, not both")
 		return
+	}
+	recipients := req.Outputs
+	if len(recipients) == 0 {
+		recipients = []core.Output{{To: req.To, Amount: req.Amount}}
+	}
+	if len(recipients) > core.MaxTxOutputs {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf("too many outputs (max %d)", core.MaxTxOutputs))
+		return
+	}
+	for i, o := range recipients {
+		if err := wallet.ValidateAddress(o.To); err != nil {
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("invalid recipient %d: %s", i, err))
+			return
+		}
 	}
 	if len(req.Memo) > core.MaxMemoBytes {
 		writeErr(w, http.StatusBadRequest, "memo too long")
@@ -495,13 +513,16 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) {
 	}
 	tx := core.Transaction{
 		From:      wal.Address(),
-		To:        req.To,
-		Amount:    req.Amount,
 		Fee:       req.Fee,
 		Nonce:     nonce,
 		Expiry:    req.Expiry,
 		LockUntil: req.LockUntil,
 		Memo:      req.Memo,
+	}
+	if len(req.Outputs) > 0 {
+		tx.Outputs = req.Outputs
+	} else {
+		tx.To, tx.Amount = req.To, req.Amount
 	}
 	if err := tx.Sign(wal); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())

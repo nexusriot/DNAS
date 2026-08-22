@@ -20,8 +20,20 @@ func testNode(t *testing.T) (*Node, *core.Mempool, *wallet.Wallet) {
 	return n, mp, w
 }
 
-func TestNextNonceCountsMempool(t *testing.T) {
+// fundedNode is testNode with the wallet holding a matured, spendable coinbase.
+// The mempool refuses a transaction whose sender cannot pay for it (as consensus
+// would), so any test that submits one needs real funds behind it.
+func fundedNode(t *testing.T) (*Node, *core.Mempool, *wallet.Wallet) {
+	t.Helper()
 	n, mp, w := testNode(t)
+	if _, err := n.Generate(core.CoinbaseMaturity + 1); err != nil {
+		t.Fatalf("fund node: %v", err)
+	}
+	return n, mp, w
+}
+
+func TestNextNonceCountsMempool(t *testing.T) {
+	n, mp, w := fundedNode(t)
 	if got := n.NextNonce(w.Address()); got != 0 {
 		t.Fatalf("initial next nonce = %d, want 0", got)
 	}
@@ -38,7 +50,7 @@ func TestNextNonceCountsMempool(t *testing.T) {
 }
 
 func TestSubmitTxAddsAndDedups(t *testing.T) {
-	n, mp, w := testNode(t)
+	n, mp, w := fundedNode(t)
 	tx := core.Transaction{From: w.Address(), To: "dnasx", Amount: core.Coin, Nonce: 0}
 	if err := tx.Sign(w); err != nil {
 		t.Fatal(err)

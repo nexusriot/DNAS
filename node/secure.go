@@ -191,5 +191,12 @@ func (s *secureConn) Read(p []byte) (int, error) {
 // enforce a liveness timeout on established peer connections.
 func (s *secureConn) SetReadDeadline(t time.Time) error { return s.conn.SetReadDeadline(t) }
 
-// Close closes the underlying connection.
-func (s *secureConn) Close() error { return s.conn.Close() }
+// Close closes the underlying connection. A nil receiver or connection is a
+// no-op, so tearing down a peer that never finished being built (or one built by
+// a test without a socket) cannot panic in a shutdown path.
+func (s *secureConn) Close() error {
+	if s == nil || s.conn == nil {
+		return nil
+	}
+	return s.conn.Close()
+}

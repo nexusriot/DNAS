@@ -31,7 +31,10 @@ JSON envelope on every new block, reorg, and mempool transaction (fed by the
 node's pub/sub bus).
 
 Write endpoints: `POST /send` (`{"to","amount","fee","expiry"?,"lock_until"?,"memo"?,"nonce"?}`,
-signed by the node's wallet — set `nonce`+higher `fee` to fee-bump), `POST /tx`
+signed by the node's wallet — set `nonce`+higher `fee` to fee-bump; or
+`{"outputs":[{"to","amount"},…]}` instead of `to`/`amount` to pay several
+recipients in one transaction, every address checksum-validated before signing),
+`POST /tx`
 (submit a fully-signed transaction, including multisig, HTLC, a native-asset
 transfer, or an issuance), `POST /mine` (`{"on":bool}`, toggle mining at runtime),
 and `POST /generate` (`{"n":N}`, **regtest only**: mine N blocks on demand). When

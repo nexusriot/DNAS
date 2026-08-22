@@ -176,7 +176,8 @@ Coins mined or received on one node appear on all of them once they sync.
 Useful node flags: `-advertise` (address peers should dial you at, for multi-host),
 `-maxpeers`, `-mempool`, `-minrelayfee` (base relay fee in base units **per byte**;
 0 disables the floor), `-checkpoints height:hash,…` (pin finality checkpoints),
-`-wallet FILE`, `-db FILE`, `-netkey KEY`.
+`-upgrades name:height,…` (schedule consensus upgrades — set the same values on
+every node), `-wallet FILE`, `-db FILE`, `-netkey KEY`.
 
 ## 6. Web explorer
 
@@ -255,6 +256,34 @@ leaves the client) and submits only the signed transaction:
 ```sh
 dnas spv -api localhost:8080 wallet -key lw.json new              # create + watch own address
 dnas spv -api localhost:8080 wallet -key lw.json send <addr> 5    # prove balance/nonce, sign, submit
+```
+
+### Paying several people at once
+
+One transaction can carry many recipients — one fee, one nonce, one signature
+instead of N of each. Every address is checksum-validated before anything is
+signed, so a typo in a batch of fifty fails loudly rather than sending coin
+nowhere:
+
+```sh
+dnas spv -api localhost:8080 wallet -key lw.json sendmany \
+    dnas<addr1>:1.5 dnas<addr2>:0.25 dnas<addr3>:2 [-fee 0.001]
+```
+
+Or over the API, with the node's own wallet signing:
+
+```sh
+curl -sX POST localhost:8080/send -d '{"outputs":[
+  {"to":"dnas<addr1>","amount":150000000},
+  {"to":"dnas<addr2>","amount":25000000}],"fee":1000000}'
+```
+
+Multi-recipient transfers are a **height-activated consensus rule**, so start
+every node on the network with the same activation height — otherwise the ones
+that have it enabled will mine blocks the others reject:
+
+```sh
+dnas node -upgrades multioutput:1000     # accepted from block 1000 onwards
 ```
 
 ## 8b2. Fast-sync from a snapshot (skip replaying history)

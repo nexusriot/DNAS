@@ -119,7 +119,7 @@ func TestNewTxWakesIdleSleep(t *testing.T) {
 // TestSubmitTxWakesMiner confirms SubmitTx bumps the wake signal the idle miner
 // watches.
 func TestSubmitTxWakesMiner(t *testing.T) {
-	n, _, w := testNode(t)
+	n, _, w := fundedNode(t)
 	before := atomic.LoadInt64(&n.txGen)
 	tx := core.Transaction{From: w.Address(), To: "dnasx", Amount: core.Coin, Nonce: 0}
 	if err := tx.Sign(w); err != nil {

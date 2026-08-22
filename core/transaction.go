@@ -30,6 +30,13 @@ type Transaction struct {
 	LockUntil uint64 `json:"lock_until,omitempty"`
 	Memo      string `json:"memo,omitempty"`
 
+	// Outputs carries a multi-recipient coin transfer: one transaction paying many
+	// addresses, for one fee, under one nonce and one signature. When it is set, To
+	// and Amount are unused (a single-output transfer keeps using those, and encodes
+	// byte-for-byte as it always has). Coin only — an asset move or an issuance uses
+	// the single-output form.
+	Outputs []Output `json:"outputs,omitempty"`
+
 	// Native asset support. When AssetID is set, Amount is an amount of that asset
 	// (moved from From to To) rather than coin; the Fee is always paid in coin.
 	// When Issue is set, the transaction mints a new asset to From (Fee in coin).
@@ -49,6 +56,55 @@ type Transaction struct {
 	// Signature) or a refund (sender's Signature, valid only from Timeout on).
 	HTLC     *HTLCScript `json:"htlc,omitempty"`
 	Preimage string      `json:"preimage,omitempty"` // hex; present on the claim path
+}
+
+// Output is one recipient of a multi-recipient transfer. Paying N people with N
+// separate transactions costs N fees and N sequential nonces, and N times the
+// block space for the sender's address and signature; one transaction with N
+// outputs costs one of each.
+type Output struct {
+	To     string `json:"to"`
+	Amount uint64 `json:"amount"`
+}
+
+// IsMultiOutput reports whether this is a multi-recipient coin transfer.
+func (t Transaction) IsMultiOutput() bool { return len(t.Outputs) > 0 }
+
+// TotalOut is the coin the transaction moves to recipients: the sum of its
+// outputs, or Amount for the single-output form. It excludes the fee. The bool is
+// false if the sum overflows, which CheckTxSanity rejects.
+func (t Transaction) TotalOut() (uint64, bool) {
+	if !t.IsMultiOutput() {
+		return t.Amount, true
+	}
+	var total uint64
+	for _, o := range t.Outputs {
+		if total+o.Amount < total {
+			return 0, false
+		}
+		total += o.Amount
+	}
+	return total, true
+}
+
+// outputs presents any coin transfer as a list of recipients, so the single- and
+// multi-output forms share one application path instead of two that could drift.
+func (t Transaction) outputs() []Output {
+	if t.IsMultiOutput() {
+		return t.Outputs
+	}
+	return []Output{{To: t.To, Amount: t.Amount}}
+}
+
+// coinAmounts is the per-recipient coin amounts a transfer pays, for rules that
+// apply to each output individually (the dust limit).
+func (t Transaction) coinAmounts() []uint64 {
+	outs := t.outputs()
+	amounts := make([]uint64, len(outs))
+	for i, o := range outs {
+		amounts[i] = o.Amount
+	}
+	return amounts
 }
 
 // MultisigScript defines an M-of-N multisig account: any Threshold of the listed
@@ -105,6 +161,10 @@ func CheckTxSanity(tx Transaction) error {
 		return err
 	}
 	switch {
+	case tx.IsMultiOutput():
+		if err := checkOutputs(tx); err != nil {
+			return err
+		}
 	case tx.IsIssue():
 		if tx.AssetID != "" {
 			return errors.New("an issuance cannot also carry an asset id")
@@ -132,6 +192,41 @@ func CheckTxSanity(tx Transaction) error {
 		if tx.Amount+tx.Fee < tx.Amount {
 			return errors.New("amount+fee overflow")
 		}
+	}
+	return nil
+}
+
+// checkOutputs validates a multi-recipient transfer's output list. The
+// single-output fields must be unused, so a transaction has exactly one meaning
+// (leaving them free would put coin in a field nothing reads, and let two
+// implementations disagree about the amount). Assets keep the single-output form.
+func checkOutputs(tx Transaction) error {
+	if len(tx.Outputs) > MaxTxOutputs {
+		return fmt.Errorf("too many outputs: %d (max %d)", len(tx.Outputs), MaxTxOutputs)
+	}
+	if tx.To != "" || tx.Amount != 0 {
+		return errors.New("a multi-output transfer must not also set to/amount")
+	}
+	if tx.AssetID != "" || tx.Issue != nil {
+		return errors.New("multi-output transfers carry coin, not assets")
+	}
+	for i, o := range tx.Outputs {
+		if o.To == "" {
+			return fmt.Errorf("output %d has no recipient", i)
+		}
+		if len(o.To) > MaxAddressBytes {
+			return fmt.Errorf("output %d recipient too long (%d > %d)", i, len(o.To), MaxAddressBytes)
+		}
+		if o.Amount == 0 {
+			return fmt.Errorf("output %d pays nothing", i)
+		}
+	}
+	total, ok := tx.TotalOut()
+	if !ok {
+		return errors.New("outputs overflow")
+	}
+	if total+tx.Fee < total {
+		return errors.New("outputs+fee overflow")
 	}
 	return nil
 }

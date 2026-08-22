@@ -93,6 +93,12 @@ sections matter most for "toy → real".
 - **`[M]` Network-adjusted time.** Timestamp checks use the local clock; a
   median-of-peers offset (bounded, bitcoind-style) resists a node with a skewed
   clock being fooled on MTP/timestamp rules.
+- **`[M]` Windowed, scored block download.** Ranged requests are now tracked,
+  timed out and spread across a few peers, with out-of-order arrivals buffered
+  ([node/sync.go](node/sync.go)) — but the window is fixed, peers are not scored on
+  throughput, and a range that times out is not re-requested from a *specific*
+  better peer. A proper scheduler (per-peer speed, adaptive window, re-assignment)
+  would make catch-up on a long chain predictable rather than merely unstuck.
 - **`[S]` Bound P2P and HTTP request sizes.** A peer frame may be up to 64 MiB
   (`maxFrame`, [node/secure.go](node/secure.go)) and the API decodes request bodies
   with no cap, so one message can force a large allocation before anything
@@ -119,17 +125,27 @@ sections matter most for "toy → real".
 ## 4. Mempool & fee policy
 
 - **`[M]` Package relay + CPFP + ancestor/descendant limits.** RBF, a per-byte
-  relay floor, and rate-based eviction exist; child-pays-for-parent and package
-  acceptance let a stuck low-fee parent be bumped and prevent pinning attacks.
+  relay floor, rate-based eviction, and per-sender nonce-contiguity/affordability
+  admission all exist. What is missing is *dependency* tracking: because admission
+  measures a sender against its confirmed state, a recipient cannot queue a spend
+  of coin that is still unconfirmed (DESIGN §21), and a stuck low-fee parent cannot
+  be bumped by its child. Ancestor/descendant accounting would restore both and
+  close pinning attacks.
+- **`[M]` Announce transactions by hash (inv/getdata for `MsgTx`).** Blocks are
+  announced and pulled; transactions are still pushed in full to every peer, so
+  each one crosses each link once per peer whether or not the peer already has it.
+  Announcing the txid and letting peers request what they lack is the biggest
+  bandwidth win left after compact blocks.
 - **`[S/M]` Weight-based congestion signal.** The EIP-1559 base fee currently
   responds to transaction *count* (§9); switching the signal to block weight/bytes
   makes it track real demand.
 - **`[S]` Index the mempool for selection.** `Mempool.Select` rescans the whole
   pool once per chosen transaction, recomputing each candidate's hash and canonical
   size every pass — O(txs × block txs) sha256 work, which on a full pool makes
-  building one block far more expensive than mining it should be. Keeping
-  candidates in a fee-rate-ordered structure keyed by `(From, Nonce)`, with sizes
-  and hashes cached on admission, makes selection linear.
+  building one block far more expensive than mining it should be. The
+  `(From, Nonce)` index added for admission is half the answer; keeping candidates
+  in a fee-rate-ordered structure, with sizes and hashes cached on admission,
+  makes selection linear.
 
 ## 5. Wallet & UX
 

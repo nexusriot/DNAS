@@ -14,6 +14,9 @@ type Event struct {
 	To     string `json:"to,omitempty"`
 	Amount uint64 `json:"amount,omitempty"`
 	Fee    uint64 `json:"fee,omitempty"`
+	// Outputs is the recipient count of a multi-recipient transfer (absent for an
+	// ordinary one), so a client can tell a summarized total from a single payment.
+	Outputs int `json:"outputs,omitempty"`
 }
 
 // eventBus is a minimal in-process publish/subscribe hub. Each subscriber gets a

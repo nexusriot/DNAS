@@ -3,33 +3,16 @@ package node
 import (
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/nexusriot/DNAS/core"
 	"github.com/nexusriot/DNAS/wallet"
 )
 
-// minerNode returns a mining-capable node with a funded, matured wallet.
-func minerNode(t *testing.T) (*Node, *wallet.Wallet, *core.Mempool) {
-	t.Helper()
-	w, err := wallet.New()
-	if err != nil {
-		t.Fatal(err)
-	}
-	bc := core.NewBlockchain()
-	mp := core.NewMempoolWithPolicy(100, core.DefaultMinRelayFee)
-	n := New(Config{ListenAddr: "127.0.0.1:0", EmptyBlockInterval: time.Millisecond}, bc, mp, w)
-	if _, err := n.Generate(core.CoinbaseMaturity + 2); err != nil {
-		t.Fatalf("funding the miner: %v", err)
-	}
-	return n, w, mp
-}
-
 // A transaction that consensus will never accept must not reach the mempool. If
 // it did, the miner would select it into every candidate block, every candidate
 // would be rejected, and the chain would stop advancing while the miner spun.
 func TestUnmineableTxCannotStallBlockProduction(t *testing.T) {
-	n, w, mp := minerNode(t)
+	n, mp, w := fundedNode(t)
 	poison := core.Transaction{
 		From: w.Address(), To: w.Address(),
 		Amount: 1000, Fee: 1_000_000, Nonce: 0,
@@ -61,7 +44,7 @@ func TestMinerSkipsTxForbiddenByAnActivatedUpgrade(t *testing.T) {
 	core.ClearUpgrades()
 	defer core.ClearUpgrades()
 
-	n, w, mp := minerNode(t)
+	n, mp, w := fundedNode(t)
 	dest, _ := wallet.New()
 	dust := core.Transaction{
 		From: w.Address(), To: dest.Address(),
@@ -95,7 +78,7 @@ func TestMinerSkipsTxForbiddenByAnActivatedUpgrade(t *testing.T) {
 // now (Select mirrors every rule), so this pins the recovery itself: given a
 // mempool holding only mineable work, the candidate always carries a state root.
 func TestBuildBlockAlwaysProducesACommittableCandidate(t *testing.T) {
-	n, w, _ := minerNode(t)
+	n, _, w := fundedNode(t)
 	dest, _ := wallet.New()
 	for i := uint64(0); i < 3; i++ {
 		tx := core.Transaction{From: w.Address(), To: dest.Address(), Amount: 1000, Fee: 1_000_000, Nonce: i}

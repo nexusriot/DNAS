@@ -16,7 +16,14 @@ func TestStatePersistence(t *testing.T) {
 	bob, _ := wallet.New()
 
 	// Node 1: record a peer, a ban score, and a pending transaction, then persist.
-	n1 := New(Config{ListenAddr: "127.0.0.1:0", StateDir: dir}, core.NewBlockchain(), core.NewMempool(), w)
+	// The chain is shared with node 2 below, standing in for the same node
+	// restarting against its own block store: a restored transaction the local
+	// chain cannot fund is dropped, exactly as it would be on admission.
+	chain := core.NewBlockchain()
+	n1 := New(Config{ListenAddr: "127.0.0.1:0", StateDir: dir}, chain, core.NewMempool(), w)
+	if _, err := n1.Generate(core.CoinbaseMaturity + 1); err != nil {
+		t.Fatalf("fund node: %v", err)
+	}
 	n1.book.note("127.0.0.1:12345")
 	n1.bans.add("badpeer", 42)
 	tx := core.Transaction{From: w.Address(), To: bob.Address(), Amount: core.Coin, Nonce: 0}
@@ -28,8 +35,8 @@ func TestStatePersistence(t *testing.T) {
 	}
 	n1.saveState()
 
-	// Node 2: fresh instance, same state dir. Restore.
-	n2 := New(Config{ListenAddr: "127.0.0.1:0", StateDir: dir}, core.NewBlockchain(), core.NewMempool(), w)
+	// Node 2: fresh instance, same state dir and chain. Restore.
+	n2 := New(Config{ListenAddr: "127.0.0.1:0", StateDir: dir}, chain, core.NewMempool(), w)
 	n2.loadState()
 
 	found := false

@@ -59,3 +59,32 @@ func TestDustLimitUpgradeGated(t *testing.T) {
 		t.Fatalf("at-threshold transfer should be accepted under the upgrade: %v", err)
 	}
 }
+
+// An operator scheduling an upgrade by name must be told immediately if it is
+// misspelled: a rule that silently never activates, on a network where the others
+// activated it, means being forked off that network.
+func TestKnownUpgrades(t *testing.T) {
+	for _, name := range Upgrades() {
+		if !KnownUpgrade(name) {
+			t.Errorf("Upgrades() lists %q but KnownUpgrade rejects it", name)
+		}
+	}
+	for _, name := range []string{UpgradeDustLimit, UpgradeMultiOutput} {
+		if !KnownUpgrade(name) {
+			t.Errorf("%q is not in the known-upgrade registry", name)
+		}
+	}
+	for _, name := range []string{"", "multiouput", "dust-limit", "DUSTLIMIT"} {
+		if KnownUpgrade(name) {
+			t.Errorf("KnownUpgrade accepted %q", name)
+		}
+	}
+	// The returned slice must be a copy: a caller cannot rewrite the registry.
+	list := Upgrades()
+	if len(list) > 0 {
+		list[0] = "tampered"
+		if KnownUpgrade("tampered") {
+			t.Error("Upgrades() exposes the registry's backing array")
+		}
+	}
+}

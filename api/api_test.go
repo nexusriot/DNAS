@@ -59,6 +59,30 @@ func testServer(t *testing.T) (*httptest.Server, *core.Blockchain, *wallet.Walle
 	return srv, chain, w
 }
 
+// mature mines CoinbaseMaturity blocks to a throwaway miner, so a coinbase paid
+// earlier becomes spendable. The mempool refuses a transaction its sender cannot
+// pay for, and an immature coinbase is not spendable — exactly as consensus sees
+// it — so tests that submit transactions need this.
+func mature(t *testing.T, chain *core.Blockchain) {
+	t.Helper()
+	sink, err := wallet.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < core.CoinbaseMaturity; i++ {
+		mineOnto(t, chain, sink.Address(), nil)
+	}
+}
+
+// fundedServer is testServer with the node wallet's reward matured, for tests
+// that need it to actually spend.
+func fundedServer(t *testing.T) (*httptest.Server, *core.Blockchain, *wallet.Wallet) {
+	t.Helper()
+	srv, chain, w := testServer(t)
+	mature(t, chain)
+	return srv, chain, w
+}
+
 func getObj(t *testing.T, url string) map[string]any {
 	t.Helper()
 	resp, err := http.Get(url)
@@ -243,7 +267,7 @@ func TestAddressAndPeers(t *testing.T) {
 }
 
 func TestSendAddsToMempool(t *testing.T) {
-	srv, _, _ := testServer(t)
+	srv, _, _ := fundedServer(t)
 	bob, _ := wallet.New()
 	body := fmt.Sprintf(`{"to":%q,"amount":100000000,"fee":1000000}`, bob.Address())
 	resp, err := http.Post(srv.URL+"/send", "application/json", strings.NewReader(body))
@@ -354,7 +378,7 @@ func TestSendMethodNotAllowed(t *testing.T) {
 }
 
 func TestSubmitSignedTx(t *testing.T) {
-	srv, _, w := testServer(t)
+	srv, _, w := fundedServer(t)
 	bob, _ := wallet.New()
 	tx := core.Transaction{From: w.Address(), To: bob.Address(), Amount: core.Coin, Nonce: 0}
 	if err := tx.Sign(w); err != nil {
@@ -503,7 +527,7 @@ func TestCompactFilterEndpoints(t *testing.T) {
 // TestEventStream confirms /events is an SSE stream that pushes a "tx" event when
 // a transaction enters the mempool — the live feed clients use instead of polling.
 func TestEventStream(t *testing.T) {
-	srv, _, _ := testServer(t)
+	srv, _, _ := fundedServer(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -558,6 +582,7 @@ func TestAPIAuth(t *testing.T) {
 	w, _ := wallet.New()
 	chain := core.NewBlockchain()
 	mineOnto(t, chain, w.Address(), nil)
+	mature(t, chain)
 	n := node.New(node.Config{ListenAddr: ":0"}, chain, core.NewMempool(), w)
 	srv := httptest.NewServer(api.NewWithToken(n, "s3cret").Handler())
 	t.Cleanup(srv.Close)
@@ -734,4 +759,57 @@ func TestExplorerServedAtRoot(t *testing.T) {
 	if r, _ := http.Get(srv.URL + "/nope"); r.StatusCode != http.StatusNotFound {
 		t.Errorf("/nope status = %d, want 404", r.StatusCode)
 	}
+}
+
+// A single /send call can pay several addresses: one fee, one nonce, one
+// signature. Every recipient's checksum is validated before signing, so a typo in
+// a batch fails loudly instead of burning coin.
+func TestSendManyOutputs(t *testing.T) {
+	core.ClearUpgrades()
+	defer core.ClearUpgrades()
+	srv, _, _ := fundedServer(t)
+	core.SetUpgradeHeight(core.UpgradeMultiOutput, 0)
+
+	a, _ := wallet.New()
+	b, _ := wallet.New()
+	body := fmt.Sprintf(`{"outputs":[{"to":%q,"amount":1000},{"to":%q,"amount":2000}],"fee":1000000}`,
+		a.Address(), b.Address())
+	resp, err := http.Post(srv.URL+"/send", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	pending := getArr(t, srv.URL+"/mempool")
+	if len(pending) != 1 {
+		t.Fatalf("mempool holds %d transactions, want 1", len(pending))
+	}
+	tx := pending[0].(map[string]any)
+	outs, ok := tx["outputs"].([]any)
+	if !ok || len(outs) != 2 {
+		t.Fatalf("queued transaction does not carry two outputs: %v", tx["outputs"])
+	}
+
+	// Mixing the two forms, and a mistyped recipient, are both refused.
+	bad := fmt.Sprintf(`{"to":%q,"amount":5,"outputs":[{"to":%q,"amount":1}]}`, a.Address(), b.Address())
+	if code := postCode(t, srv.URL+"/send", bad); code != http.StatusBadRequest {
+		t.Errorf("mixing to/amount with outputs = %d, want 400", code)
+	}
+	typo := `{"outputs":[{"to":"dnasdeadbeef","amount":1}],"fee":1000000}`
+	if code := postCode(t, srv.URL+"/send", typo); code != http.StatusBadRequest {
+		t.Errorf("mistyped recipient = %d, want 400", code)
+	}
+}
+
+// postCode POSTs a body and returns the status code.
+func postCode(t *testing.T, url, body string) int {
+	t.Helper()
+	resp, err := http.Post(url, "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode
 }

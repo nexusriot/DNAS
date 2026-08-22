@@ -97,12 +97,13 @@ func NewFromSnapshot(s Snapshot, headers []Header) (*Blockchain, error) {
 		burned = minted - totalBalance(state)
 	}
 	return &Blockchain{
-		blocks:  blocks,
-		state:   state,
-		work:    work,
-		undos:   undos, // all nil: no reorg below the snapshot is permitted
-		txIndex: buildTxIndex(blocks),
-		burned:  burned,
+		blocks:   blocks,
+		state:    state,
+		work:     work,
+		undos:    undos, // all nil: no reorg below the snapshot is permitted
+		txIndex:  buildTxIndex(blocks),
+		burned:   burned,
+		sigCache: NewValidationCache(DefaultValidationCacheSize),
 	}, nil
 }
 

@@ -66,6 +66,18 @@ func (t Transaction) signedFields(c *cbuf) {
 		c.byte(0)
 	}
 	c.str(t.Memo)
+	// Multi-recipient outputs are appended ONLY when present, so a single-output
+	// transaction encodes exactly as it did before they existed: its txid, its
+	// signing bytes and its fee-bearing size are all unchanged, and a stored chain
+	// still replays. Nothing is ambiguous either — every field before this is
+	// length-prefixed, so the trailing block cannot be confused with Memo's content.
+	if len(t.Outputs) > 0 {
+		c.u32(uint32(len(t.Outputs)))
+		for _, o := range t.Outputs {
+			c.str(o.To)
+			c.u64(o.Amount)
+		}
+	}
 }
 
 // canonicalSigningBytes is the message a sender signs: the codec version plus the

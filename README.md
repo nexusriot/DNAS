@@ -62,6 +62,13 @@ it would go next, see [ROADMAP.md](ROADMAP.md).
   (1 DNAS = 100 000 000 units). Each account has a running balance and a nonce;
   a transaction must use the sender's next nonce and cannot spend more than the
   balance.
+- **Pay many people in one transaction.** `Outputs` carries up to
+  `MaxTxOutputs` recipients, so a batch payment costs one fee, one nonce and one
+  signature instead of N of each — `POST /send {"outputs":[…]}` or
+  `dnas spv wallet -key F sendmany addr:amount …`. It is gated by a
+  height-activated consensus upgrade (`-upgrades multioutput:HEIGHT`), and a
+  single-recipient transaction encodes exactly as it always did, so no existing
+  transaction id, signature or stored chain changes.
 - **Time windows, memos & fee-bumping.** A transaction may carry a signed
   `Expiry` (highest valid height) and `LockUntil` (lowest valid height), so it is
   only mineable within a window and is dropped from mempools outside it, plus an
@@ -161,13 +168,35 @@ it would go next, see [ROADMAP.md](ROADMAP.md).
   **block locator** — the peer finds the last common block, and only the
   divergent suffix is transferred and applied as a reorg. Whole-chain transfer
   remains only for deep/pathological forks and initial bootstrap.
+- **Sync that cannot silently stall.** Every ranged block request is tracked
+  against the peer it went to: a peer that accepts one and never answers is timed
+  out, ban-scored and dropped, and its slot goes to someone else — a peer that
+  keeps answering pings while serving nothing can no longer wedge a node's
+  catch-up (or leave a miner building on a stale tip). Several ranges are
+  downloaded from different peers at once, and blocks that arrive before their
+  parent are buffered and connected the moment it lands, instead of costing
+  another round trip.
 - **Peer discovery.** Nodes gossip the addresses they know (`getpeers`/`peers`),
   so a node seeded with a single peer discovers the rest and dials them, up to
   `-maxpeers`. Self-dials and duplicates are avoided.
+- **A mempool slot costs real balance.** Admission requires that a transaction
+  could plausibly be mined: per sender, the pool holds a contiguous run of nonces
+  starting at that sender's confirmed nonce, whose total the sender can actually
+  afford. Without that, an address holding *nothing* can sign transactions at
+  nonces the chain will never reach — admitted, never mined, never expiring, never
+  paying a fee — and fill the pool for free, pricing out every real payment.
+  Eviction never breaks a run, and after each block the pool re-checks itself and
+  drops whatever became unmineable.
+- **Signatures verified once, and metered.** A transaction verified when it
+  entered the mempool is not verified again when the block carrying it applies
+  (they share a cache keyed on the transaction id), and a block's signatures are
+  checked across all cores before it is applied. A block also has a
+  *verification* budget, not just a byte budget, so it cannot cost the network
+  more to check than it cost its miner to produce.
 - **Bounded memory & dynamic relay fee.** The mempool is capped and, under
   pressure, evicts the transaction paying the least *per byte* (fee rate); the
-  gossip de-duplication sets are bounded FIFOs, so a long-running node's memory
-  does not grow without limit. It also enforces a **dynamic minimum relay fee**
+  gossip de-duplication sets, the orphan-block pool and the validation cache are
+  bounded FIFOs, so a long-running node's memory does not grow without limit. It also enforces a **dynamic minimum relay fee**
   (`-minrelayfee`, a per-byte rate) that starts at a configured base and rises
   quadratically as the pool fills — cheap to relay on an idle devnet, priced up
   under load. This is *local relay policy*, not the consensus base fee: a block
@@ -284,6 +313,7 @@ graceful restart resumes warm.
 | `-regtest`   | off            | regtest mode: mine on demand via `POST /generate` (isolated netkey) |
 | `-dandelion` | on             | relay new transactions via Dandelion++ stem/fluff (origin privacy) |
 | `-checkpoints` | —            | finality checkpoints, comma-separated `height:hash` pairs |
+| `-upgrades`  | —              | consensus upgrade activations, comma-separated `name:height` pairs (e.g. `multioutput:1000`) |
 | `-config`    | —              | JSON config file (flags override its values)   |
 
 A node shuts down cleanly on `SIGINT`/`SIGTERM` (stops mining, closes peers,
@@ -457,9 +487,13 @@ branch and the other via the **refund** (timeout) branch.
   trustless. Committing a filter root in the header would be a consensus change.
 - Proof-of-work difficulty is unbounded (it tracks hashpower); a devnet/regtest
   pins it to the easy genesis floor (`NoRetarget`) so a laptop mines instantly.
-- Consensus rules can change via height-activated upgrades (`core/upgrade.go`), but
-  there's no on-chain miner signaling (BIP9) — activation heights are set at
-  startup, like checkpoints.
+- Consensus rules can change via height-activated upgrades (`core/upgrade.go`,
+  `-upgrades name:height`), but there's no on-chain miner signaling (BIP9) —
+  activation heights are set at startup, like checkpoints.
+- Mempool admission measures a sender against its *confirmed* state, so a
+  recipient cannot queue a spend of coin that is still unconfirmed. That is the
+  account-model norm, and it is what makes a pool slot cost real balance; package
+  relay would lift it.
 
 Each of these is a deliberate stopping point, not an oversight; the prioritized
 plan for closing them is in [ROADMAP.md](ROADMAP.md).

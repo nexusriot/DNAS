@@ -80,6 +80,7 @@ Usage:
   dnas spv [-api URL] history <addr>  reconstruct an address's history (light wallet)
   dnas spv [-api URL] wallet ...      persistent light wallet (add/update/status/watch)
   dnas spv [-api URL] wallet -key F new|send <to> <amount>   self-custodial light wallet (signs locally)
+  dnas spv [-api URL] wallet -key F sendmany <addr:amt>...    pay many addresses in one transaction
   dnas fastsync [-api URL] [-checkpoint H:HASH]   bootstrap state from a verified snapshot
   dnas miner -api URL -address ADDR   external miner (get template, mine, submit)
   dnas htlc new                       mint a preimage + hash for an atomic swap
@@ -99,7 +100,8 @@ Node flags:
   -mempool N      max pending transactions (default 5000)
   -mine           enable mining
   -regtest        regtest mode: mine blocks on demand via POST /generate
-  -checkpoints L  finality checkpoints, comma-separated height:hash pairs`)
+  -checkpoints L  finality checkpoints, comma-separated height:hash pairs
+  -upgrades L     consensus upgrade activations, comma-separated name:height pairs`)
 }
 
 // walletPassphrase reads the optional at-rest encryption passphrase from the
@@ -309,6 +311,7 @@ func runNode(args []string) {
 	regtest := fs.Bool("regtest", cfg.boolean("regtest", false), "regtest mode: enable on-demand block generation (POST /generate)")
 	dandelion := fs.Bool("dandelion", cfg.boolean("dandelion", true), "relay new transactions via Dandelion++ stem/fluff (origin privacy)")
 	checkpoints := fs.String("checkpoints", cfg.str("checkpoints", ""), "finality checkpoints as comma-separated height:hash pairs")
+	upgrades := fs.String("upgrades", cfg.str("upgrades", ""), "consensus upgrade activations as comma-separated name:height pairs (e.g. multioutput:1000)")
 	_ = fs.Parse(args)
 
 	// Pin any finality checkpoints before syncing, so a block at a checkpointed
@@ -321,6 +324,23 @@ func runNode(args []string) {
 		}
 		core.AddCheckpoint(h, strings.TrimSpace(hash))
 		log.Printf("checkpoint pinned: height %d", h)
+	}
+
+	// Schedule consensus upgrades before syncing. Every node on a network must be
+	// given the same values: an upgrade activates at a fixed height (a flag day), so
+	// nodes that disagree about the height disagree about whether a block is valid.
+	for _, u := range parsePeers(*upgrades) {
+		name, heightStr, ok := strings.Cut(u, ":")
+		h, err := strconv.ParseUint(strings.TrimSpace(heightStr), 10, 64)
+		name = strings.TrimSpace(name)
+		if !ok || err != nil || name == "" {
+			log.Fatalf("bad -upgrades entry %q (want name:height)", u)
+		}
+		if !core.KnownUpgrade(name) {
+			log.Fatalf("unknown upgrade %q (known: %s)", name, strings.Join(core.Upgrades(), ", "))
+		}
+		core.SetUpgradeHeight(name, h)
+		log.Printf("consensus upgrade %q activates at height %d", name, h)
 	}
 
 	// In regtest, isolate the network by default (a distinct pre-shared key) so a

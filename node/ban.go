@@ -14,6 +14,7 @@ const (
 	banHandshake    = 20 // failed secure/identity handshake (keyed by IP)
 	banBadHeaders   = 34 // served an internally-invalid header chain (keyed by identity)
 	banInvalidBlock = 20 // served a block that fails PoW/structure (keyed by identity)
+	banStalling     = 10 // accepted a block request and never answered it (keyed by identity)
 )
 
 type banbook struct {

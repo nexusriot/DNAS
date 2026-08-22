@@ -17,6 +17,26 @@ const DefaultMempoolSize = 5000
 // transactions are cheap to relay on an idle network but priced out under load.
 const feeFloorMaxMultiplier = 100
 
+// MaxPerSender bounds how many queued transactions one address may have. The
+// nonce-contiguity rule below already stops a sender from queueing work that can
+// never be mined, and the affordability rule stops them queueing more than they
+// can pay for; this is a third, blunter bound so one address cannot occupy the
+// whole pool even when it is rich and its nonces are in order.
+const MaxPerSender = 64
+
+// AccountSource is the confirmed chain state the mempool validates against:
+// which nonce an address is at, and how much it can actually spend right now.
+// *Blockchain implements it.
+//
+// A mempool without one is *permissive* — it can still check everything internal
+// to a transaction, but not whether the sender could ever pay for it. Nodes always
+// bind one (node.New does it), so this only affects tests that exercise the pool
+// in isolation.
+type AccountSource interface {
+	Account(addr string) Account
+	SpendableBalance(addr string) uint64
+}
+
 // Mempool holds validated, not-yet-mined transactions keyed by hash. It is
 // bounded: once full, a new transaction is admitted only if it pays a strictly
 // higher fee than the cheapest one already queued, which it then evicts.
@@ -25,11 +45,24 @@ const feeFloorMaxMultiplier = 100
 // policy — NOT a consensus rule. A transaction below the current floor is
 // refused entry here, but if it reaches a node in a mined block it is still
 // accepted; the floor only governs what this node will queue and gossip.
+//
+// Admission additionally requires that a transaction could *plausibly* be mined
+// (see admissibleLocked): the pool holds, per sender, a contiguous run of nonces
+// starting at the sender's confirmed nonce, whose total cost the sender can
+// afford. Without that rule the pool is free to fill with work that can never be
+// mined — an address holding nothing can sign transactions at nonces 1..N,
+// skipping 0, and they are admitted, never selected, never expire and never pay a
+// fee, evicting everyone's real payments for nothing.
 type Mempool struct {
-	mu          sync.Mutex
-	txs         map[string]Transaction
+	mu  sync.Mutex
+	txs map[string]Transaction
+	// bySender indexes sender -> nonce -> txid, so conflict lookup, the
+	// contiguity check and gap-free eviction are all O(1) rather than a scan.
+	bySender    map[string]map[uint64]string
 	max         int
-	minRelayFee uint64 // base per-byte relay floor when empty; 0 disables the fee floor
+	minRelayFee uint64           // base per-byte relay floor when empty; 0 disables the fee floor
+	accounts    AccountSource    // confirmed state to validate against (may be nil)
+	sigCache    *ValidationCache // shared with the chain, so a signature is verified once (may be nil)
 }
 
 // NewMempool returns an empty mempool with the default size limit and no fee
@@ -44,7 +77,31 @@ func NewMempoolWithPolicy(max int, minRelayFee uint64) *Mempool {
 	if max <= 0 {
 		max = DefaultMempoolSize
 	}
-	return &Mempool{txs: map[string]Transaction{}, max: max, minRelayFee: minRelayFee}
+	return &Mempool{
+		txs:         map[string]Transaction{},
+		bySender:    map[string]map[uint64]string{},
+		max:         max,
+		minRelayFee: minRelayFee,
+	}
+}
+
+// UseAccounts binds the confirmed state the pool validates admissions against.
+// It returns the mempool so it can be chained onto a constructor.
+func (m *Mempool) UseAccounts(src AccountSource) *Mempool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.accounts = src
+	return m
+}
+
+// UseValidationCache binds the signature-verification cache the pool shares with
+// the chain, so a transaction verified on admission costs nothing to verify again
+// when the block carrying it is applied. It returns the mempool for chaining.
+func (m *Mempool) UseValidationCache(c *ValidationCache) *Mempool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sigCache = c
+	return m
 }
 
 // MinFee returns the current dynamic relay-fee floor as a rate (base units PER
@@ -75,12 +132,115 @@ func (m *Mempool) minFeeLocked() uint64 {
 	return m.minRelayFee * (1 + extra)
 }
 
+// insertLocked stores tx under h and indexes it by sender+nonce. m.mu held.
+func (m *Mempool) insertLocked(h string, tx Transaction) {
+	m.txs[h] = tx
+	byNonce := m.bySender[tx.From]
+	if byNonce == nil {
+		byNonce = map[uint64]string{}
+		m.bySender[tx.From] = byNonce
+	}
+	byNonce[tx.Nonce] = h
+}
+
+// deleteLocked removes the transaction stored under h from both indexes. m.mu held.
+func (m *Mempool) deleteLocked(h string) {
+	tx, ok := m.txs[h]
+	if !ok {
+		return
+	}
+	delete(m.txs, h)
+	if byNonce := m.bySender[tx.From]; byNonce != nil {
+		if byNonce[tx.Nonce] == h {
+			delete(byNonce, tx.Nonce)
+		}
+		if len(byNonce) == 0 {
+			delete(m.bySender, tx.From)
+		}
+	}
+}
+
+// txCoinCost is the coin a transaction takes from its sender's spendable
+// balance: an asset move or an issuance pays only the fee (the asset amount comes
+// out of the asset ledger), anything else pays amount + fee.
+func txCoinCost(tx Transaction) uint64 {
+	if tx.IsIssue() || tx.IsAssetTransfer() {
+		return tx.Fee
+	}
+	out, ok := tx.TotalOut()
+	if !ok {
+		return ^uint64(0) // overflowing: unaffordable by construction (CheckTxSanity rejects it)
+	}
+	return out + tx.Fee
+}
+
+// admissibleLocked reports whether tx could plausibly be mined, given the
+// confirmed state and what this sender already has queued. replacing is the hash
+// of the queued transaction tx would replace (replace-by-fee), or "".
+//
+// Two rules, both about the sender rather than the transaction:
+//
+//   - No nonce gaps. The queue for a sender must stay a contiguous run starting
+//     at their confirmed nonce, so every entry in it is reachable. A transaction
+//     at nonce confirmed+5 with nothing in between can never be mined, and would
+//     otherwise sit in the pool forever without ever paying its fee.
+//   - Affordability. The sender's whole queue, this transaction included, must fit
+//     in their spendable balance — otherwise the tail is unminable for the same
+//     reason, just via the balance check instead of the nonce check.
+//
+// Requires a bound AccountSource; without one there is nothing to check against
+// and everything is admissible. m.mu held.
+func (m *Mempool) admissibleLocked(tx Transaction, replacing string) error {
+	if m.accounts == nil {
+		return nil
+	}
+	queued := m.bySender[tx.From]
+	confirmed := m.accounts.Account(tx.From).Nonce
+	if tx.Nonce < confirmed {
+		return fmt.Errorf("nonce %d already used (account is at %d)", tx.Nonce, confirmed)
+	}
+	if replacing == "" {
+		if len(queued) >= MaxPerSender {
+			return fmt.Errorf("sender already has %d queued transactions (max %d)", len(queued), MaxPerSender)
+		}
+		// The next free slot is the confirmed nonce plus the contiguous run already
+		// queued. Anything above it would leave a gap.
+		next := confirmed
+		for queued[next] != "" {
+			next++
+		}
+		if tx.Nonce != next {
+			return fmt.Errorf("nonce %d leaves a gap: the next usable nonce for this sender is %d", tx.Nonce, next)
+		}
+	}
+	// Affordability across the sender's whole queue. Overflow is impossible here:
+	// CheckTxSanity has already rejected an amount+fee that wraps, and the running
+	// total is compared against a balance every step, so it cannot exceed it.
+	spendable := m.accounts.SpendableBalance(tx.From)
+	total := txCoinCost(tx)
+	for _, h := range queued {
+		if h == replacing {
+			continue
+		}
+		total += txCoinCost(m.txs[h])
+		if total > spendable {
+			break
+		}
+	}
+	if total > spendable {
+		return fmt.Errorf("sender cannot afford its queued transactions: %d needed, %d spendable", total, spendable)
+	}
+	return nil
+}
+
 // Add verifies the transaction's signature and stores it. Returns whether it
 // was newly added. Behaviour:
 //   - an exact duplicate (same hash) is a no-op: (false, nil);
 //   - a transaction with the same sender and nonce as one already queued
 //     replaces it if and only if it pays a strictly higher fee (replace-by-fee /
 //     fee-bumping); a same-or-lower fee is rejected with an error;
+//   - a transaction that could never be mined — a nonce gap, or more than the
+//     sender can afford — is refused (see admissibleLocked);
 //   - otherwise, if the pool is full, it is admitted only by out-bidding the
 //     cheapest queued transaction, which it evicts.
 func (m *Mempool) Add(tx Transaction) (bool, error) {
@@ -107,40 +267,75 @@ func (m *Mempool) Add(tx Transaction) (bool, error) {
 		return false, fmt.Errorf("fee %d below current relay floor %d/byte × %d bytes = %d",
 			tx.Fee, floor, size, floor*uint64(size))
 	}
-	if err := tx.VerifySignature(); err != nil {
+	h := tx.Hash()
+	if _, ok := m.Get(h); ok {
+		return false, nil
+	}
+	if err := m.admissible(tx); err != nil {
+		return false, err
+	}
+	if err := m.verify(tx); err != nil {
 		return false, err
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	h := tx.Hash()
 	if _, ok := m.txs[h]; ok {
 		return false, nil
 	}
 
 	// Replace-by-fee: a conflicting tx (same sender+nonce) may only be replaced
 	// by a higher fee.
-	if oldHash, old, ok := m.conflictLocked(tx); ok {
+	oldHash, old, conflict := m.conflictLocked(tx)
+	// Re-check admissibility under the lock (the tip may have moved while we were
+	// verifying), now knowing which entry a replacement would displace.
+	if err := m.admissibleLocked(tx, oldHash); err != nil {
+		return false, err
+	}
+	if conflict {
 		if tx.Fee <= old.Fee {
 			return false, errors.New("replacement fee not higher than existing transaction")
 		}
-		delete(m.txs, oldHash)
-		m.txs[h] = tx
+		m.deleteLocked(oldHash)
+		m.insertLocked(h, tx)
 		return true, nil
 	}
 
-	// When full, admit only by out-bidding the lowest fee *rate* (fee per byte),
-	// which this transaction then evicts — so block space, a per-byte resource, is
-	// allocated to the highest-paying transactions per byte.
+	// When full, admit only by out-bidding the cheapest evictable transaction (fee
+	// per byte), which this transaction then displaces — so block space, a per-byte
+	// resource, is allocated to the highest-paying bytes.
 	if len(m.txs) >= m.max {
-		minHash, minRate := m.lowestRateLocked()
-		if txRate(tx) <= minRate {
+		victimHash, victimRate := m.evictionCandidateLocked()
+		if txRate(tx) <= victimRate {
 			return false, errors.New("mempool full and fee rate too low")
 		}
-		delete(m.txs, minHash)
+		victim := m.txs[victimHash]
+		if victim.From == tx.From && victim.Nonce < tx.Nonce {
+			// The only room to be had is this sender's own predecessor. Taking it would
+			// strand the arriving transaction behind the gap it created, so it loses.
+			return false, errors.New("mempool full: this sender cannot displace its own queue to add to it")
+		}
+		m.deleteLocked(victimHash)
 	}
-	m.txs[h] = tx
+	m.insertLocked(h, tx)
 	return true, nil
+}
+
+// verify checks tx's authorization through the shared cache, so the block that
+// later carries it does not pay for the same signatures again.
+func (m *Mempool) verify(tx Transaction) error {
+	m.mu.Lock()
+	cache := m.sigCache
+	m.mu.Unlock()
+	return cache.Verify(tx)
+}
+
+// admissible runs admissibleLocked under the lock, for the pre-verification
+// check (so an inadmissible transaction costs no signature verification).
+func (m *Mempool) admissible(tx Transaction) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.admissibleLocked(tx, m.bySender[tx.From][tx.Nonce])
 }
 
 // txRate is a transaction's fee per byte, used only to rank and evict within the
@@ -153,12 +348,11 @@ func txRate(tx Transaction) float64 {
 // conflictLocked finds a queued transaction with the same sender and nonce as
 // tx (a replace-by-fee candidate). The caller must hold m.mu.
 func (m *Mempool) conflictLocked(tx Transaction) (hash string, existing Transaction, ok bool) {
-	for h, t := range m.txs {
-		if t.From == tx.From && t.Nonce == tx.Nonce {
-			return h, t, true
-		}
+	h, found := m.bySender[tx.From][tx.Nonce]
+	if !found {
+		return "", Transaction{}, false
 	}
-	return "", Transaction{}, false
+	return h, m.txs[h], true
 }
 
 // PruneExpired removes transactions that can no longer be included in any block
@@ -169,21 +363,80 @@ func (m *Mempool) PruneExpired(tipHeight uint64) int {
 	n := 0
 	for h, tx := range m.txs {
 		if tx.IsExpiredAt(tipHeight + 1) { // the next block is at tipHeight+1
-			delete(m.txs, h)
+			m.deleteLocked(h)
 			n++
 		}
 	}
 	return n
 }
 
-// lowestRateLocked returns the hash and fee rate (fee per byte) of the queued
-// transaction paying the least per byte. The caller must hold m.mu and the pool
+// Reconcile drops everything the pool should no longer be holding, and returns
+// how many entries it removed. It is the counterpart to the admission rules: a
+// new block moves nonces and balances, so entries that were admissible when they
+// arrived may no longer be mineable. Per sender it keeps the contiguous,
+// affordable run starting at the confirmed nonce and drops the rest.
+//
+// Without this, a reorg or a block from another sender's payment could leave the
+// pool holding permanently unmineable work — occupying slots that real payments
+// need. Nodes call it after every tip change.
+func (m *Mempool) Reconcile(tipHeight uint64) int {
+	dropped := m.PruneExpired(tipHeight)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.accounts == nil {
+		return dropped
+	}
+	for sender, byNonce := range m.bySender {
+		confirmed := m.accounts.Account(sender).Nonce
+		spendable := m.accounts.SpendableBalance(sender)
+		nonces := make([]uint64, 0, len(byNonce))
+		for n := range byNonce {
+			nonces = append(nonces, n)
+		}
+		sort.Slice(nonces, func(i, j int) bool { return nonces[i] < nonces[j] })
+		want := confirmed
+		var total uint64
+		for _, n := range nonces {
+			h := byNonce[n]
+			keep := n == want
+			if keep {
+				if total += txCoinCost(m.txs[h]); total > spendable {
+					keep = false
+				}
+			}
+			if !keep {
+				m.deleteLocked(h)
+				dropped++
+				continue
+			}
+			want++
+		}
+	}
+	return dropped
+}
+
+// evictionCandidateLocked returns the hash and fee rate of the cheapest queued
+// transaction that may be dropped. Only the LAST entry in a sender's nonce run is
+// eligible: dropping from the middle would strand every higher nonce behind a gap
+// it can never cross, which is precisely the state the admission rules exist to
+// prevent. Among those, the lowest fee per byte goes first, so scarce space still
+// ends up with the highest-paying bytes. The caller must hold m.mu and the pool
 // must be non-empty.
-func (m *Mempool) lowestRateLocked() (hash string, rate float64) {
+func (m *Mempool) evictionCandidateLocked() (hash string, rate float64) {
 	first := true
-	for h, tx := range m.txs {
-		if r := txRate(tx); first || r < rate {
-			rate, hash, first = r, h, false
+	for _, byNonce := range m.bySender {
+		var top uint64
+		var topHash string
+		for nonce, h := range byNonce {
+			if topHash == "" || nonce > top {
+				top, topHash = nonce, h
+			}
+		}
+		if topHash == "" {
+			continue
+		}
+		if r := txRate(m.txs[topHash]); first || r < rate {
+			rate, hash, first = r, topHash, false
 		}
 	}
 	return hash, rate
@@ -213,7 +466,7 @@ func (m *Mempool) Remove(txs []Transaction) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, tx := range txs {
-		delete(m.txs, tx.Hash())
+		m.deleteLocked(tx.Hash())
 	}
 }
 
@@ -314,12 +567,13 @@ func (m *Mempool) Select(bc *Blockchain, max int) []Transaction {
 		case tx.IsAssetTransfer():
 			return s.balance >= tx.Fee && s.assets[tx.AssetID] >= tx.Amount
 		default:
-			return s.balance >= tx.Amount+tx.Fee
+			return s.balance >= txCoinCost(tx)
 		}
 	}
 
 	var selected []Transaction
 	weight := 0 // running total of selected transaction bytes (<= MaxBlockBytes)
+	ops := 0    // running total of verification cost (<= MaxBlockVerifyOps)
 	used := make(map[string]bool)
 	for len(selected) < max {
 		var candidates []Transaction
@@ -335,6 +589,9 @@ func (m *Mempool) Select(bc *Blockchain, max int) []Transaction {
 				continue
 			}
 			if weight+tx.Size() > MaxBlockBytes { // wouldn't fit the block's byte budget
+				continue
+			}
+			if ops+VerifyOps(tx) > MaxBlockVerifyOps { // nor its verification budget
 				continue
 			}
 			if ready(tx) {
@@ -362,16 +619,21 @@ func (m *Mempool) Select(bc *Blockchain, max int) []Transaction {
 			r.assets[pick.AssetID] += pick.Amount
 			cache[pick.To] = r
 		default:
-			s.balance -= pick.Amount + pick.Fee
+			s.balance -= txCoinCost(pick)
 			cache[pick.From] = s
-			r := get(pick.To)
-			r.balance += pick.Amount
-			cache[pick.To] = r
+			// Credit every recipient, re-reading the simulated account each time so a
+			// repeated recipient (or the sender paying itself) accumulates correctly.
+			for _, o := range pick.outputs() {
+				r := get(o.To)
+				r.balance += o.Amount
+				cache[o.To] = r
+			}
 		}
 
 		selected = append(selected, pick)
 		used[pick.Hash()] = true
 		weight += pick.Size()
+		ops += VerifyOps(pick)
 	}
 	return selected
 }
