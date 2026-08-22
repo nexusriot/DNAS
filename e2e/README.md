@@ -8,7 +8,7 @@ still passes.
 
 ```sh
 make e2e          # against a binary built from the working tree
-make e2e-docker   # the same suite, isolated in a container (needs only Docker)
+make e2e-docker   # the same suite, hermetically, in a container (needs only Docker)
 ```
 
 They are behind the `e2e` build tag, so `make test` and `go test ./core/...`
@@ -28,11 +28,50 @@ Every test is self-contained and leaves nothing behind:
 - **Nodes** are stopped with SIGTERM through `t.Cleanup`, which also exercises the
   graceful-shutdown path.
 
-`make e2e-docker` adds a fourth layer: the binary is compiled and the suite runs
-entirely inside the container, so the host needs no Go toolchain and every
-listener lives in the container's own network namespace. See
-[Dockerfile](Dockerfile); [.dockerignore](../.dockerignore) keeps local state
-(`chain.db`, `wallet.json`) out of the build context.
+That is enough for the suite to be *repeatable* on a developer's machine. It is
+not enough for it to be *hermetic*: run it on the host and the result still
+depends on which Go toolchain is installed, what the module proxy serves, and
+what the network lets through.
+
+## Hermetic runs
+
+`make e2e-docker` closes that gap. The [Dockerfile](Dockerfile) compiles both the
+`dnas` binary and the test binary from this tree at image build time, and the
+runtime image holds nothing else — no toolchain, no sources, no build cache:
+
+| Input | How it is pinned |
+|-------|------------------|
+| Toolchain | base images pinned by digest, so every machine compiles with the same bytes |
+| Dependencies | `GOPROXY=off`, `GOTOOLCHAIN=local` — a stray dependency fails the build instead of being downloaded |
+| Test binary | compiled in the build stage (`go test -c`), so a run executes only what the build produced and Go's test cache cannot serve a stale result |
+| Network | the run gets `--network none`: nodes talk over the container's own loopback, and nothing can reach a host, peer or proxy outside it |
+| Filesystem | `--read-only` root plus a `tmpfs` for `TMPDIR`; `$HOME` points into the read-only root, so a test that writes there fails loudly |
+| Privileges | non-root user, `--cap-drop ALL`, `--security-opt no-new-privileges` |
+
+[.dockerignore](../.dockerignore) keeps local state (`chain.db`, `wallet.json`)
+and everything the image does not compile out of the build context, so the image
+is a function of the source and nothing else.
+
+That the build fetches nothing is checkable, not just claimed — with the base
+images already pulled:
+
+```sh
+docker build --network none --no-cache -f e2e/Dockerfile -t dnas-e2e .
+```
+
+Useful variations:
+
+```sh
+make e2e-docker E2E_ARGS='-test.run TestReorg'   # one test
+make e2e-docker E2E_IMAGE=dnas-e2e:pr-42         # tag the image
+make e2e-docker-shell                            # poke around inside the image
+```
+
+Bumping the toolchain is deliberate: change the tag in the Dockerfile, then
+`docker pull golang:<tag>` and
+`docker image inspect golang:<tag> --format '{{index .RepoDigests 0}}'`, and
+paste the digest back. The digests are multi-arch manifest lists, so amd64 and
+arm64 hosts resolve the same pin.
 
 ## What is covered
 

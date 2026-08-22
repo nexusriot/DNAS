@@ -1022,7 +1022,10 @@ All in [`core/params.go`](core/params.go). Every node must agree on these.
   on breaks the unit tests cannot see. Each node gets a kernel-assigned port and
   its own temp directory, and runs in regtest so blocks are mined on demand
   (deterministic heights, no race with a miner). `make e2e-docker` runs the same
-  suite entirely inside a container, which is how CI runs it.
+  suite hermetically — both binaries compiled at image build time from pinned,
+  digest-locked base images with `GOPROXY=off`, then run with `--network none`
+  on a read-only root as a non-root user — which is how CI runs it. The host
+  supplies Docker and nothing else, and a red run can only be the source.
 - **End-to-end demo** (`scripts/demo.sh`) runs a three-node network exercising
   auth, discovery, a converging transfer, expiry, the fee floor, multisig, HD,
   and SPV.

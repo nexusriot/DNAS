@@ -1,7 +1,10 @@
-# Keep the e2e build context to source only. Two reasons beyond speed: a stale
-# chain.db or peers.json copied into the image would make a "fresh" node in the
-# container start with someone else's state, and wallet.json is a private key
-# that has no business inside an image.
+# Keep the e2e build context to the source the image actually builds. Two
+# reasons beyond speed: a stale chain.db or peers.json copied into the image
+# would make a "fresh" node in the container start with someone else's state,
+# and wallet.json is a private key that has no business inside an image. What
+# reaches the build is what the image is a function of, so anything the build
+# does not compile is excluded — the fewer inputs, the more a rebuild can be
+# trusted to reproduce.
 
 .git
 .github
@@ -12,7 +15,6 @@ dist/
 /dnas
 /dnas-tui
 /dnas-race
-tui/tui
 
 # Node/wallet state from local runs
 *.db
@@ -27,6 +29,11 @@ bans.json
 mempool.json
 spvwallet.json
 node.json
+
+# Not part of the e2e image: tui/ is its own module with external dependencies
+# and is absent from go.work, gui/ is Python. Neither is compiled here.
+gui/
+tui/
 
 # Editor / tooling noise
 .claude

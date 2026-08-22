@@ -12,10 +12,20 @@ GOMODS    := ./core/... ./node/... ./api/... ./cmd/... ./wallet/...
 PLATFORMS ?= linux/amd64 linux/arm64
 ARCHES    ?= amd64 arm64
 
+# Containerized e2e. The run gets its own loopback and nothing else: no network,
+# no writable filesystem outside a tmpfs for the nodes' data directories, no
+# privileges. Whatever passes in there passed without touching the host, so a
+# green run means the product works, not that the machine helped.
+E2E_IMAGE ?= dnas-e2e
+E2E_ARGS  ?=
+E2E_DOCKER_RUN := --rm --init --network none --read-only \
+	--tmpfs /tmp:rw,noexec,nosuid,nodev,size=512m \
+	--cap-drop ALL --security-opt no-new-privileges --pids-limit 512
+
 # Pass computed settings down to the build/packaging scripts.
 export VERSION PLATFORMS ARCHES GO
 
-.PHONY: all build dnas tui test test-race e2e e2e-docker vet fmt dist deb demo install uninstall clean version help
+.PHONY: all build dnas tui test test-race e2e e2e-docker e2e-docker-shell vet fmt dist deb demo install uninstall clean version help
 
 all: build
 
@@ -50,10 +60,15 @@ test-race:
 e2e:
 	$(GO) test -tags e2e -count=1 -timeout 20m ./e2e/...
 
-## e2e-docker: run the same suite isolated in a container (needs only Docker)
+## e2e-docker: run the same suite hermetically in a container (needs only Docker)
 e2e-docker:
-	docker build -f e2e/Dockerfile -t dnas-e2e .
-	docker run --rm dnas-e2e
+	docker build -f e2e/Dockerfile -t $(E2E_IMAGE) .
+	docker run $(E2E_DOCKER_RUN) $(E2E_IMAGE) -test.v -test.timeout=20m $(E2E_ARGS)
+
+## e2e-docker-shell: drop into the e2e image to poke at it by hand
+e2e-docker-shell:
+	docker build -f e2e/Dockerfile -t $(E2E_IMAGE) .
+	docker run $(E2E_DOCKER_RUN) -it --entrypoint /bin/sh $(E2E_IMAGE)
 
 ## vet: go vet across all modules
 vet:

@@ -240,7 +240,7 @@ make build          # compile dnas + dnas-tui into bin/ (version stamped from gi
 make test           # go tests (all modules + tui) + the GUI tests
 make test-race      # the same under the race detector
 make e2e            # black-box end-to-end suite: drives the real binary (see e2e/)
-make e2e-docker     # the same suite isolated in a container (needs only Docker)
+make e2e-docker     # the same suite, hermetically, in a container (needs only Docker)
 make dist           # cross-compiled release tarballs (linux/amd64 + arm64) → dist/
 make deb            # .deb packages (amd64 + arm64) → dist/
 make install        # install dnas + dnas-tui to /usr/local/bin (PREFIX overridable)
