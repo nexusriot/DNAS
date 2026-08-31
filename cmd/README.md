@@ -19,6 +19,7 @@ dnas spv [-api URL] wallet -key FILE issue <ticker> <supply>                mint
 dnas spv [-api URL] wallet -key FILE -asset ID send <to> <amount>           transfer a native asset
 dnas fastsync [-api URL] [-checkpoint H:HASH] [addr...]                     bootstrap state from a verified snapshot
 dnas miner -api URL -address ADDR [-once]                                   external miner (template -> mine -> submit)
+dnas supply [-api URL]           minted / burned / circulating + the conservation check
 dnas version                     print the build version (stamped via -ldflags)
 ```
 

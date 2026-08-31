@@ -133,17 +133,17 @@ type Transaction struct {
     Outputs          []Output        // OR pay many recipients at once (see below)
     AssetID          string          // move this native asset instead of coin (§4)
     Issue            *AssetIssue     // OR mint a new native asset to From (§4)
-    Signature        []byte          // single-key authorization
+    PubKey, Signature string         // single-key authorization (both hex)
     Multisig         *MultisigScript // OR multisig authorization
-    Signatures       [][]byte
+    Signatures       []string        // hex
     HTLC             *HTLCScript     // OR hash-time-locked-contract authorization
-    Preimage         []byte          // revealed on the HTLC claim branch
+    Preimage         string          // hex; revealed on the HTLC claim branch
 }
 ```
 
 **Signing.** The signed message (`signingBytes`) covers every consensus-relevant
-field (From/To/Amount/Fee/Nonce/Expiry/LockUntil/AssetID/Issue/Memo) but **not**
-the signature fields. Crucially it is *identical* for single-key and multisig
+field (From/To/Amount/Fee/Nonce/Expiry/LockUntil/AssetID/Issue/Memo, and Outputs
+when present) but **not** the signature fields. Crucially it is *identical* for single-key and multisig
 transactions, so the two authorization paths sign the same bytes. (A native-asset
 transfer or issuance is an ordinary single-key spend by `From`; the fee is always
 paid in coin — see §4.)
@@ -209,7 +209,7 @@ to add to a running chain:
   canonical encoding *only when present* ([core/codec.go](core/codec.go)), so a
   single-recipient transaction's signing bytes, txid and fee-bearing size are
   byte-for-byte what they always were, and a stored chain still replays.
-- **The rule is height-activated.** `UpgradeMultiOutput` (§16) gates acceptance,
+- **The rule is height-activated.** `UpgradeMultiOutput` (§8) gates acceptance,
   so the whole network starts allowing the new form at one agreed height instead
   of some nodes treating a block as valid while others reject it. Operators
   schedule it with `-upgrades multioutput:HEIGHT`.
@@ -525,8 +525,9 @@ trustworthy as the balances themselves.
   so it stays near the base on an idle devnet and reaches `base·100` when full.
   A transaction below the current floor is refused entry, but this only governs
   what *this* node queues and gossips — a block that includes an under-floor
-  transaction is still valid. This is intentionally **not** an EIP-1559 consensus
-  base fee (which would need header/SPV/supply surgery).
+  transaction is still valid. It is deliberately separate from the consensus base
+  fee (§9): that one is committed in the header, burned, and decides block
+  *validity*; this one only decides what a node is willing to hold and relay.
 - **Nonce-aware, rate-ordered, byte-bounded selection.** `Select` greedily builds
   a valid sequence for the next block: each transaction must have its sender's next
   nonce, cover its per-byte base fee, and be affordable *from spendable balance*
@@ -535,7 +536,7 @@ trustworthy as the balances themselves.
   ready candidates, and selection stops at `MaxBlockBytes` of total size, the
   `MaxBlockVerifyOps` verification budget (§5), and the transaction-count cap. It also re-applies `CheckTxSanity` and
   `checkTxAtHeight` for the height being built, so a rule that activates *after*
-  admission (the dust limit, §16) cannot make the miner select a transaction its
+  admission (the dust limit, §8) cannot make the miner select a transaction its
   own consensus rules would then reject.
 - **Expiry pruning** drops transactions that can no longer be mined.
 - **A doomed candidate is never hashed.** `buildBlockFor` computes the candidate's
@@ -1047,10 +1048,12 @@ the default runs.
   with `dpkg-deb --root-owner-group`.
 - The build **version is stamped** via `-ldflags "-X main.version=…"` (default
   from `git describe`) and reported by `dnas version`.
-- **CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs a gofmt
-  check, `make vet`, `make build`, and `make test-race` on every push and pull
-  request, and on a version tag (`v*`) also runs `make dist` + `make deb` and
-  uploads the tarballs and `.deb`s as build artifacts.
+- **CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs two jobs on
+  every push and pull request: a gofmt check plus `make vet`, `make build` and
+  `make test-race`, and — in parallel — the containerized black-box suite via
+  `make e2e-docker` (§19). On a version tag (`v*`), and only if both pass, a
+  release job runs `make dist` + `make deb` and uploads the tarballs and `.deb`s
+  as build artifacts.
 
 See [scripts/README.md](scripts/README.md) for the script details.
 

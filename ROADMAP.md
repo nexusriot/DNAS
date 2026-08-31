@@ -83,7 +83,7 @@ sections matter most for "toy → real".
   latency/bandwidth win over shipping full blocks, and it reduces orphan rates.
 - **`[M/L]` Outbound address manager with ASN/group diversity + DNS seeds.**
   Inbound eclipse caps exist (total + per-/16 group), but outbound peer selection
-  and bootstrap are still manual (`-peer`). A tried/new addrman that buckets by
+  and bootstrap are still manual (`-peers`). A tried/new addrman that buckets by
   ASN/network group, plus DNS seeds, closes the outbound eclipse vector (§21) and
   removes hand-configured bootstrapping.
 - **`[M]` Authenticated / Tor-friendly transport.** The open handshake is anonymous
@@ -163,8 +163,12 @@ sections matter most for "toy → real".
 
 ## 6. Ops, tooling & observability
 
-- **`[S/M]` Prometheus metrics + Grafana dashboard.** Export height, mempool depth,
-  peer count, reorg/ban counters, and block interval, and ship a dashboard JSON.
+- **`[S]` Finish the Prometheus metrics + a Grafana dashboard.** `GET /metrics`
+  already exports height, difficulty, mempool depth, peer count, the relay floor,
+  the base fee and the mining flag ([api/api.go](api/api.go)). What is missing is
+  the *counters* — reorgs, bans, orphans, blocks mined, block interval — which
+  need the node to keep them rather than the handler to read a gauge, plus a
+  dashboard JSON to ship alongside.
 - **`[M]` JSON-RPC 2.0 interface.** The HTTP API is REST; a bitcoind-style JSON-RPC
   surface eases integration with existing tooling and block explorers.
 - **`[S]` systemd unit + RPM + wider release matrix.** A `.deb` and tagged CI

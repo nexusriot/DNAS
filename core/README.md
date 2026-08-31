@@ -90,8 +90,11 @@ Module `github.com/nexusriot/DNAS/core` — the ledger and consensus rules.
   transaction's hash (txid), its fee-determining `Size()`, and its signing bytes,
   so those are reproducible by any implementation (not tied to `encoding/json`).
 - `upgrade.go` — height-activated consensus upgrades: `SetUpgradeHeight` /
-  `IsUpgradeActive(name, height)` gate a rule change to a coordinated flag-day
-  (`UpgradeDustLimit` is the worked example, guarded in `applyTxsAndCoinbase`).
+  `IsUpgradeActive(name, height)` gate a rule change to a coordinated flag-day.
+  Two are defined: `UpgradeMultiOutput` (multi-recipient transfers) and
+  `UpgradeDustLimit` (the worked example); both are guarded in `checkTxAtHeight`,
+  so the mempool, `Select` and block application enforce them identically.
+  `KnownUpgrade`/`Upgrades` let the CLI reject a misspelled name at startup.
 - `work.go` — cumulative proof-of-work (`BlockWork = 2^256/(target+1)`,
   `ChainWork`). Fork choice is greatest cumulative work, with equal-work ties
   broken deterministically by the smaller tip hash so every node converges.

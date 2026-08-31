@@ -206,11 +206,11 @@ it would go next, see [ROADMAP.md](ROADMAP.md).
   and restores them on the next start, so a graceful restart resumes warm (bans
   no longer reset). The chain itself remains authoritative and re-syncs from
   peers regardless.
-- **Optional API auth.** Setting `DNAS_API_TOKEN` locks the mutating endpoints
-  (`/send`, `/tx`, `/mine`) behind an `Authorization: Bearer <token>` header
-  (constant-time compared); read endpoints stay open. Unset, the API is fully
-  open — the localhost/toy default. All bundled clients send the token when the
-  env var is set.
+- **Optional API auth.** Setting `DNAS_API_TOKEN` locks every mutating endpoint
+  (`/send`, `/tx`, `/mine`, `/generate`, `/submitblock`) behind an
+  `Authorization: Bearer <token>` header (constant-time compared); read endpoints
+  stay open. Unset, the API is fully open — the localhost/toy default. All
+  bundled clients send the token when the env var is set.
 
 ## Layout
 
@@ -225,11 +225,15 @@ core/               module .../core   — transactions, blocks, chain state, wor
 node/               module .../node   — encrypted P2P, discovery, gossip, sync, miner       (→ core, wallet)
 api/                module .../api    — HTTP API                                            (→ core, node)
 cmd/                module .../cmd    — CLI/daemon; main package in cmd/dnas                 (→ all)
+e2e/                module .../e2e    — black-box suite driving the built binary (build tag `e2e`)
+tui/                terminal client — its OWN module, outside go.work (external deps)
+gui/                desktop client — Python / PyQt6
 scripts/demo.sh     three-node end-to-end demo
 ```
 
 Dependency direction: `wallet → core → node → api → cmd` (no cycles). Each
-module has its own `README.md`.
+directory above has its own `README.md`. The two clients (`tui/`, `gui/`) import
+no DNAS package — they speak only the HTTP API.
 
 ## Build & test
 
@@ -321,7 +325,7 @@ flushes the store). When stdin is a terminal you also get a REPL:
 
 ```
 dnas> address
-dnas> send <address> <amount> [fee]
+dnas> send <address> <amount> [fee] [expiry-height]
 dnas> balance [address]
 dnas> info | peers | mempool
 ```
@@ -337,7 +341,7 @@ go run ./cmd/dnas node -listen :3001 -api :8081 -peers localhost:3000 -mine \
 
 | Method | Path              | Purpose                                                       |
 |--------|-------------------|---------------------------------------------------------------|
-| GET    | `/info`           | height, tip, next difficulty, work, mempool, min relay fee, base fee, peers |
+| GET    | `/info`           | height, tip, next difficulty, work, mempool, min relay fee, base fee, peers, mining |
 | GET    | `/chain`          | the full chain                                                |
 | GET    | `/balance/{addr}` | balance (raw + formatted)                                     |
 | GET    | `/account/{addr}` | balance, nonce, and any native-asset balances                 |
@@ -348,7 +352,7 @@ go run ./cmd/dnas node -listen :3001 -api :8081 -peers localhost:3000 -mine \
 | GET    | `/address`        | this node's wallet address                                    |
 | GET    | `/estimatefee`    | `?blocks=N` → recommended fee **rate** per byte (base fee + estimated tip) |
 | GET    | `/blocktemplate`  | `?address=ADDR` → candidate block for an external miner       |
-| POST   | `/submitblock`    | submit an externally-mined block                              |
+| POST   | `/submitblock` 🔒 | submit an externally-mined block                          |
 | GET    | `/headers`        | all block headers (SPV)                                       |
 | GET    | `/header/{index}` | one block header (SPV)                                        |
 | GET    | `/block/{index}`  | one full block body (light clients fetch only flagged blocks) |
@@ -366,7 +370,7 @@ go run ./cmd/dnas node -listen :3001 -api :8081 -peers localhost:3000 -mine \
 | POST   | `/generate` 🔒    | `{"n":N}` — regtest only: mine N blocks on demand             |
 | POST   | `/multisig/address` | `{"threshold","pubkeys":[…]}` → M-of-N multisig address (stateless helper) |
 | POST   | `/htlc/address`   | `{"hash","recipient","sender","timeout"}` → HTLC address (stateless helper) |
-| POST   | `/wallet/hd`      | `{"mnemonic"?,"count"?}` → BIP39 mnemonic + derived HD addresses (stateless helper) |
+| POST   | `/wallet/hd`      | `{"mnemonic"?,"passphrase"?,"count"?}` → BIP39 mnemonic + derived HD addresses (stateless helper) |
 
 🔒 = requires `Authorization: Bearer $DNAS_API_TOKEN` when that env var is set (otherwise open).
 

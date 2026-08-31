@@ -369,8 +369,9 @@ Run `./scripts/htlc-demo.sh` to watch both branches settle.
 ## 8f. Lock down the API
 
 By default the API is fully open (a localhost toy). Set a token to require it on
-the **write** endpoints (`/send`, `/tx`, `/mine`, `/generate`); reads stay open,
-and all bundled clients send it automatically from the same env var:
+the **write** endpoints (`/send`, `/tx`, `/mine`, `/generate`, `/submitblock`);
+reads stay open, and all bundled clients send it automatically from the same env
+var:
 
 ```sh
 export DNAS_API_TOKEN='a-long-random-secret'

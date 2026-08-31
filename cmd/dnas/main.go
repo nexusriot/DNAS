@@ -72,7 +72,9 @@ func usage() {
 Usage:
   dnas node [flags]              run a node (default)
   dnas wallet new [-o FILE]      create a wallet
-  dnas wallet address [-o FILE]
+  dnas wallet address|pubkey [-o FILE]
+  dnas wallet mnemonic|restore|addresses      BIP39 backup + HD addresses
+  dnas wallet multisig -threshold M -pubkeys a,b,c   M-of-N multisig address
   dnas spv [-api URL] sync            verify the header chain (light client)
   dnas spv [-api URL] verify <txhash> prove a payment is in the chain
   dnas spv [-api URL] scan <address>  find/prove non-inclusion of an address
@@ -94,14 +96,17 @@ Node flags:
   -api ADDR       HTTP API address (default ":8080")
   -peers LIST     comma-separated seed peer addresses
   -wallet FILE    wallet key file, created if missing (default "wallet.json")
-  -db FILE        blockchain storage file (default "chain.json")
-  -netkey KEY     pre-shared network key; peers must match (default "dnas-devnet")
+  -db FILE        blockchain append-only store file (default "chain.db")
+  -netkey KEY     pre-shared key for a PRIVATE net; empty (default) = open/permissionless
   -maxpeers N     maximum outbound peer connections (default 8)
   -mempool N      max pending transactions (default 5000)
+  -minrelayfee N  base min relay fee, base units per byte; rises with load (default 10)
   -mine           enable mining
   -regtest        regtest mode: mine blocks on demand via POST /generate
+  -dandelion      Dandelion++ stem/fluff relay for origin privacy (default true)
   -checkpoints L  finality checkpoints, comma-separated height:hash pairs
-  -upgrades L     consensus upgrade activations, comma-separated name:height pairs`)
+  -upgrades L     consensus upgrade activations, comma-separated name:height pairs
+  -config FILE    JSON config file (flags override its values)`)
 }
 
 // walletPassphrase reads the optional at-rest encryption passphrase from the
