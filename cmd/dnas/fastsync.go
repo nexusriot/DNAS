@@ -23,6 +23,8 @@ func runFastSync(args []string) {
 	heightFlag := fs.Int("height", -1, "snapshot height (default: the server's latest safe height)")
 	_ = fs.Parse(args)
 	base := ensureHTTP(*api)
+	// The genesis hash this verifies against is network-bound, so adopt the node's.
+	adoptNetwork(base)
 
 	// 1. Fetch and PoW-verify the whole header chain (cheap — no bodies).
 	headers, err := fetchHeaders(base)

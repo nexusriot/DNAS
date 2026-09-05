@@ -47,6 +47,13 @@ func mineOnto(t *testing.T, chain *core.Blockchain, miner string, txs []core.Tra
 // serves its API via httptest.
 func testServer(t *testing.T) (*httptest.Server, *core.Blockchain, *wallet.Wallet) {
 	t.Helper()
+	return testServerWith(t, nil)
+}
+
+// testServerWith is testServer with a chance to configure the API server before
+// it starts serving (the rate limit, so far).
+func testServerWith(t *testing.T, configure func(*api.Server)) (*httptest.Server, *core.Blockchain, *wallet.Wallet) {
+	t.Helper()
 	w, err := wallet.New()
 	if err != nil {
 		t.Fatal(err)
@@ -54,7 +61,11 @@ func testServer(t *testing.T) (*httptest.Server, *core.Blockchain, *wallet.Walle
 	chain := core.NewBlockchain()
 	mineOnto(t, chain, w.Address(), nil) // fund the wallet with block 1's reward
 	n := node.New(node.Config{ListenAddr: ":0"}, chain, core.NewMempool(), w)
-	srv := httptest.NewServer(api.New(n).Handler())
+	s := api.New(n)
+	if configure != nil {
+		configure(s)
+	}
+	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 	return srv, chain, w
 }

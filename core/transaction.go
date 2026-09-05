@@ -56,6 +56,35 @@ type Transaction struct {
 	// Signature) or a refund (sender's Signature, valid only from Timeout on).
 	HTLC     *HTLCScript `json:"htlc,omitempty"`
 	Preimage string      `json:"preimage,omitempty"` // hex; present on the claim path
+
+	// Time-delayed vault authorization: when set, From is the hash of this script
+	// and the spend is either by the cold (recovery) key at any height, or by the
+	// hot key once the chain reaches Unlock.
+	Vault *VaultScript `json:"vault,omitempty"`
+
+	// Fee sponsorship. When FeePayer is set, the FEE is charged to that account
+	// instead of the sender's, so an address holding no coin at all can still
+	// transact — someone else pays for its block space. The sender signs FeePayer
+	// (it is part of the signing bytes) and the sponsor counter-signs the same
+	// bytes with FeePayerPubKey, which must derive FeePayer.
+	//
+	// The sponsor has no nonce of its own: the sender's nonce already makes the
+	// transaction unrepeatable, and the sponsor's signature covers the sender and
+	// that nonce, so a sponsorship cannot be lifted onto a different transfer or
+	// replayed once the nonce is spent.
+	FeePayer       string `json:"fee_payer,omitempty"`
+	FeePayerPubKey string `json:"fee_payer_pubkey,omitempty"`
+	FeePayerSig    string `json:"fee_payer_sig,omitempty"`
+}
+
+// VaultScript defines a time-delayed vault account. Coin held at its address can
+// be spent two ways: by Cold at any height (the offline recovery key), or by Hot
+// once the chain reaches Unlock (the warm day-to-day key). See
+// wallet.VaultAddress for what the delay buys.
+type VaultScript struct {
+	Hot    string `json:"hot"`    // public key that may spend from Unlock on
+	Cold   string `json:"cold"`   // recovery public key that may spend at any height
+	Unlock uint64 `json:"unlock"` // height at/after which the hot key's path opens
 }
 
 // Output is one recipient of a multi-recipient transfer. Paying N people with N
@@ -157,6 +186,18 @@ func CheckTxSanity(tx Transaction) error {
 	if len(tx.Memo) > MaxMemoBytes {
 		return fmt.Errorf("memo too long (%d > %d)", len(tx.Memo), MaxMemoBytes)
 	}
+	// An inverted height window can never be satisfied: below LockUntil the
+	// transaction is not yet valid, above Expiry it is too late, and if the two
+	// cross there is no height in between. Rejecting it here changes the validity
+	// of no block (application already refuses it at every height) but keeps the
+	// mempool from holding a transaction that could never be mined, and tells
+	// whoever built it what is wrong while they can still fix it.
+	if tx.Expiry != 0 && tx.LockUntil > tx.Expiry {
+		return fmt.Errorf("impossible height window: lock_until %d is above expiry %d", tx.LockUntil, tx.Expiry)
+	}
+	if len(tx.FeePayer) > MaxAddressBytes {
+		return fmt.Errorf("fee payer address too long (%d > %d)", len(tx.FeePayer), MaxAddressBytes)
+	}
 	if err := tx.checkAuthShape(); err != nil {
 		return err
 	}
@@ -238,11 +279,17 @@ func checkOutputs(tx Transaction) error {
 // signature) and would let two implementations disagree about which branch a
 // transaction meant to take.
 func (t Transaction) checkAuthShape() error {
+	scripts := 0
+	for _, present := range []bool{t.IsMultisig(), t.IsHTLC(), t.IsVault()} {
+		if present {
+			scripts++
+		}
+	}
+	if scripts > 1 {
+		return errors.New("transaction carries more than one authorization script")
+	}
 	switch {
 	case t.IsMultisig():
-		if t.HTLC != nil {
-			return errors.New("transaction carries both a multisig and an htlc script")
-		}
 		if t.PubKey != "" || t.Signature != "" {
 			return errors.New("multisig transaction must not carry a single-key signature")
 		}
@@ -256,6 +303,16 @@ func (t Transaction) checkAuthShape() error {
 		if len(t.Signatures) > 0 {
 			return errors.New("htlc transaction must not carry multisig signatures")
 		}
+	case t.IsVault():
+		if t.PubKey != "" {
+			return errors.New("vault transaction must not carry a public key")
+		}
+		if len(t.Signatures) > 0 {
+			return errors.New("vault transaction must not carry multisig signatures")
+		}
+		if t.Preimage != "" {
+			return errors.New("vault transaction must not carry a preimage")
+		}
 	default:
 		if len(t.Signatures) > 0 {
 			return errors.New("single-key transaction must not carry multisig signatures")
@@ -263,6 +320,29 @@ func (t Transaction) checkAuthShape() error {
 		if t.Preimage != "" {
 			return errors.New("single-key transaction must not carry a preimage")
 		}
+	}
+	return t.checkSponsorShape()
+}
+
+// checkSponsorShape pins the fee-sponsorship fields to the one form they may
+// take: either all three are set, or none is. A stray sponsor key or signature
+// on an unsponsored transaction would be bytes nothing verifies, covered by the
+// txid and charged for by the per-byte base fee — the same malleability handle
+// the auth-shape rules exist to close. A sponsor that is also the sender is
+// rejected as meaningless: it would just be an ordinary transaction paying its
+// own fee, spelled in a way two implementations could disagree about.
+func (t Transaction) checkSponsorShape() error {
+	if t.FeePayer == "" {
+		if t.FeePayerPubKey != "" || t.FeePayerSig != "" {
+			return errors.New("fee sponsor key/signature without a fee payer")
+		}
+		return nil
+	}
+	if t.FeePayerPubKey == "" || t.FeePayerSig == "" {
+		return errors.New("fee payer without a sponsor key or signature")
+	}
+	if t.FeePayer == t.From {
+		return errors.New("fee payer is the sender (drop the sponsorship instead)")
 	}
 	return nil
 }
@@ -272,6 +352,25 @@ func (t Transaction) IsMultisig() bool { return t.Multisig != nil }
 
 // IsHTLC reports whether the transaction spends a hash-time-locked contract.
 func (t Transaction) IsHTLC() bool { return t.HTLC != nil }
+
+// IsVault reports whether the transaction spends a time-delayed vault.
+func (t Transaction) IsVault() bool { return t.Vault != nil }
+
+// IsSponsored reports whether a third party pays this transaction's fee.
+func (t Transaction) IsSponsored() bool { return t.FeePayer != "" }
+
+// VaultHotNotReady reports whether this is a vault spend on the HOT path that is
+// not yet allowed at the given height. The cold (recovery) key has no such
+// restriction, and which key signed is decided by verifyVault — so this asks the
+// same question: if the cold key did not authorize it, the hot key did, and the
+// hot key must wait for Unlock. Enforced in block application and mirrored by
+// the mempool so the miner never selects a spend its own rules would reject.
+func (t Transaction) VaultHotNotReady(height uint64) bool {
+	if t.Vault == nil || height >= t.Vault.Unlock {
+		return false
+	}
+	return !wallet.Verify(t.Vault.Cold, t.Signature, t.signingBytes())
+}
 
 // HTLCRefundNotReady reports whether this is an HTLC refund (no preimage) that is
 // not yet spendable at the given height: the refund path opens only once the
@@ -302,6 +401,16 @@ func (t Transaction) IsLockedAt(height uint64) bool {
 // signature/authorization fields. Being binary and length-prefixed, it is
 // unambiguous for any field value and reproducible by any implementation.
 func (t Transaction) signingBytes() []byte { return t.canonicalSigningBytes() }
+
+// SigningMessage is signingBytes exported, for a CLIENT that needs to check a
+// signature itself rather than ask consensus to. Collecting multisig signatures
+// is the case that needs it: to report which member has already signed, a tool
+// must verify each supplied signature against the message the members sign, and
+// nothing else can compute that message correctly (it commits to the network id
+// and to the fee payer, and excludes exactly the authorization fields).
+//
+// It is derived, never authoritative: consensus always recomputes it.
+func (t Transaction) SigningMessage() []byte { return t.signingBytes() }
 
 // IsAssetTransfer reports whether this transaction moves a native asset (Amount
 // is in asset units) rather than coin.
@@ -353,11 +462,23 @@ func (t Transaction) VerifySignature() error {
 	if t.IsCoinbase() {
 		return errors.New("coinbase transaction is not signed")
 	}
+	if err := t.verifySender(); err != nil {
+		return err
+	}
+	return t.verifySponsor()
+}
+
+// verifySender checks the authorization of the account the value comes from,
+// choosing the branch by which script (if any) the transaction carries.
+func (t Transaction) verifySender() error {
 	if t.IsMultisig() {
 		return t.verifyMultisig()
 	}
 	if t.IsHTLC() {
 		return t.verifyHTLC()
+	}
+	if t.IsVault() {
+		return t.verifyVault()
 	}
 	derived, err := wallet.AddressFromPubKeyHex(t.PubKey)
 	if err != nil {
@@ -369,6 +490,68 @@ func (t Transaction) VerifySignature() error {
 	if !wallet.Verify(t.PubKey, t.Signature, t.signingBytes()) {
 		return errors.New("invalid signature")
 	}
+	return nil
+}
+
+// verifySponsor checks a fee-sponsored transaction's second signature: the
+// sponsor's key must derive FeePayer, and must have signed the same bytes the
+// sender did — which name the sponsor, the sender, the nonce and the fee. So a
+// sponsorship is bound to exactly this transfer and expires with the sender's
+// nonce; it cannot be lifted onto another payment or replayed later.
+func (t Transaction) verifySponsor() error {
+	if !t.IsSponsored() {
+		return nil
+	}
+	derived, err := wallet.AddressFromPubKeyHex(t.FeePayerPubKey)
+	if err != nil {
+		return fmt.Errorf("bad fee sponsor public key: %w", err)
+	}
+	if derived != t.FeePayer {
+		return errors.New("fee sponsor public key does not match the fee payer address")
+	}
+	if !wallet.Verify(t.FeePayerPubKey, t.FeePayerSig, t.signingBytes()) {
+		return errors.New("invalid fee sponsor signature")
+	}
+	return nil
+}
+
+// verifyVault checks that the script hashes to From and that one of its two keys
+// signed: the cold (recovery) key, valid at any height, or the hot key, whose
+// spends are additionally gated on the Unlock height at block-application time
+// (see Transaction.VaultHotNotReady) — signature verification has no height
+// context, exactly as with an HTLC refund.
+func (t Transaction) verifyVault() error {
+	v := t.Vault
+	addr, err := wallet.VaultAddress(v.Hot, v.Cold, v.Unlock)
+	if err != nil {
+		return fmt.Errorf("invalid vault script: %w", err)
+	}
+	if addr != t.From {
+		return errors.New("vault script does not match sender address")
+	}
+	msg := t.signingBytes()
+	if wallet.Verify(v.Cold, t.Signature, msg) || wallet.Verify(v.Hot, t.Signature, msg) {
+		return nil
+	}
+	return errors.New("signature is from neither the vault's hot nor its cold key")
+}
+
+// SignVault authorizes a vault spend with w, which must hold either the script's
+// cold key (spendable at any height) or its hot key (spendable from Unlock on).
+func (t *Transaction) SignVault(w *wallet.Wallet) {
+	t.Signature = w.Sign(t.signingBytes())
+}
+
+// SponsorFee attaches a sponsor's authorization: w agrees to pay this exact
+// transaction's fee out of its own balance. The sender must already have set
+// FeePayer to w's address and signed — the sponsor signs the same bytes, so any
+// later change to the transfer invalidates both signatures.
+func (t *Transaction) SponsorFee(w *wallet.Wallet) error {
+	if t.FeePayer != w.Address() {
+		return errors.New("wallet is not the transaction's fee payer")
+	}
+	t.FeePayerPubKey = w.PublicKeyHex()
+	t.FeePayerSig = w.Sign(t.signingBytes())
 	return nil
 }
 

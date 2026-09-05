@@ -97,13 +97,20 @@ func NewFromSnapshot(s Snapshot, headers []Header) (*Blockchain, error) {
 		burned = minted - totalBalance(state)
 	}
 	return &Blockchain{
-		blocks:   blocks,
-		state:    state,
-		work:     work,
-		undos:    undos, // all nil: no reorg below the snapshot is permitted
-		txIndex:  buildTxIndex(blocks),
-		burned:   burned,
-		sigCache: NewValidationCache(DefaultValidationCacheSize),
+		blocks:  blocks,
+		state:   state,
+		work:    work,
+		undos:   undos, // all nil: no reorg below the snapshot is permitted
+		txIndex: buildTxIndex(blocks),
+		assets:  buildAssetIndex(blocks),
+		burned:  burned,
+		// The bodies below the snapshot were never seen, so their filter
+		// commitments cannot be folded: this node's filter-header chain starts
+		// above the snapshot, and it says so rather than serving values that would
+		// match no other node (see cfilter.go).
+		filterBase:    s.Height + 1,
+		filterHeaders: nil,
+		sigCache:      NewValidationCache(DefaultValidationCacheSize),
 	}, nil
 }
 

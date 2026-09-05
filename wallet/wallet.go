@@ -197,10 +197,27 @@ func Load(path string) (*Wallet, error) {
 		return nil, err
 	}
 	if len(seed) != ed25519.SeedSize {
+		// The overwhelmingly likely cause is an ENCRYPTED file opened without a
+		// passphrase: it parses as JSON, carries no seed, and the length check is
+		// what notices. "bad seed length" sends the reader looking for a corrupt
+		// file instead of at the environment variable they forgot to set.
+		if isEncryptedWalletFile(data) {
+			return nil, errors.New("this key file is encrypted; set DNAS_WALLET_PASSPHRASE to open it")
+		}
 		return nil, errors.New("bad seed length")
 	}
 	priv := ed25519.NewKeyFromSeed(seed)
 	return &Wallet{priv: priv, pub: priv.Public().(ed25519.PublicKey)}, nil
+}
+
+// isEncryptedWalletFile reports whether these bytes look like a file written by
+// SaveEncrypted, so an unencrypted read can say what is actually wrong.
+func isEncryptedWalletFile(data []byte) bool {
+	var probe encryptedWalletFile
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return false
+	}
+	return probe.Ciphertext != "" && probe.Salt != ""
 }
 
 // LoadOrCreate loads the wallet at path, creating and saving a new one if the
@@ -303,6 +320,11 @@ func LoadEncrypted(path, passphrase string) (*Wallet, error) {
 	gcm, err := walletCipher(passphrase, salt, ewf.Iterations)
 	if err != nil {
 		return nil, err
+	}
+	// A nonce of the wrong length makes GCM panic rather than fail, and a key file
+	// is input from disk that anything could have written.
+	if len(nonce) != gcm.NonceSize() {
+		return nil, errors.New("not an encrypted wallet file (bad nonce)")
 	}
 	seed, err := gcm.Open(nil, nonce, ct, nil)
 	if err != nil {

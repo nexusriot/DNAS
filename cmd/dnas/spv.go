@@ -25,13 +25,23 @@ import (
 func runSPV(args []string) {
 	fs := flag.NewFlagSet("spv", flag.ExitOnError)
 	api := fs.String("api", "localhost:8080", "node HTTP API address")
+	cache := fs.String("cache", "spvheaders.json", "verified-header cache file (empty disables it and refetches every time)")
 	_ = fs.Parse(args)
+	spvCachePath = *cache
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "cache" {
+			spvCacheExplicit = true
+		}
+	})
 	rest := fs.Args()
 	if len(rest) == 0 {
 		fmt.Println("usage: dnas spv [-api URL] <sync | verify <txhash> | scan <addr> | balance <addr> | history <addr> | wallet ...>")
 		return
 	}
 	base := ensureHTTP(*api)
+	// Everything below either checks the node's genesis or signs a transaction,
+	// both of which are network-bound — so take the network from the node.
+	adoptNetwork(base)
 
 	switch rest[0] {
 	case "wallet":
@@ -152,38 +162,94 @@ func verifySPV(headers []core.Header, pr core.TxProof, txHash string) (string, e
 // verifiedFilters fetches the header chain and compact filters, verifies the
 // headers' proof-of-work, and checks each filter is bound to its header and
 // consistent with the node's filter-header chain. Shared by scan and history.
+//
+// The header chain comes from the cache (only the new suffix is downloaded), and
+// the filter-header chain with it. The filters themselves are still fetched for
+// the whole range, because a filter is only useful if you have it: what the
+// cache saves here is the headers and the fold, not the filter bodies.
 func verifiedFilters(base string) ([]core.Header, []core.BlockFilter, error) {
-	headers, err := fetchHeaders(base)
+	// A PRUNING node cannot serve filters for the blocks whose bodies it has
+	// dropped, and it must not invent empty ones (an empty filter is a proof of
+	// absence — see core/prune.go). So the scan starts where the node's data
+	// starts; callers report the range they actually covered rather than claiming
+	// the whole chain.
+	from, err := nodeFilterStart(base)
+	if err != nil {
+		return nil, nil, err
+	}
+	return verifiedFiltersFrom(base, from)
+}
+
+// nodeFilterStart is the lowest height a node can serve filters for. It is 0 (or
+// 1, which is the same thing for filters, genesis carrying no transactions) on a
+// node holding the whole chain.
+func nodeFilterStart(base string) (uint64, error) {
+	var info struct {
+		BodyHeight uint64 `json:"body_height"`
+		Pruned     bool   `json:"pruned"`
+	}
+	if err := getJSON(base+"/info", &info); err != nil {
+		return 0, fmt.Errorf("ask the node what it can serve: %w", err)
+	}
+	if info.BodyHeight <= 1 {
+		return 0, nil
+	}
+	return info.BodyHeight, nil
+}
+
+// verifiedFiltersFrom is verifiedFilters for a client that only needs the NEW
+// part of the chain: it returns the verified headers, the filters from `from`
+// onwards, and nothing before that.
+//
+// The saving is real. A wallet that has scanned to height H needs filters for
+// H+1.. only, and with a cached filter-header chain it can check them: the chain
+// is a running hash, so folding the new filters onto the cached value at H must
+// reproduce the node's headers for H+1.. — the same guarantee as re-folding from
+// genesis, at the cost of the suffix instead of the whole chain.
+func verifiedFiltersFrom(base string, from uint64) ([]core.Header, []core.BlockFilter, error) {
+	cache := loadHeaderCache(spvCachePath)
+	headers, err := cache.syncHeaders(base)
 	if err != nil {
 		return nil, nil, err
 	}
 	if _, _, err := verifyHeaderChain(headers); err != nil {
 		return nil, nil, fmt.Errorf("header chain invalid: %w", err)
 	}
-	filters, err := fetchFilters(base)
+	cfheaders, err := cache.syncFilterHeaders(base)
 	if err != nil {
 		return nil, nil, err
 	}
-	cfheaders, err := fetchFilterHeaders(base)
+	if err := cache.save(spvCachePath); err != nil {
+		fmt.Println("warning: could not save the header cache:", err)
+	}
+	if from > uint64(len(headers)) {
+		from = uint64(len(headers))
+	}
+
+	filters, err := fetchFiltersFrom(base, from)
 	if err != nil {
 		return nil, nil, err
 	}
-	if len(filters) != len(headers) {
-		return nil, nil, fmt.Errorf("got %d filters for %d headers", len(filters), len(headers))
+	if got, want := from+uint64(len(filters)), uint64(len(headers)); got != want {
+		return nil, nil, fmt.Errorf("got filters up to height %d for %d headers", got, want)
 	}
-	// The filters must be exactly the set the advertised filter-header chain
-	// commits to (recompute it locally and compare), each bound to its PoW-verified
-	// block hash.
-	recomputed := core.FilterHeaderChain(filters)
-	if len(recomputed) != len(cfheaders) {
-		return nil, nil, fmt.Errorf("filter-header chain length mismatch")
+	// Fold the new filters onto the last verified filter header and check they
+	// reproduce what the node advertised.
+	var prev string
+	if from > 0 {
+		prev = cfheaders[from-1]
+	}
+	recomputed, err := core.FoldFilterHeaders(prev, filters)
+	if err != nil {
+		return nil, nil, err
 	}
 	for i := range filters {
-		if filters[i].BlockHash != headers[i].Hash {
-			return nil, nil, fmt.Errorf("filter %d is not bound to the verified header", i)
+		h := from + uint64(i)
+		if filters[i].BlockHash != headers[h].Hash {
+			return nil, nil, fmt.Errorf("filter %d is not bound to the verified header", h)
 		}
-		if recomputed[i] != cfheaders[i] {
-			return nil, nil, fmt.Errorf("filter %d is inconsistent with the node's filter-header chain", i)
+		if recomputed[i] != cfheaders[h] {
+			return nil, nil, fmt.Errorf("filter %d is inconsistent with the node's filter-header chain", h)
 		}
 	}
 	return headers, filters, nil
@@ -207,13 +273,30 @@ func spvScan(base, addr string) error {
 	clear := len(filters) - len(matches)
 	fmt.Printf("✓ scanned %d blocks against a %d-header PoW chain (filters consistent)\n", len(filters), len(headers))
 	fmt.Printf("  %s\n", addr)
+	// The claim has to name the range it covers. A pruning node serves no filters
+	// for the bodies it dropped, and "absent from every block I was given" is not
+	// "absent from the chain" — saying the latter would be the one way this
+	// command could mislead.
+	covered := coveredRange(filters)
 	if len(matches) == 0 {
-		fmt.Printf("  no matches: the address is provably absent from all %d blocks\n", len(filters))
+		fmt.Printf("  no matches: the address is provably absent from %s\n", covered)
+		if len(filters) < len(headers) {
+			fmt.Printf("  NOT scanned: heights below %d, whose bodies this node has pruned\n", filters[0].Index)
+		}
 		return nil
 	}
 	fmt.Printf("  candidate blocks (download to confirm; ~1/%d false-positive rate): %v\n", 784931, matches)
 	fmt.Printf("  provably clear (address definitely absent): %d block(s)\n", clear)
 	return nil
+}
+
+// coveredRange describes the heights a set of filters actually spans, so a
+// report can state what it checked instead of implying it checked everything.
+func coveredRange(filters []core.BlockFilter) string {
+	if len(filters) == 0 {
+		return "no blocks"
+	}
+	return fmt.Sprintf("heights %d..%d", filters[0].Index, filters[len(filters)-1].Index)
 }
 
 // txOutputs presents either transaction form as a list of recipients.
@@ -232,6 +315,9 @@ type HistoryEntry struct {
 	Amount        uint64
 	Fee           uint64
 	Confirmations uint64
+	// Hash is the transaction this entry came from, so a client-side note can be
+	// attached to it (see spvlabels.go). Entries written by older builds have none.
+	Hash string
 }
 
 // walletHistory scans the given blocks for transactions involving addr and
@@ -243,7 +329,7 @@ func walletHistory(addr string, blocks []core.Block, tipHeight uint64) (entries 
 		for _, tx := range b.Transactions {
 			if tx.IsCoinbase() {
 				if tx.To == addr {
-					entries = append(entries, HistoryEntry{b.Index, "mined", "", tx.Amount, 0, confs})
+					entries = append(entries, HistoryEntry{b.Index, "mined", "", tx.Amount, 0, confs, tx.Hash()})
 					received += tx.Amount
 				}
 				continue
@@ -252,14 +338,14 @@ func walletHistory(addr string, blocks []core.Block, tipHeight uint64) (entries 
 			// right whichever form the payment took.
 			if tx.From == addr {
 				for _, o := range txOutputs(tx) {
-					entries = append(entries, HistoryEntry{b.Index, "sent", o.To, o.Amount, 0, confs})
+					entries = append(entries, HistoryEntry{b.Index, "sent", o.To, o.Amount, 0, confs, tx.Hash()})
 					sent += o.Amount
 				}
 				fees += tx.Fee
 			}
 			for _, o := range txOutputs(tx) {
 				if o.To == addr {
-					entries = append(entries, HistoryEntry{b.Index, "received", tx.From, o.Amount, 0, confs})
+					entries = append(entries, HistoryEntry{b.Index, "received", tx.From, o.Amount, 0, confs, tx.Hash()})
 					received += o.Amount
 				}
 			}
@@ -299,7 +385,12 @@ func spvHistory(base, addr string) error {
 	}
 
 	entries, received, sent, fees := walletHistory(addr, matched, tipHeight)
-	fmt.Printf("✓ scanned %d filters; %d block(s) touch the address (downloaded + authenticated)\n", len(filters), len(matched))
+	fmt.Printf("✓ scanned %d filters over %s; %d block(s) touch the address (downloaded + authenticated)\n",
+		len(filters), coveredRange(filters), len(matched))
+	if len(filters) > 0 && len(filters) < len(headers) {
+		fmt.Printf("  incomplete: this node has pruned the bodies below height %d, so anything\n", filters[0].Index)
+		fmt.Printf("  older than that is not in these totals\n")
+	}
 	fmt.Printf("  %s\n", addr)
 	if len(entries) == 0 {
 		fmt.Println("  no transactions")
@@ -386,9 +477,40 @@ func ensureHTTP(addr string) string {
 	return strings.TrimRight(addr, "/")
 }
 
+// The bulk read endpoints are paged (a node will not serialize its whole chain
+// into one response), so a client that wants everything asks for one page at a
+// time. spvCachePath, when set, keeps the verified prefix between runs so the
+// pages only cover what is new — see headercache.go.
+var (
+	spvCachePath     = ""
+	spvCacheExplicit = false // the operator named a cache file, so don't override it
+)
+
+// fetchHeaders returns the node's whole header chain, verified. With a cache
+// configured it downloads only the headers above the cached tip; without one it
+// pages through the lot.
 func fetchHeaders(base string) ([]core.Header, error) {
+	cache := loadHeaderCache(spvCachePath)
+	headers, err := cache.syncHeaders(base)
+	if err != nil {
+		return nil, err
+	}
+	if err := cache.save(spvCachePath); err != nil {
+		fmt.Println("warning: could not save the header cache:", err)
+	}
+	return headers, nil
+}
+
+// fetchHeaderPage fetches one page of headers starting at `from`.
+func fetchHeaderPage(base string, from uint64) ([]core.Header, error) {
 	var hs []core.Header
-	return hs, getJSON(base+"/headers", &hs)
+	return hs, getJSON(fmt.Sprintf("%s/headers?from=%d", base, from), &hs)
+}
+
+// fetchFilterHeaderPage fetches one page of the filter-header chain.
+func fetchFilterHeaderPage(base string, from uint64) ([]string, error) {
+	var hs []string
+	return hs, getJSON(fmt.Sprintf("%s/cfheaders?from=%d", base, from), &hs)
 }
 
 func fetchProof(base, txHash string) (core.TxProof, error) {
@@ -397,14 +519,22 @@ func fetchProof(base, txHash string) (core.TxProof, error) {
 	return pr, err
 }
 
-func fetchFilters(base string) ([]core.BlockFilter, error) {
-	var fs []core.BlockFilter
-	return fs, getJSON(base+"/cfilters", &fs)
-}
-
-func fetchFilterHeaders(base string) ([]string, error) {
-	var hs []string
-	return hs, getJSON(base+"/cfheaders", &hs)
+// fetchFiltersFrom pages through the compact filters from `from` to the end of
+// the chain. Filters are needed only for the blocks a wallet has not scanned
+// yet, so callers pass the height they left off at rather than always 0.
+func fetchFiltersFrom(base string, from uint64) ([]core.BlockFilter, error) {
+	var all []core.BlockFilter
+	for {
+		var page []core.BlockFilter
+		if err := getJSON(fmt.Sprintf("%s/cfilters?from=%d", base, from), &page); err != nil {
+			return nil, err
+		}
+		if len(page) == 0 {
+			return all, nil
+		}
+		all = append(all, page...)
+		from += uint64(len(page))
+	}
 }
 
 func fetchStateProof(base, addr string) (core.AccountProof, error) {
@@ -426,8 +556,29 @@ func short(h string) string {
 	return h
 }
 
-func getJSON(url string, v any) error {
+func getJSON(url string, v any) error { return getJSONVia(spvHTTP, url, v) }
+
+// getJSONAny decodes a JSON body whatever the status code, and reports the
+// status separately. It exists for endpoints whose FAILURE is also a documented
+// JSON answer — /health returns 503 with the reasons a node is not ready, and
+// treating that as a transport error would throw away the very thing it says.
+func getJSONAny(url string, v any) (int, error) {
 	resp, err := spvHTTP.Get(url)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
+		return resp.StatusCode, fmt.Errorf("%s: %s: %w", url, resp.Status, err)
+	}
+	return resp.StatusCode, nil
+}
+
+// getJSONVia is getJSON with an explicit client, for requests whose deadline
+// differs from the default — a mining long poll deliberately hangs for far
+// longer than spvHTTP's timeout allows.
+func getJSONVia(client *http.Client, url string, v any) error {
+	resp, err := client.Get(url)
 	if err != nil {
 		return err
 	}

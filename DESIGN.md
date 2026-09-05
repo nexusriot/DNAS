@@ -68,9 +68,9 @@ wallet → core → node → api → cmd        (dependency direction, no cycles
 
 | Module   | Responsibility                                                        |
 |----------|-----------------------------------------------------------------------|
-| `wallet` | Ed25519 keys, checksummed addresses, at-rest encryption, BIP39/HD, multisig address derivation |
-| `core`   | Transactions, blocks, headers, Merkle, chain state, work, reorgs, mempool, persistence, params |
-| `node`   | Encrypted/authenticated P2P, peer identity, ban scoring, discovery, sync, the miner |
+| `wallet` | Ed25519 keys, checksummed addresses, at-rest encryption, BIP39/HD, and the script-bound address kinds (multisig, HTLC, vault) |
+| `core`   | Networks, transactions, blocks, headers, Merkle, chain state, work, reorgs, mempool, persistence, params, share targets, store tooling |
+| `node`   | Encrypted/authenticated P2P, peer identity, ban scoring, discovery, sync, mempool reconciliation, the miner, the share ledger, the faucet |
 | `api`    | HTTP interface + embedded web explorer                                |
 | `cmd`    | The `dnas` CLI/daemon (`cmd/dnas`)                                     |
 
@@ -138,12 +138,17 @@ type Transaction struct {
     Signatures       []string        // hex
     HTLC             *HTLCScript     // OR hash-time-locked-contract authorization
     Preimage         string          // hex; revealed on the HTLC claim branch
+    Vault            *VaultScript    // OR time-delayed vault authorization (§5.2)
+    FeePayer         string          // a third party pays the fee (§5.3)
+    FeePayerPubKey   string          // hex; must derive FeePayer
+    FeePayerSig      string          // hex; the sponsor's signature over the same signing bytes
 }
 ```
 
 **Signing.** The signed message (`signingBytes`) covers every consensus-relevant
-field (From/To/Amount/Fee/Nonce/Expiry/LockUntil/AssetID/Issue/Memo, and Outputs
-when present) but **not** the signature fields. Crucially it is *identical* for single-key and multisig
+field (From/To/Amount/Fee/Nonce/Expiry/LockUntil/AssetID/Issue/Memo, plus Outputs
+and FeePayer when present, and the NETWORK ID — see §5.1) but **not** the
+signature fields. Crucially it is *identical* for single-key and multisig
 transactions, so the two authorization paths sign the same bytes. (A native-asset
 transfer or issuance is an ordinary single-key spend by `From`; the fee is always
 paid in coin — see §4.)
@@ -165,6 +170,9 @@ canonical bytes.
 
 - **Single key:** the signature must verify against the public key that hashes to
   `From`.
+- **Time-delayed vault:** `From` must equal `VaultAddress(Hot, Cold, Unlock)`, and
+  either key may have signed — the height rule that separates them is applied at
+  block application, not here (§5.2).
 - **M-of-N multisig:** `From` must equal `MultisigAddress(Threshold, PubKeys)`
   (so the script is bound to the address it spends), and at least `Threshold`
   signatures from *distinct* listed members must verify. `verifyMultisig`
@@ -263,6 +271,177 @@ admits but a block cannot contain is selected into every candidate the miner
 builds, so every candidate is invalid and **block production stops** until the
 transaction is evicted. One function for both callers makes that divergence
 impossible for this class of rule.
+
+### 5.1 Networks, and what binds a chain to one
+
+A DNAS process runs on exactly one **network** — `mainnet`, `testnet` or
+`regtest` ([core/network.go](core/network.go)) — selected once at startup with
+`-network` and identical on every node meant to converge. A network is not a
+label: its ID is bound into three places, and each closes a hole that existed
+while it was not.
+
+| Bound into | Closes |
+|------------|--------|
+| the genesis block, via `PrevHash` | two networks cannot share a chain; every other parameter matching no longer makes them the same chain |
+| the transaction **signing preimage** (`signedFields`) | a signature made on one network does not authorize the same transfer on another — cross-network replay |
+| the peer **handshake** (`MsgVersion.Network`) | nodes on different networks disconnect immediately instead of failing to converge forever |
+
+Mainnet's id is deliberately the **empty string**, and both the genesis
+`PrevHash` and the signing preimage omit an empty id entirely. So every mainnet
+encoding is byte-for-byte what it was before networks existed: no flag day, no
+changed txids, and a stored chain still replays. The other networks get their own
+genesis hash and their own signatures for free.
+
+`regtest` additionally holds difficulty at the genesis target (`NoRetarget`) and
+defaults to its own pre-shared network key, which is how it was isolated before —
+now belt *and* braces.
+
+### 5.2 Time-delayed vaults
+
+A `VaultScript{Hot, Cold, Unlock}` is a third script-bound address kind alongside
+multisig and HTLC. Coin at `VaultAddress(Hot, Cold, Unlock)` is spendable by the
+**cold** key at any height, and by the **hot** key only from `Unlock` on. The hot
+key lives on a warm machine and signs day to day; the cold key stays offline. If
+the hot key is stolen, the thief must wait out the delay, and the cold key can
+move the coin somewhere safe first.
+
+Which branch a spend took is decided by *which key signed*, so the height rule
+(`VaultHotNotReady`) has to re-derive that independently of the signature cache —
+it verifies the cold key's signature, and a spend that is not the cold key's is
+the hot key's. That costs one extra verification, which `VerifyOps` charges for.
+
+Vault spends are gated by the `vault` height-activated upgrade, and — like
+multi-output transfers — the script is encoded only when present, so scheduling
+the upgrade changes no existing txid and no stored chain.
+
+One interaction is worth knowing before trusting a vault with anything. A hot-key
+spend below `Unlock` is *admitted to the mempool* and merely never selected (the
+same treatment an HTLC refund before its timeout gets). A thief holding the hot
+key can therefore park an unmineable spend at the vault's nonce, and the cold
+key's rescue — which uses that same nonce — has to displace it by
+**replace-by-fee**, i.e. by paying strictly more. The cold key can always do that,
+since it is sweeping the whole balance, but it is a step the rescuer has to take
+rather than a race they automatically win.
+
+This is the cheap version of what a script VM would express generically (the
+`[L]` item in the ROADMAP): it buys a real new spending condition today at the
+cost of being one more hand-rolled special case in consensus.
+
+A consequence of §5.1 that bites in practice: **a client must be on the node's
+network**. A transaction's hash and its signing preimage both carry the network
+id, so a client that thinks it is on mainnet while the node runs regtest produces
+signatures the node rejects and merkle roots that do not match — failures that
+surface as "invalid signature" or "merkle root mismatch" rather than as the
+configuration error they are. Rather than a flag that has to match, the CLI
+*asks*: `GET /info` reports the network and every client command that signs,
+verifies a genesis, or recomputes a transaction hash adopts it before doing so
+([cmd/dnas/network.go](cmd/dnas/network.go)). The external miner needs this as
+much as a wallet does, because it recomputes the candidate block's merkle root.
+
+### 5.3 Fee sponsorship
+
+With `FeePayer` set, the **fee** is charged to that account instead of the
+sender's. An address holding no coin at all can then transact, because someone
+else pays for its block space — the onboarding problem every account-model chain
+has, solved without a faucet or a special case in the fee rules. The fee itself is
+unchanged: the base-fee portion is still burned and the tip still goes to the
+miner; only who is debited moves.
+
+Two signatures authorize it. The sender signs `FeePayer` along with everything
+else (it is in the signing preimage), so the sponsor cannot be swapped in or out
+without invalidating the transaction; the sponsor signs the *same bytes*, which
+name the sender, the amount and the nonce — so a sponsorship is bound to exactly
+one transfer and cannot be lifted onto another.
+
+The sponsor has **no nonce of its own**. Replay is already impossible because the
+sender's nonce is consumed exactly once, and leaving the payer's nonce alone means
+sponsoring does not disturb transactions the payer has in flight. The payer's
+own coinbase-maturity reserve still applies, so a miner cannot pay everyone's fees
+out of a reward a reorg may take back.
+
+The mempool tracks a running total per payer (`Mempool.sponsored`), so a sponsor
+is held to everything it has promised across the pool rather than one fee at a
+time — otherwise a payer could sponsor a hundred transactions it can afford one at
+a time and only the first would be mineable, which is the same "queue full of
+unminable work" problem the sender rules exist to prevent, moved one account over.
+
+Gated by the `feesponsor` height-activated upgrade. Only a single-key account can
+sponsor — the payer's key must derive the payer's address — so a multisig or
+script account cannot currently pay someone else's fee.
+
+Because it takes two parties, it takes two steps, and a transaction has to travel
+between them half-authorized: `dnas sponsor request` builds and sender-signs it
+(committing to who pays), `dnas sponsor pay` counter-signs and submits. The
+half-signed file is not a bearer instrument — its sender, recipient, amount and
+nonce are all covered by the sender's signature, so a payer can only agree to it
+or not, never alter it. It is the shape a PSBT has, for the one case that needs
+it today.
+
+### 5.4 Spending from a multisig account (and escrow on top of it)
+
+Consensus has verified M-of-N multisig from early on: `verifyMultisig` checks
+that the script hashes to the sender address and that M *distinct* listed members
+signed. Four separate surfaces would derive a multisig address (`dnas wallet
+multisig`, `POST /multisig/address`, the TUI, the GUI) and nothing could spend
+one — `Transaction.AddSignature` was called by tests and by nothing else. The
+feature was complete except for the part where you get your coin back.
+
+`dnas multisig` is that part, and it borrows the shape `dnas sponsor` already
+had: the transaction travels between the members as a file, gaining one signature
+per stop. Three properties make that safe:
+
+- **The file is not a bearer instrument at any stage.** The recipient, the
+  amount, the fee and the nonce are covered by every signature already on it, so
+  a later signer can only agree to the same transfer or refuse.
+- **The script is bound into the address.** A file naming a different member set
+  simply does not hash to the account it is trying to drain.
+- **It carries its network.** Signing is offline — the members that matter are
+  the ones kept away from the machine running a node — and a signature commits to
+  the network id, so a member whose CLI defaulted elsewhere would produce a
+  worthless signature and nobody would find out until submission, with the coin
+  still stuck. Reading the file selects the chain; there is deliberately no flag
+  to get wrong.
+
+The tool refuses the two mistakes that reach the node as the same message ("not
+enough signatures"): a non-member signing, and one member signing twice. The
+second matters because consensus counts M *distinct* members and rejects a
+signature matching no unused one, so a doubly-signed file is not redundant, it is
+unusable.
+
+**Escrow** (`dnas escrow`) is a 2-of-3 whose three members have names: buyer,
+seller, arbiter. Consensus needs none of this — it is a multisig account and
+nothing more — and what the tool adds is the part that is easy to get wrong by
+hand: remembering which public key is whose role, and building a spend that pays
+the right one of them. It refuses two roles sharing a key, which would quietly
+make a 2-of-3 into a 1-of-2 that one party can spend alone, and it re-derives the
+address from the roles on every read rather than trusting the stored one. Its
+payouts are ordinary multisig spend files, so the signatures are collected by the
+same tool — there is no second signing protocol to keep in step with the first.
+
+### 5.5 The memo, and what it made possible
+
+`Memo` and the `Expiry`/`LockUntil` window are signed consensus fields that every
+client left at zero for as long as they existed. Giving the light wallet flags for
+them (§14) turned two other things from ideas into commands:
+
+- **Anchoring** (`dnas anchor`) publishes `sha256(file)` in a zero-value
+  self-payment and later proves it: the header chain's proof of work, a merkle
+  path to a header, and — the step it would be easy to skip — reading the
+  transaction to see what the proven txid actually commits to. The merkle proof
+  binds a txid to a block; only the body says what that txid *means*.
+- **Invoices** (`dnas invoice`) state what is wanted, hand the payer a `dnas:`
+  URI, and verify settlement the way a merchant needs it verified: proof of work
+  checked locally, compact filters to find the blocks touching the address, those
+  bodies authenticated against their headers, and confirmations required before
+  the answer is yes. A payment in the tip block alone can still be reorganized
+  away, and a merchant shipping on one confirmation has been paid reversibly.
+
+Consensus gained one rule from this: an **inverted height window** is rejected
+outright. Below `LockUntil` a transaction is not yet valid and above `Expiry` it
+is too late, so if the two cross there is no height at which it could be mined —
+the check changes the validity of no block (application already refuses it
+everywhere) and keeps the mempool from holding something unminable while telling
+whoever built it what is wrong.
 
 ---
 
@@ -483,8 +662,39 @@ trustworthy as the balances themselves.
   once full, a new transaction is admitted only by out-bidding the queued
   transaction paying the least per byte (fee *rate*), which it evicts — so scarce
   block space, a per-byte resource, goes to the highest-paying bytes.
+- **Bounded in BYTES as well as in count** (`DefaultMempoolBytes`, 32 MiB).
+  A count limit is not a memory limit: 5000 transactions at the relay size limit
+  is roughly half a gigabyte of resident state, all of it valid, all of it paying
+  the floor, and therefore unevictable — about one block reward's worth of fees
+  to hold. Whichever budget binds first evicts, and because one large transaction
+  may have to displace several small ones the check is a loop, not a single
+  eviction. Occupancy for the dynamic relay floor is `max(count%, bytes%)`, so a
+  pool full by bytes stops quoting the floor fee.
 - **Replace-by-fee.** A conflicting `(From, Nonce)` may be replaced only by a
   strictly higher fee.
+- **An unmineable transaction cannot hold a nonce hostage.** Replace-by-fee
+  normally requires a strictly higher fee, with one exception: a queued
+  transaction that the height rules would reject for the NEXT block (expired, not
+  yet time-locked, an HTLC refund before its timeout, a vault hot-key spend
+  before its unlock) has no claim on the slot it occupies, so a transaction that
+  *is* mineable displaces it regardless of fee. Without that rule a thief holding
+  a vault's hot key could park a spend no block will accept and force the cold
+  key's rescue — same account, same nonce — to out-bid them to recover their own
+  coin (§5.2). The exception is narrow on purpose: between two mineable
+  transactions, the higher fee still wins.
+- **Sponsors are held to their whole queue.** A fee payer's outstanding
+  sponsorships are totalled per payer and checked against its spendable balance on
+  every admission, and re-checked on every new block (§5.3), so a sponsor cannot
+  promise the same coin to a hundred transactions.
+- **Reconciliation with peers.** A node asks each peer, once, for the
+  transactions it has pending (`MsgGetMempool`) — see §11. Everything it is told
+  goes through this same admission path; nothing is trusted for having arrived in
+  bulk.
+- **Fee-rate distribution.** `Mempool.Stats` buckets the queue by fee *rate* and
+  reports the min/median/max, served at `GET /mempool/stats`. A queue depth alone
+  cannot tell a sender whether their fee will be picked up next block or sit
+  behind a wall of higher bidders; the distribution can, and computing it needs
+  the canonical size only the node has.
 - **Admission requires a transaction that could plausibly be mined.** The pool
   holds, per sender, a **contiguous run of nonces starting at that sender's
   confirmed nonce**, whose **total cost the sender can afford** from its spendable
@@ -564,9 +774,30 @@ Either way, peers are still cryptographically identified afterwards by their
 Ed25519 node identity (below). The handshake sends and receives concurrently so it
 also works over `net.Pipe` (used in tests).
 
-**Peer identity.** The handshake yields a deterministic session id; each peer
-then signs it with its **Ed25519 node identity** (`MsgIdentity`), so peers are
-cryptographically identified, not merely "knows the key".
+**Peer identity — and why it is NOT the wallet key.** The handshake yields a
+deterministic session id; each peer then signs it with its **Ed25519 node
+identity** (`MsgIdentity`), so peers are cryptographically identified, not merely
+"knows the key".
+
+That message carries the identity's PUBLIC key, and a DNAS address is
+`hash(pubkey)` — so a node whose identity is its wallet key hands every peer the
+address holding its coin, and they can watch its balance, its mining income and
+every payment it makes. It also substantially undoes the Dandelion++ origin
+privacy below: hiding which peer first relayed a transaction matters much less
+when peers know which address each peer owns. The identity is therefore its own
+key file ([node/identity.go](node/identity.go), `-nodekey`, default
+`nodekey.json` beside the chain), holding no coin and needing no backup — losing
+it costs a node its accumulated peer reputation and nothing else. An in-process
+node with no identity given still falls back to the wallet, and says so at WARN.
+
+**Self-connections.** Two connections cannot be told apart by address: a node
+advertising `:3000` is reached as `localhost:3000`, and a string comparison sees
+two different hosts — so a node would dial itself whenever a peer gossiped its
+address back in a different spelling, burning an outbound slot, an inbound slot
+and a goroutine on a loop into the same process, then gossiping the alias onward
+so others dialed it twice. Identity settles it: a handshake that returns our own
+public key is closed, and the address is recorded as a self-alias
+(`peerbook.noteSelf`) so it is never dialed or gossiped again.
 
 **Ban scoring (`banbook`).** Misbehaving peers accrue points and are cut off past
 a threshold. The key depends on when the misbehaviour is detectable: a **failed
@@ -583,11 +814,28 @@ dropped if it sends nothing for `peerIdleTimeout` (a read deadline is reset on
 every message). This detects a half-open connection — a peer that died without
 closing — instead of leaking a goroutine and peer slot forever.
 
-**Protocol version & capabilities.** Right after the identity exchange each side
-sends a `MsgVersion` carrying its `ProtocolVersion` and a list of capability
-strings. A peer below `MinProtocolVersion` is dropped, so the wire format can
-evolve; capabilities (e.g. `dand` for Dandelion++) let optional features be
-negotiated per-connection without a version bump.
+**Protocol version, network, & capabilities.** Right after the identity exchange
+each side sends a `MsgVersion` carrying its `ProtocolVersion`, its **network name**
+and a list of capability strings. A peer below `MinProtocolVersion` is dropped, so
+the wire format can evolve; a peer on a *different network* is dropped too (§5.1)
+— its genesis and its signatures are not ours, so the connection could only ever
+fail to converge. A peer predating network names sends none, which reads as
+mainnet. Capabilities (`dand` for Dandelion++, `mpool` for mempool
+reconciliation) let optional features be negotiated per-connection without a
+version bump.
+
+**Mempool reconciliation.** Transactions are otherwise only ever *pushed* as they
+arrive, so a node that was down when a payment was broadcast never learns of it
+until someone rebroadcasts or it is mined — and a miner that just joined builds
+emptier blocks than it should. Each peer is therefore asked once, via
+`MsgGetMempool`, for what it has pending; the answer is a bounded batch
+(`maxMempoolBatch`) that goes through ordinary admission on arrival.
+
+The request waits until we are **caught up**, which is not a nicety: admission is
+checked against confirmed state, so a node still downloading the chain would
+reject every transaction it was told about — the sender's coin does not exist yet
+as far as it knows. The sync loop issues it once the tip reaches the best height a
+peer has announced (`reconcileMempoolWithPeers`).
 
 **Dandelion++ transaction relay (origin privacy).** A newly submitted transaction
 is not broadcast to every peer immediately — that would let a network observer
@@ -712,6 +960,41 @@ a foreign-file guard). `Blockchain.Open(path)` backs a chain with it so:
 `Save`/`Load` remain as a JSON import/export snapshot. On restart a node loads its
 store and re-syncs anything missing from peers.
 
+**Pruning.** A `Blockchain` keeps its blocks in a slice, so a long chain costs
+its whole size in RAM. `-prune N` (`core/prune.go`) keeps the state and every
+header for all time and drops the bodies deeper than N, replacing them with the
+same header-only placeholders a fast-synced node already uses below its snapshot
+(`blockFromHeader`) — which is why nothing in validation, supply accounting or
+maturity had to change.
+
+Three things make that safe rather than merely smaller:
+
+- **The floor.** `MinPruneKeep = MaxReorgDepth + 32`. A reorg replays the bodies
+  it disconnects, so pruning inside the range a reorg can reach would leave a
+  node unable to follow the chain it must follow. A smaller `-prune` is raised to
+  the floor and logged, rather than accepted and failing later.
+- **No empty filters.** A compact filter built from a missing body is a valid
+  EMPTY filter, and an empty filter is a proof of *absence*. Serving one would
+  tell a light client its address is provably not in a block the node cannot even
+  read, so `BlockFilterAt` reports a body-less height as having no filter and the
+  API answers `410 Gone` — never `404`, which a client would read as "not in the
+  chain".
+- **A cached filter-header chain.** The chain is a running hash over bodies, so a
+  pruning node that re-folded over what it still has would produce values that
+  agree with nobody. It is therefore maintained incrementally as blocks connect
+  and truncated on reorg (`extendFilterHeadersLocked`), at 32 bytes a block — the
+  BIP157 bargain: keep the commitments, drop the data. A node that followed the
+  chain from genesis keeps serving all of it after pruning; a fast-synced node
+  never saw those bodies and publishes `filter_base` above them.
+
+The transaction and address indexes drop their entries for a pruned body (a
+location holding nothing is worse than a miss); the **asset registry** does not,
+because an asset issued at height 5 still exists and is still held — what is lost
+is the transaction that issued it, not the fact of it.
+
+Pruning is a memory bound, not a disk one: the append-only store still holds
+every block and a restart replays it (see [ROADMAP](ROADMAP.md) §1).
+
 **Soft state.** Beside the authoritative chain, a node also persists three
 *conveniences* to the same directory (`peers.json`, `bans.json`, `mempool.json`),
 loading them on start and rewriting them on graceful shutdown. This lets a
@@ -730,7 +1013,7 @@ torn files.
 **Addresses.** `dnas` + `hex( sha256(pubkey)[:20] ‖ checksum[4] )`, where the
 checksum is `sha256("dnas" ‖ body)[:4]`. `ValidateAddress` verifies prefix,
 length, and checksum so a mistyped recipient fails validation instead of burning
-coins. (Checksums are enforced **client-side** — in `/send` and the REPL — not in
+coins. (Checksums are enforced **client-side** — in `/send` and the console — not in
 consensus, to avoid a validation cascade; a malicious client can still burn its
 own coins.)
 
@@ -747,6 +1030,34 @@ simple, deterministic HD scheme, explicitly **not** SLIP-0010.
 address is order-independent) and hashes them into the *same* address format and
 checksum as a normal address — so a multisig account is funded and spent like any
 other address.
+
+**Message signing.** `wallet/message.go` signs arbitrary data under a *domain
+tag*: the preimage is `sha256("DNAS signed message v1\n" ‖ len(msg) ‖ msg)`. The
+tag is not decoration. A wallet that signs whatever bytes it is handed can be
+asked to "prove you own this address" with the serialization of a transaction,
+and the answer is a valid transfer — so a message preimage is a tagged hash while
+a transaction preimage is a codec-versioned encoding, and neither can ever be
+presented as the other. The length is committed too, so two messages cannot share
+a preimage by shifting bytes across a field boundary. `VerifyMessage` returns the
+address a signature *proves*, which a caller must compare against the one it
+expected: a verifier that skips the comparison accepts any valid signature from
+anybody.
+
+**Passphrase rotation.** Encryption at rest used to be write-once —
+`DNAS_WALLET_PASSPHRASE` decided how a file was created and nothing could change
+it. `dnas wallet passphrase` re-encrypts in place (and `-remove` decrypts), and
+because it rewrites the only copy of a key it reopens the file and compares the
+address before reporting success. An encrypted file opened without a passphrase
+now says so instead of failing on a seed-length check.
+
+**Encrypted blobs.** `wallet/blob.go` is the same KDF and cipher for something
+that is not a single key — a backup bundle of key files, identities and watch
+lists (`dnas backup`). It writes 0600 through a temp file and a rename, because an
+interrupted write must not leave a truncated backup where the previous good one
+was, and it refuses an empty passphrase rather than writing key material in the
+clear. GCM's authentication is what makes a modified bundle unrestorable rather
+than silently wrong; a nonce of the wrong length is rejected instead of panicking
+(GCM panics rather than erroring, and these files are untrusted input).
 
 ---
 
@@ -818,6 +1129,44 @@ transaction (`POST /tx`). A local next-nonce counter lets several sends queue
 before a confirming block without colliding, catching up to the proven nonce as
 they confirm.
 
+**Memo and height window.** `send`/`sendmany` take `-memo`, `-expiry`/
+`-expire-in` and `-lock-until`/`-lock-for`. All three are signed consensus fields
+that had carried zero from every client since they existed. An expiry is how a
+payment stops being an open-ended liability: without one a transaction signed
+today can be mined next month at a nonce that has not moved, and the only way to
+retract it is to spend that nonce on something else. The relative forms are what
+a person means ("expire in twenty blocks") and are resolved against the tip
+*before* signing, because a signature has to commit to a specific window. What
+can be checked offline is checked before signing — an over-long memo, an inverted
+window — because afterwards the wallet has already advanced its own next-nonce
+and the node's answer is a bare rejection. Consensus also now rejects an inverted
+window outright: below `LockUntil` a transaction is not yet valid and above
+`Expiry` it is too late, so if the two cross there is no height in between, and
+such a transaction could never have been mined at any height anyway.
+
+**A node that cannot show you everything.** A pruning or fast-synced node serves
+filters only for the bodies it holds. `verifiedFilters` therefore asks `/info`
+where the node's data starts and scans from there, and the reports name the range
+they covered ("provably absent from heights 8..140") plus what they could not
+see. "Absent from every block I was given" is not "absent from the chain", and
+saying the latter is the one way a non-inclusion claim could mislead.
+
+**The verified-header cache.** A light client that re-downloads the header chain
+on every command is not light, and that is exactly what `dnas spv` did: every
+command PoW-verifies the chain before trusting anything, and every command
+fetched all of it. Headers are self-authenticating — each commits to its
+predecessor's hash and to its own proof of work — so the verified prefix can be
+KEPT ([cmd/dnas/headercache.go](cmd/dnas/headercache.go)) and only the suffix
+downloaded. Trust is unchanged: a fetched batch must link onto the cached tip and
+satisfy `ValidateHeaderChain`, a cache from another network or format version is
+discarded, and a node serving a different hash at a height we already hold is
+treated as a reorg — the cache is dropped and rebuilt, because a client cannot
+tell a reorg from a lie and the honest answer to both is to verify again. The
+filter-header chain is cached alongside for a stronger reason: it is a running
+hash, so a client with a verified prefix folds new filters onto it
+(`core.FoldFilterHeaders`) instead of re-folding from genesis, and a wallet that
+has scanned to height H fetches filters for H+1.. only.
+
 **Snapshot fast-sync (`core/snapshot.go`).** Because a header commits a
 `StateRoot`, the entire account set at a height can be verified in one shot:
 recompute `stateRoot(accounts)` and check it equals the (PoW-verified, ideally
@@ -845,19 +1194,119 @@ against the PoW-committed state root.
 `api/` exposes a small HTTP interface (`Handler()` is extracted so tests drive it
 with `httptest`). Highlights:
 
-- **Read:** `/info` (height, tip, work, mempool, `min_relay_fee`, `base_fee`,
-  peers, mining), `/chain`, `/balance/{addr}`, `/account/{addr}`, `/mempool`,
+- **Read:** `/info` (network, height, tip, work, mempool, `min_relay_fee`,
+  `base_fee`, peers, mining, and whether the address index and faucet are
+  available), `/chain`, `/balance/{addr}`, `/account/{addr}`, `/mempool`,
+  `/mempool/stats` (the pending queue's fee-rate distribution, §10),
   `/tx/{txhash}` (one transaction by id, answering for both stages of its life —
   `confirmed` with block and confirmation count via the transaction index, or
   `pending` from the mempool — so a wallet polls one endpoint from submission to
   confirmation instead of guessing which to ask), `/supply` (minted, burned,
   circulating and the conservation check, §9), `/peers`, `/address`,
   `/estimatefee?blocks=N` (recommended fee = base fee + estimated tip),
-  `/metrics` (Prometheus text).
+  `/metrics` (Prometheus text), and `/shares` (the share ledger, below).
+- **Paged bulk reads.** `/chain`, `/headers`, `/cfilters` and `/cfheaders` take
+  `?from=HEIGHT&limit=N` and answer at most `defaultPageLimit` (2000) entries.
+  They used to serialize the WHOLE chain into one response, which is a
+  memory-amplification attack anyone can run with curl, and which made the light
+  client the heaviest participant on the network (`dnas spv` re-fetched every
+  header on every command — tens of megabytes per invocation on a long chain).
+  The response stays a plain JSON array, so a client pages with `from` and reads
+  the total from `/info`. Since the chain is cached rather than re-folded (§12),
+  serving filter headers is now O(range) rather than O(chain).
+
+  `?last=N` was the missing half. Paging silently changed what an
+  *unparameterized* request means: every client that draws a chain view wants the
+  TAIL, and each of them was fetching the whole chain and slicing. Once `/chain`
+  was paged, "no parameters" started meaning "the OLDEST page", so the explorer,
+  the TUI and the GUI would all have sat frozen at genesis on a long chain.
+  Asking for the newest N has to be one request that does not depend on knowing
+  the height first; `from` and `last` together are refused rather than one being
+  quietly ignored.
+- **Peers, bans, and control:** `GET /peers` reports every live connection in
+  full — advertised address, remote IP, authenticated identity, negotiated
+  version, capabilities, direction, uptime, ban score, and whether a block
+  request is outstanding to it. All of that was already known per connection and
+  discarded in favour of a list of address strings, which cannot tell you which
+  peer is misbehaving or stalling. `GET /bans` lists scored keys *including those
+  below the threshold* (seeing a peer at 80 of 100 is most of the value of
+  scoring), `POST /unban` clears one — previously impossible without stopping the
+  node and editing `bans.json` — and `POST /addpeer` / `POST /droppeer` manage
+  connections at runtime.
+- **Chain analytics:** `GET /chainstats?window=N` ([core/chainstats.go](core/chainstats.go))
+  turns the header numbers into what they imply: estimated network hashrate
+  (window work ÷ elapsed time), the block-interval distribution against
+  `TargetBlockTime`, the difficulty range, fee/burn/tip totals with the fullest
+  block as a percentage of the limit, and the coinbase recipients of the window —
+  the closest thing to a hashpower distribution a chain this size has. Reporting
+  only; a node computing it differently is not on a different chain.
+- **Reorg history:** `GET /reorgs` ([node/reorghist.go](node/reorghist.go)) is a
+  bounded ring of the chain switches this node has lived through — depth, fork
+  height, both tips, and how many of the orphaned branch's payments were
+  re-queued — plus lifetime counters and the current orphan-pool depth. The SSE
+  stream announces a reorg to whoever is listening at that instant and then
+  forgets it; this is the record you want afterwards.
+- **Readiness:** `GET /health` answers 200 only when the node is actually usable
+  and **503 with the reasons** when it is not (no peers, behind the best known
+  height, at genesis, or sitting on a stale tip). `/info` cannot serve this
+  purpose: it answers 200 while syncing, un-peered, or on a tip that stopped
+  moving hours ago. `dnas health` exits non-zero to match, so it works as a
+  supervisor or CI check.
+- **Address history:** `GET /address/{addr}/history?from=&limit=` lists the
+  transactions that touched an address, oldest first, from the optional address
+  index (`-addrindex`, [core/addrindex.go](core/addrindex.go)). Without the index
+  the endpoint answers **503** rather than "no history", because a node that
+  simply is not indexing must not be mistaken for an address that has done
+  nothing. The index is opt-in because it is the one index whose size is not
+  bounded by the chain — an address appearing in a million transactions has a
+  million entries — and it is maintained across reorgs by the same
+  unindex-from-the-tip-down discipline as the transaction index.
 - **SPV / filters / state:** `/headers`, `/header/{index}`, `/block/{index}`,
   `/proof/{txhash}`, `/cfilters`, `/cfilter/{index}`, `/cfheaders`,
   `/stateproof/{addr}` (a balance proof against the header state root), and
   `/snapshot/{height}` (the full account state at a height, for fast-sync).
+- **Assets:** `GET /assets` (with `?ticker=X`) and `GET /asset/{id}` describe
+  what the chain has issued (`core/assetindex.go`). An asset id is
+  `hash(issuer, ticker, nonce)` and cannot be unpacked, so an account holding one
+  showed `tok3f2a…: 500` and nothing else — not the ticker, not the issuer, not
+  whether 500 is most of the supply. The registry is built as blocks connect,
+  rolled back with them, and always on: it is bounded by the number of issuances,
+  not of transfers. `?ticker=` returns a LIST on purpose — anyone may issue
+  "GOLD", so the id is the identifier and collapsing a ticker to one asset would
+  be choosing an issuer for the caller. `/asset/{id}` serves the held total next
+  to the issued supply, because an asset's total is conserved and a client can
+  then check that rather than trust the figure.
+- **Webhooks:** `-webhook URL` POSTs every event to a service that wants to be
+  *called* rather than hold an SSE connection open — a shop backend, a bot, a
+  cron job ([node/webhook.go](node/webhook.go)). Delivery runs off a bounded
+  queue on its own goroutine and never blocks block processing: a receiver far
+  enough behind to fill the queue loses events, which it had lost either way, and
+  stalling a node to wait for somebody's web server would be the wrong trade in
+  every direction. A 5xx or a transport error is retried a few times with a
+  growing delay; a 4xx is not, because a retry cannot fix a request the receiver
+  says is wrong. Every delivery carries the network and the node's height, so a
+  receiver can tell a regtest event from a mainnet one and can spot a gap.
+  `GET /webhooks` reports sent/failed/dropped/queued — a silently failing webhook
+  is otherwise invisible from outside, since "nothing" is also what a quiet chain
+  looks like.
+- **Rate limiting:** a token bucket per client IP in front of everything
+  ([api/ratelimit.go](api/ratelimit.go)), `-apirate`/`-apiburst`, answering
+  **429** with `Retry-After`. The peer protocol has had a per-peer bucket from
+  early on and the HTTP API had nothing, while being the cheaper target of the
+  two: no handshake, no protocol, just a URL — and the expensive endpoints are
+  plain GETs (`/chain?limit=2000` serializes two thousand blocks, `/snapshot`
+  walks the whole account state, `/stateproof` builds a proof per call). It keys
+  on the IP rather than host:port (a client uses a new source port per request)
+  and deliberately ignores `X-Forwarded-For`: trusting a client-set header would
+  let anyone claim a new identity per request, turning the limiter into a memory
+  allocator for the attacker. `/events` is exempt — it is one long-lived request
+  that then sends many messages, and dropping a live feed because of an unrelated
+  burst of reads would be the wrong answer.
+- **What this node can serve:** `/info` publishes `body_height`, `filter_base`
+  and the pruning counters, and `/block/{i}`, `/cfilter/{i}` and `/cfheaders`
+  answer **410 Gone** rather than 404 for data this node has pruned (§12). The
+  distinction is the whole point: a client told "not found" concludes the chain is
+  shorter than it is, when the right move is to ask another node.
 - **Events:** `GET /events` is a **Server-Sent Events** stream that pushes a
   small JSON envelope on every new block, reorg, and mempool transaction, so a
   browser (`EventSource`) or any HTTP client refreshes the instant something
@@ -869,25 +1318,69 @@ with `httptest`). Highlights:
   drops events rather than stalling the node's hot paths.
 - **Write (guarded):** `POST /send` (built + signed by the node wallet; optional
   nonce/expiry/lock_until/memo), `POST /tx` (a fully-signed tx incl. multisig,
-  HTLC, an asset transfer or an issuance), `POST /mine` (`{on}` toggles mining at
-  runtime), `POST /generate` (`{n}`, regtest only: mine N blocks on demand), and
-  `POST /submitblock` (accept a block mined by an external miner).
+  HTLC, a vault spend, a sponsored transfer, an asset transfer or an issuance),
+  `POST /mine` (`{on}` toggles mining at runtime), `POST /generate` (`{n}`,
+  regtest only: mine N blocks on demand), `POST /submitblock` (accept a block
+  mined by an external miner), `POST /submitshare` (below), and `POST /faucet`
+  (`{address}`, testnet/regtest only).
 - **Mining:** `GET /blocktemplate?address=ADDR` returns a candidate block (every
   field filled but the winning nonce) so an external miner (`dnas miner`) can hash
   it off-node and submit the result to `/submitblock` — mining is fully decoupled
-  from the node. When `DNAS_API_TOKEN`
+  from the node. Two things make that efficient rather than merely possible
+  ([node/shares.go](node/shares.go)):
+  - **Long poll.** `?longpoll=1&prev=HASH` holds the request until the tip moves
+    off `HASH` (or `&timeout=SECONDS` elapses), so a miner starts on a fresh
+    candidate the moment the old one dies instead of hashing a dead template until
+    its next poll. A `prev` the node has already passed answers immediately, so a
+    miner can never be parked waiting for a change it has missed.
+  - **Shares.** The template also carries `share_bits`, a deliberately easier
+    target. A hash that clears it proves work was done without being a block, which
+    is what lets a pool pay for hashpower that has not found one; `POST /submitshare`
+    accepts them and `GET /shares` reports the ledger. A share that also clears the
+    real target is submitted as the block it is, so a miner never has to tell the
+    two apart. None of this is consensus — no share is stored in the chain, and a
+    node that ignores them is on the same network.
+- **Faucet.** `POST /faucet {"address":…}` pays out of the node's own wallet on a
+  network whose parameters permit it — never mainnet, by definition rather than by
+  policy (`core.NetworkParams.Faucet`), so no flag can turn a real chain into a
+  free one. It is off unless the operator passes `-faucet`, and rate-limited by
+  recipient *and* by the client's connection IP (deliberately not a forwarded
+  header, which a client can set freely). It exists because otherwise joining a
+  throwaway network means asking a stranger for coin.
+
+  When `DNAS_API_TOKEN`
   is set these require an `Authorization: Bearer <token>` header
   (constant-time compared); read endpoints stay open, and an unset token leaves
   the whole API open (the localhost/toy default). The token is read from the
   environment, not a flag, so it doesn't leak into `ps`.
 - **Stateless wallet helpers:** `POST /multisig/address`, `POST /htlc/address`,
-  and `POST /wallet/hd` compute an address or derive HD addresses without
+  `POST /vault/address`, and `POST /wallet/hd` compute an address or derive HD addresses without
   touching node state or holding a secret. They exist so the thin clients (§16)
   share one crypto implementation instead of re-deriving it.
 
 The web explorer (`api/explorer.html`, embedded via `//go:embed`) is served at
-`/`: live status, expandable blocks, mempool, a send form, and an in-browser SPV
-verifier.
+`/`: live status, expandable blocks, mempool, the asset registry, a panel for
+what the node can serve (readiness, hashrate, reorgs, pruning), a send form, and
+an in-browser SPV verifier.
+
+One **search box** takes whatever identifier a person has and works out which it
+is: digits are a height, a `dnas` prefix is an address, and a 64-character hash
+is resolved by asking the node (transactions first, since that is what somebody
+pasting a hash almost always has, then the recent blocks — a node has no index
+from block hash to height, and the page says so rather than implying the search
+covered the whole chain).
+
+Its transaction line renders every form the ledger allows — multi-output, asset
+transfer, issuance, multisig, HTLC, vault, sponsored, memo, height window —
+because a page that shows a multi-recipient payment as a transfer of zero to
+nobody, or drops a memo and a deadline that are signed parts of the transaction,
+is showing something that did not happen. A memo is arbitrary data chosen by a
+stranger, so it is escaped like everything else on the page.
+
+The page reads `/health` through a helper that decodes the body whatever the
+status: readiness answers **503** with the reasons, and treating that as a
+transport error would drop the readiness line on exactly the nodes that are not
+ready.
 
 ---
 
@@ -897,8 +1390,11 @@ Both clients drive the same HTTP API and can launch a local node so mining works
 out of the box.
 
 - **TUI** (`tui/`, Go/bubbletea): live dashboard, send, SPV verify, mining
-  toggle, and — via the stateless helpers — multisig address derivation (`x`) and
-  HD wallet generate/restore (`h`).
+  toggle, a **fee-rate histogram** of the pending queue (from `/mempool/stats`), a
+  **transaction watcher** (`w`) that follows one payment from submission to
+  confirmation on the same refresh signal as everything else, and — via the
+  stateless helpers — multisig address derivation (`x`) and HD wallet
+  generate/restore (`h`).
 - **GUI** (`gui/`, PyQt6): the same plus a "Wallet tools" panel. Polling runs on
   a background thread and updates the UI via a Qt signal so a slow node never
   freezes the window.
@@ -913,11 +1409,39 @@ derivation is exposed as **stateless API endpoints** — one source of truth for
 the crypto. All of them attach `DNAS_API_TOKEN` to write requests when it is set,
 so a locked-down node still works from the same host.
 
+**Self-custodial mode.** Both clients paid through `POST /send`, which asks the
+*node* to sign with the *node's* wallet: fine for a private node you own, and
+against a shared one it spends somebody else's coin. Given `-key`/`--key` they
+sign locally instead — by running `dnas spv wallet -key … send`, not by
+implementing the transaction encoding a second and third time.
+
+That delegation is the deliberate part. The canonical encoding is what
+signatures cover; a hand-written copy of it in a UI is how a client comes to
+produce signatures a node rejects, or to verify one incorrectly. This project has
+already had exactly that bug, in the GUI's SPV header format, which went unnoticed
+because nothing exercised it. The cost is a process launch per payment and a
+dependency on the binary; a wallet is not a hot path, and `-spawn` already assumes
+the binary is there.
+
+Two details that only show up in practice: the CLI writes its log lines to stderr
+and its result to stdout, so the helpers keep the two streams apart (a merged
+stream has no reliable last line); and a refusal the CLI handles itself — an
+insufficient balance, a rejected transaction — is printed with a *zero* exit
+status, so the outcome is read from the output rather than inferred from the exit
+code.
+
 ---
 
 ## 17. Consensus parameters
 
-All in [`core/params.go`](core/params.go). Every node must agree on these.
+Mostly in [`core/params.go`](core/params.go); the rest live next to the code they
+govern — the proof-of-work targets and `lwmaWindow` in
+[core/target.go](core/target.go), `MaxTickerLen`/`MaxAssetSupply` in
+[core/asset.go](core/asset.go), `MaxPerSender` in [core/mempool.go](core/mempool.go),
+`DefaultShareFactor` in [core/share.go](core/share.go), `MaxMultisigKeys` in
+[wallet/wallet.go](wallet/wallet.go), `ProtocolVersion` in
+[node/protocol.go](node/protocol.go), and the network ids in
+[core/network.go](core/network.go). Every node must agree on the consensus ones.
 
 | Parameter             | Value            | Meaning                                   |
 |-----------------------|------------------|-------------------------------------------|
@@ -928,7 +1452,8 @@ All in [`core/params.go`](core/params.go). Every node must agree on these.
 | `PowLimit`            | ~2^244 target    | easiest target (difficulty floor); no hard ceiling — difficulty is unbounded |
 | `TargetBlockTime`     | 5 s              | desired spacing (LWMA retarget target)    |
 | `lwmaWindow`          | 20               | blocks the LWMA retarget averages over    |
-| `ProtocolVersion`     | 1                | P2P wire version (peers below are dropped) |
+| `ProtocolVersion`     | 2                | P2P wire version (peers below `MinProtocolVersion` = 1 are dropped) |
+| network id            | "" / `dnas-testnet` / `dnas-regtest` | bound into genesis, the signing preimage and the handshake (§5.1) |
 | `CoinbaseMaturity`    | 3                | blocks before a reward is spendable       |
 | `MaxReorgDepth`       | 100              | deepest reorg allowed (finality guard)    |
 | `MaxBlockTxs`         | 1000             | non-coinbase txs per block                |
@@ -951,6 +1476,12 @@ All in [`core/params.go`](core/params.go). Every node must agree on these.
 | `BaseFeeTargetTxs`    | MaxBlockTxs / 2  | per-block tx count the base fee targets    |
 | `BaseFeeMaxChangeDenominator` | 8        | max base-fee change per block (1/8 = 12.5%) |
 | `GenesisTimestamp`    | 1735689600       | fixed genesis time (2025-01-01Z)          |
+| `DefaultShareFactor`  | 256              | how many times easier a mining share is than a block (pool accounting, not consensus) |
+| `DefaultAddressHistoryLimit` / `MaxAddressHistoryLimit` | 100 / 1000 | paging bounds for the optional address index (policy) |
+| `defaultPageLimit` / `maxPageLimit` | 2000 | entries one bulk read returns (policy, [api/api.go](api/api.go)) |
+| `DefaultStatsWindow`  | 144              | blocks `/chainstats` covers by default (reporting) |
+| `reorgHistoryCapacity` | 64              | reorgs kept in the in-memory ring ([node/reorghist.go](node/reorghist.go)) |
+| `banThreshold`        | 100              | ban score at which a peer is cut off ([node/ban.go](node/ban.go)) |
 
 ---
 
@@ -984,6 +1515,21 @@ All in [`core/params.go`](core/params.go). Every node must agree on these.
 | State root in the header (balance proofs) | Light clients prove balances, not just inclusion | Another header field; proves membership only, not account absence |
 | Regtest = on-demand `/generate`, not fast continuous mining | Deterministic, controlled block production; no runaway chain | A separate mode; isolated by netkey rather than a distinct genesis |
 | Miner throttles empty blocks by one `TargetBlockTime`, overridable per node | An idle network doesn't fill with coinbase-only blocks | It caps how fast an idle chain advances regardless of hashpower, so devnets and tests must lower `EmptyBlockInterval` rather than wait it out |
+| Network id bound into genesis, the signing preimage and the handshake | A chain and its signatures belong to exactly one network; cross-network replay and accidental peering become impossible | A third thing every node must be configured with identically; mainnet keeps the empty id so nothing already stored changes |
+| Fee sponsorship with no sponsor nonce | An address holding nothing can transact; replay is already prevented by the sender's nonce, and the payer's own in-flight transactions are undisturbed | The pool must track a per-payer total, and a sponsor's affordability is state the sender cannot see |
+| Vault as a third hand-rolled script kind | A real new spending condition (delayed hot key, instant cold recovery) today, reusing the multisig/HTLC plumbing | One more special case consensus must carry until a script VM subsumes it; the height rule costs a second verification |
+| Address index opt-in, in memory | An explorer or wallet on a full node stops re-deriving history from filters | Its size is not bounded by the chain, and it is rebuilt at every startup |
+| Mempool reconciliation once per peer, after catch-up | A node that was offline learns pending payments instead of waiting for a rebroadcast | Asking before catch-up would reject everything (admission needs confirmed state), so it is one request, not a continuous protocol |
+| Shares as pool accounting outside consensus | A pool can pay for hashpower that has not found a block, and the mining path gets exercised far harder | The ledger is unauthenticated and node-local: it is lost on restart and a node operator could fake it |
+| Faucet allowed by the network, not by config | No flag, config key or API call can make a real chain give coin away | Testnet coin is free for anyone who can reach the node; the cooldown is a speed bump, not a defence |
+| Node identity in its own key file, never the wallet | The identity public key goes to every peer, and an address is a hash of a public key — sharing them publishes the node's wallet address | One more file to keep; an in-process node with no identity still falls back to the wallet (with a warning) |
+| Self-connections detected by identity, not address | The same host is reachable under several spellings, so a string comparison cannot see it; identity always can | The alias is only learned by completing a handshake with ourselves once |
+| Bulk reads paged, response shape unchanged | A node can no longer be asked to serialize its whole chain into one response, and clients page instead | Callers must page; and paging bounds the response, not the cumulative fold behind filter headers |
+| Light client keeps its verified headers | A command downloads only what is new instead of the whole chain, which is what "light" was supposed to mean | A cache file per wallet, and a reorg below its tip forces a full rebuild |
+| An unmineable transaction is displaced for free | A vault's cold-key rescue cannot be held hostage by a parked hot-key spend at the same nonce | One narrow exception to replace-by-fee that both the pool and its readers must know about |
+| Reorg history in a bounded in-memory ring | The one question worth asking after a surprise becomes answerable, without unbounded memory | Lost on restart; it is telemetry, not chain state |
+| /health separate from /info, exiting non-zero in the CLI | A supervisor can tell "running" from "usable"; /info answers 200 while syncing, un-peered or stale | Another endpoint, and a readiness policy (stale-tip window) that is a judgement call |
+| Log levels + optional JSON, wrapping the stdlib logger | A node's output can be quietened, turned up, or counted | Two output formats to keep readable; call sites carry key/value fields |
 | Checksums client-side only | Avoids a consensus validation cascade | A malicious client can still burn its own coins |
 | HMAC-SHA512 HD, not SLIP-0010 | Small and self-contained | Not interoperable with standard wallets |
 | TUI as its own module | Keeps external deps' `go.sum` off the internal v0.0.0 modules | It can't import `wallet`; multisig/HD go through API helpers |
@@ -993,6 +1539,16 @@ All in [`core/params.go`](core/params.go). Every node must agree on these.
 | SSE for the event stream, not WebSockets | One-directional, plain HTTP, zero deps, native `EventSource` | No client→server messaging over it (not needed) |
 | API auth as relay-style policy (token on writes only) | Locks spending/mining without breaking public reads or the explorer | Not per-user auth; a shared bearer token, reads unauthenticated |
 | Soft state persisted, chain authoritative | Warm restart (bans/peers/mempool survive) without trusting them | A hard kill can lose the latest soft state (re-synced from peers) |
+| Mempool and orphan pool bounded in BYTES as well as in count | A count limit is not a memory limit: 5000 relay-size transactions is ~500 MB of valid, unevictable state for about one block reward | Two budgets to reason about, and a big arrival may displace several small ones |
+| Pruning drops bodies but keeps the filter-header chain | A node's resident size stops tracking the chain, and it can still serve light clients the part it holds | It cannot serve old bodies, proofs or filters, and says so with 410 rather than 404 |
+| A body-less block serves NO filter | An empty filter is a proof of absence; serving one would tell a light client its address is provably not in a block the node cannot read | Filter lists are sparse on a pruning node, and clients must read the range they were actually given |
+| `MinPruneKeep` above `MaxReorgDepth` | A reorg replays the bodies it disconnects, so pruning into that range would leave a node unable to follow the chain | An operator's smaller `-prune` is silently raised (and logged) rather than honoured |
+| Message signing domain-separated from transaction signing | "Sign this to prove it's you" cannot be answered with a valid transfer | One more preimage format to keep straight, and the two must never converge |
+| Multisig/escrow spends travel as a file carrying their network | Members sign offline, which is the point of multisig, and a signature commits to one chain | A new file format per flow, versioned, that has to be refused rather than guessed at when unknown |
+| Webhooks never block the node | A shop's web server being down cannot slow block processing | Delivery is at-most-once: a receiver far enough behind loses events |
+| API rate limit keyed on IP, ignoring `X-Forwarded-For` | A client-set header would hand out a fresh bucket per request, making the limiter an allocator for the attacker | A node behind a real proxy must limit at the proxy |
+| The TUI and GUI delegate signing to the `dnas` binary | One copy of the consensus-critical encoding; this project has already shipped a client whose hand-written copy had silently rotted | A process launch per payment, and the binary must be present |
+| The console reads the node in process, not over HTTP | It works on a node whose API is unreachable, which is when it is most wanted | It duplicates the API's shape, and `-console` exists only so a script can drive it |
 
 ---
 
@@ -1014,8 +1570,19 @@ All in [`core/params.go`](core/params.go). Every node must agree on these.
   partition links on demand, then asserts that a network which forks under a
   partition re-converges on the most-work chain after healing — stressing reorg,
   fork choice and sync under conditions the plain integration tests don't reach.
+- **Delegation tests for the clients.** The TUI and GUI sign by running the
+  `dnas` binary (§16), so their tests stand a shell script in for it and check the
+  two things that can actually be wrong: the arguments passed, and that the
+  outcome is read from stdout rather than assumed from the exit code. Each script
+  writes its log line AFTER the result, which is precisely what a merged
+  stdout+stderr stream cannot survive.
 - **GUI tests** (`gui/test_dnas_gui.py`) run headless (`QT_QPA_PLATFORM=offscreen`)
-  against a stub HTTP server.
+  against a stub HTTP server. They now also cover the client's *own* crypto:
+  `header_string`, `compact_to_big` and `meets_target` must match
+  `core.Header.headerString`, `core.CompactToBig` and `meetsTarget` exactly, or
+  the client's proof-of-work check is meaningless — and it HAD fallen out of step,
+  silently, when the chain moved to an nBits target and a state root. Nothing
+  exercised the SPV path, so nothing noticed.
 - **Black-box end-to-end suite** (`e2e/`, behind the `e2e` build tag) starts the
   shipped `dnas` binary and drives it over HTTP and the CLI, importing no DNAS
   package. Everything above tests the code; this tests the *product* — wire
@@ -1029,12 +1596,69 @@ All in [`core/params.go`](core/params.go). Every node must agree on these.
   supplies Docker and nothing else, and a red run can only be the source.
 - **End-to-end demo** (`scripts/demo.sh`) runs a three-node network exercising
   auth, discovery, a converging transfer, expiry, the fee floor, multisig, HD,
-  and SPV.
+  and SPV. `scripts/htlc-demo.sh` settles both HTLC branches, and
+  `scripts/swap-demo.sh` settles a whole asset-for-coin atomic swap (both legs
+  funded, the preimage published by one claim and used by the other).
+- **What unit tests structurally cannot catch.** Everything above runs in one
+  process on one network, so the class of bug where a *client* and a *node*
+  disagree is invisible to it: the network id is part of a transaction's hash and
+  its signing preimage (§5.1), so a client on the wrong network produces
+  signatures and merkle roots the node rejects, and every in-process test agrees
+  with itself. Every bug of that shape found so far — an external miner
+  recomputing merkle roots on the wrong network, the faucet pricing its fee below
+  the node's own relay floor, and a multisig member signing offline on whatever
+  network their CLI defaulted to — was caught by running a real node and the real
+  CLI against it. That is what `e2e/` is for, and why it is worth its runtime.
+  The same round found two more that only a live run shows: `/account` served no
+  formatted balance, so the explorer's address search rendered "balance
+  undefined"; and a CLI flag written *after* a positional argument
+  (`dnas assets show ID -api URL`) silently queried the default node, because
+  Go's flag parser stops at the first positional.
+- **What regtest cannot deliver.** Block timestamps advance a second per block
+  and `MaxFutureDrift` is 120 seconds, so a single `/generate` call stops around
+  120 blocks in — a node refuses its own block as too far in the future. Any test
+  needing a deeper chain (pruning's 132-body floor, for instance) belongs in the
+  unit suites, where the chain is built directly, rather than in `e2e/`.
 
 `make test` runs the Go suites plus the GUI tests (skipped if PyQt6 is absent);
 `make test-race` runs the Go suites under the race detector; `make e2e` /
 `make e2e-docker` run the end-to-end suite, which the tagged build keeps out of
 the default runs.
+
+---
+
+## 19b. Logging and operability
+
+Everything a node had to say went through `log.Printf` at one volume: every
+accepted block, every peer connect and disconnect, with no way to quieten a busy
+node or turn up detail on one problem. On a chain producing a block every five
+seconds that is a log nobody reads, which is the same as no log at all.
+
+`node/logging.go` adds levels (`error`, `warn`, `info`, `debug`; `-loglevel`) and
+an optional machine-readable form (`-logjson`), one JSON object per line with the
+fields already separated — `accepted block 41 0000abc…` is fine for a human and
+useless to anything that wants to count blocks per hour. It wraps the standard
+logger rather than replacing it, so any remaining `log.Printf` still lands at
+info. Misbehaviour is WARN (a rejected peer, a dropped transaction, a discarded
+block), an unbuildable candidate is ERROR, and the rest is INFO.
+
+`-printconfig` answers the other operability question: a node's settings come
+from a JSON file and the command line, and several are then adjusted by the code
+(`-regtest` rewrites the network, a network supplies a default netkey, an unset
+`-nodekey` resolves to a path beside the chain, a `-prune` below the floor is
+raised, zero means "default"). The effective configuration is therefore not
+readable off either input, so the node can print the merged, resolved result and
+exit without touching the chain.
+
+**The console** (`cmd/dnas/repl.go`) is the third. A node started in a terminal
+drops into a prompt, and it is the only way to look at a node whose HTTP API is
+unreachable — which is exactly when somebody most wants to look. It had six
+commands (send, balance, address, info, peers, mempool) while the node grew a
+couple of dozen surfaces around it, so it now covers the same ground the API does,
+read directly out of the node in process: no HTTP, no token, no listener. Its
+commands are a table rather than a switch, so `help` cannot drift from what
+exists; `-console` forces the prompt on when stdin is a pipe, which is what makes
+it drivable by a script and testable at all.
 
 ---
 
@@ -1109,14 +1733,78 @@ See [scripts/README.md](scripts/README.md) for the script details.
   regtest (`NoRetarget`) holds it at the easy genesis floor for instant blocks.
 - Snapshot fast-sync bootstraps trustlessly (state verified against the header
   state root, anchored by a checkpoint) but the resulting pruned chain runs in
-  memory — persisting it through the index-based block store is future work.
+  memory — persisting it through the index-based block store is future work. A
+  fast-synced node also cannot fold the filter commitments of bodies it never
+  saw, so it reports `filter_base` above its snapshot and answers 410 below it:
+  it can validate the chain it has, and it cannot serve a light client the old
+  part of it.
+- `-prune` bounds a node's **resident** size, not its disk: the append-only store
+  still holds every block and a restart replays it. The bodies it drops take
+  their inclusion proofs and compact filters with them, which the node reports
+  (410, `body_height`) rather than answering "not found".
+- Webhook delivery is at-most-once behind a bounded queue: a receiver far enough
+  behind loses events rather than the node growing a backlog for it. A service
+  that must not miss a payment should reconcile against `/chain` or
+  `/address/{addr}/history`.
+- The API rate limit keys on the client IP and ignores `X-Forwarded-For` on
+  purpose (a client-set header would hand out a fresh bucket per request), so a
+  node behind a real proxy needs the limit at the proxy. It is also per-process:
+  nothing is shared between two nodes behind one address.
+- An invoice is matched by (address, amount, height ≥ its own), so two invoices
+  for the same amount at the same address cannot be told apart. The file says so;
+  a fresh address per invoice is the fix, and needs standard HD derivation to be
+  worth exporting.
+- A message signature is domain-separated from a transaction signature, so
+  neither can be replayed as the other — but it proves only control of a key at
+  the moment it was made. There is no revocation and no expiry on one.
+- The TUI and the GUI sign by shelling out to the `dnas` binary rather than
+  re-implementing the canonical encoding. That keeps one copy of the
+  consensus-critical part; it costs a process launch per payment and a dependency
+  on the binary being on the machine.
+- The asset registry describes what the chain issued, but a fast-synced node
+  cannot recover the issuances below its snapshot: the balances are in the
+  snapshot's state and the descriptions are not, and they only appear if the
+  chain is walked from a full peer.
 - Dandelion++ hides a transaction's origin along the stem, but on a tiny devnet
   with few peers the anonymity set is small; it is a demonstration of the scheme.
 - Native assets are balances committed in the state root; fees are always paid in
   coin (no per-asset fee market), and there is no scripting/contract layer — asset
   logic is limited to issue and transfer.
-- Regtest is isolated from a devnet by its network key, not a distinct genesis;
-  point it at a separate data directory.
+- Regtest and testnet now have their **own genesis** and their own signing
+  preimage (§5.1), so they are separate chains rather than the same chain behind a
+  different pre-shared key. Still point each at its own data directory: a store
+  from one network is refused by a node on another, but the error is easier to
+  read than to prevent.
+- The address index (`-addrindex`) is in memory and rebuilt at every startup, and
+  its size is bounded by *usage*, not by the chain: an address appearing in a
+  million transactions has a million entries. It is off by default for that
+  reason.
+- Mempool reconciliation is one request per peer, sent once we are caught up — not
+  a continuous set-reconciliation protocol. A transaction broadcast during the
+  window between that request and the peer's next push is still missed until
+  someone rebroadcasts it.
+- Mining shares are node-local, unauthenticated accounting: they are not stored in
+  the chain, they are lost on restart, and nothing stops a node operator from
+  reporting whatever ledger they like. That is enough to run a toy pool between
+  machines you control and nothing more.
+- Fee sponsorship makes a transaction's affordability depend on an account the
+  sender does not control. The mempool holds a sponsor to its whole queued total,
+  but a sponsor that spends its balance elsewhere still invalidates the
+  sponsorships it has outstanding, which are then dropped at the next block.
+- The faucet spends the node's own wallet with a per-address and per-IP cooldown.
+  On any network where the coin were worth something that would be far too weak —
+  which is why the network parameters, not a flag, decide whether one may exist.
+- Reorg history is a bounded (64-entry) in-memory ring, lost on restart: operator
+  telemetry rather than chain state.
+- `/chainstats` reports estimates. Hashrate is window work ÷ elapsed time, and
+  proof-of-work variance means a short window describes luck as much as
+  hashpower; a window whose blocks share a timestamp reports no rate at all
+  rather than an infinite one.
+- Paging bounds responses, not always work: a range of filter headers still
+  requires folding the chain from genesis, since that chain is cumulative. A
+  client holding its own verified prefix (the SPV header cache) pays neither.
+- `/health`'s stale-tip window is a fixed multiple of `TargetBlockTime`, not
+  something the operator can tune.
 
 Each limitation is a chosen stopping point. [ROADMAP.md](ROADMAP.md) turns this
 list into a prioritized plan (on-disk state trie, second implementation, script

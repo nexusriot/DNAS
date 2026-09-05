@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
 	"math/bits"
 	"sort"
 )
@@ -161,6 +162,14 @@ func (bc *Blockchain) BlockFilterAt(height uint64) (BlockFilter, bool) {
 	if height >= uint64(len(bc.blocks)) {
 		return BlockFilter{}, false
 	}
+	// A filter built from a body the node does not have is a valid EMPTY filter,
+	// and an empty filter is a proof that the block contains nothing. Serving one
+	// would tell a light client that its address is provably absent from a block
+	// this node simply cannot read (see prune.go). So a body-less height has no
+	// filter to offer, and says so.
+	if bc.blocks[height].IsPlaceholder() {
+		return BlockFilter{}, false
+	}
 	return BuildBlockFilter(bc.blocks[height]), true
 }
 
@@ -168,23 +177,94 @@ func (bc *Blockchain) BlockFilterAt(height uint64) (BlockFilter, bool) {
 func (bc *Blockchain) BlockFilters() []BlockFilter {
 	bc.mu.RLock()
 	defer bc.mu.RUnlock()
-	out := make([]BlockFilter, len(bc.blocks))
-	for i, b := range bc.blocks {
-		out[i] = BuildBlockFilter(b)
+	out := make([]BlockFilter, 0, len(bc.blocks))
+	for _, b := range bc.blocks {
+		if b.IsPlaceholder() {
+			continue // no body, so no filter: see BlockFilterAt
+		}
+		out = append(out, BuildBlockFilter(b))
 	}
 	return out
 }
 
-// FilterHeaders returns the filter-header chain over the whole chain's filters.
-func (bc *Blockchain) FilterHeaders() []string { return FilterHeaderChain(bc.BlockFilters()) }
+// BlockFiltersFrom returns up to max compact filters starting at the given
+// height, so a client can page through them instead of asking a node to
+// serialize one per block in a single response.
+func (bc *Blockchain) BlockFiltersFrom(from uint64, max int) []BlockFilter {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+	if from >= uint64(len(bc.blocks)) || max <= 0 {
+		return nil
+	}
+	end := from + uint64(max)
+	if end > uint64(len(bc.blocks)) {
+		end = uint64(len(bc.blocks))
+	}
+	out := make([]BlockFilter, 0, end-from)
+	for i := from; i < end; i++ {
+		if bc.blocks[i].IsPlaceholder() {
+			continue // no body, so no filter: see BlockFilterAt
+		}
+		out = append(out, BuildBlockFilter(bc.blocks[i]))
+	}
+	return out
+}
+
+// FilterHeaders returns the filter-header chain this node holds, from
+// FilterHeaderBase upwards.
+func (bc *Blockchain) FilterHeaders() []string {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+	return append([]string(nil), bc.filterHeaders...)
+}
+
+// FilterHeadersFrom returns up to max filter headers starting at the given
+// height. The chain is a running hash, so the values below `from` still have to
+// be folded to produce them — paging bounds the RESPONSE, not the work. A client
+// that keeps its own verified prefix (see the SPV header cache) folds
+// incrementally instead and pays neither.
+func (bc *Blockchain) FilterHeadersFrom(from uint64, max int) []string {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+	if max <= 0 || from < bc.filterBase {
+		// Below the base there is nothing to serve and nothing to invent: see
+		// FilterHeaderBase. The caller reports the gap rather than filling it.
+		return nil
+	}
+	start := from - bc.filterBase
+	if start >= uint64(len(bc.filterHeaders)) {
+		return nil
+	}
+	end := start + uint64(max)
+	if end > uint64(len(bc.filterHeaders)) {
+		end = uint64(len(bc.filterHeaders))
+	}
+	return append([]string(nil), bc.filterHeaders[start:end]...)
+}
 
 // FilterHeaderChain folds a sequence of block filters into a hash chain
 // (Fh[i] = sha256(commitment(filter[i]) || Fh[i-1])), mirroring BIP157 filter
 // headers. A client can fetch the chain once and then check that each filter it
 // downloads hashes into it, detecting a node that serves an inconsistent set.
 func FilterHeaderChain(filters []BlockFilter) []string {
-	out := make([]string, len(filters))
+	out, _ := FoldFilterHeaders("", filters)
+	return out
+}
+
+// FoldFilterHeaders continues the filter-header chain from a previous value, so
+// a client holding a verified prefix can extend it with just the new filters
+// instead of re-folding from genesis. An empty prevHex starts at genesis, making
+// this the general form of FilterHeaderChain.
+func FoldFilterHeaders(prevHex string, filters []BlockFilter) ([]string, error) {
 	var prev []byte
+	if prevHex != "" {
+		b, err := hex.DecodeString(prevHex)
+		if err != nil {
+			return nil, fmt.Errorf("previous filter header is not hex: %w", err)
+		}
+		prev = b
+	}
+	out := make([]string, len(filters))
 	for i, f := range filters {
 		h := sha256.New()
 		h.Write(f.commitment())
@@ -193,7 +273,7 @@ func FilterHeaderChain(filters []BlockFilter) []string {
 		out[i] = hex.EncodeToString(sum)
 		prev = sum
 	}
-	return out
+	return out, nil
 }
 
 // filterKey derives the 128-bit SipHash key from a block hash (its first 16
@@ -327,4 +407,56 @@ func (r *bitReader) readDelta() (uint64, bool) {
 		return 0, false
 	}
 	return (q << gcsP) | rem, true
+}
+
+// The filter-header chain is CACHED as blocks connect rather than recomputed on
+// demand, because it is a running hash over block bodies: on a node that prunes
+// (or that fast-synced from a snapshot) the old bodies are gone, and folding
+// over the ones that remain would produce a chain that agrees with nobody. A
+// cached chain stays correct for every height the node ever connected.
+//
+// It costs 32 bytes a block, against a body's kilobytes — which is the whole
+// bargain of BIP157: keep the commitments, drop the data.
+
+// extendFilterHeadersLocked appends the filter header for a newly connected
+// block. bc.mu held for writing.
+func (bc *Blockchain) extendFilterHeadersLocked(b Block) {
+	if b.IsPlaceholder() {
+		return // nothing to fold: a header-only block has no filter
+	}
+	prev := ""
+	if n := len(bc.filterHeaders); n > 0 {
+		prev = bc.filterHeaders[n-1]
+	}
+	next, err := FoldFilterHeaders(prev, []BlockFilter{BuildBlockFilter(b)})
+	if err != nil || len(next) != 1 {
+		return
+	}
+	bc.filterHeaders = append(bc.filterHeaders, next[0])
+}
+
+// truncateFilterHeadersLocked drops the cached headers above `fork`, for a reorg
+// that is about to replace those blocks. bc.mu held for writing.
+func (bc *Blockchain) truncateFilterHeadersLocked(fork uint64) {
+	if fork+1 < bc.filterBase {
+		return
+	}
+	keep := int(fork + 1 - bc.filterBase)
+	if keep < 0 {
+		keep = 0
+	}
+	if keep < len(bc.filterHeaders) {
+		bc.filterHeaders = bc.filterHeaders[:keep]
+	}
+}
+
+// FilterHeaderBase is the lowest height this node can serve a filter header for.
+// It is 0 for a node that has followed the chain from genesis — including one
+// that prunes bodies, since the cache outlives them — and the snapshot height
+// plus one for a node that fast-synced, which never saw the bodies below it and
+// so cannot fold their commitments.
+func (bc *Blockchain) FilterHeaderBase() uint64 {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+	return bc.filterBase
 }

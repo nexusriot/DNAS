@@ -26,6 +26,19 @@ const UpgradeDustLimit = "dustlimit"
 // transaction's id and no stored chain's validity.
 const UpgradeMultiOutput = "multioutput"
 
+// UpgradeVault, once active, allows spends authorized by a time-delayed vault
+// script (Transaction.Vault). Until then a transaction carrying one is rejected,
+// so no node accepts a block the rest of the network would refuse. Vault-
+// authorized spends encode only when the script is present (see codec.go), so
+// scheduling this changes no existing transaction id and no stored chain.
+const UpgradeVault = "vault"
+
+// UpgradeFeeSponsor, once active, allows a third party to pay a transaction's
+// fee (Transaction.FeePayer). It is height-activated for the same reason as the
+// others: the rule changes who must be able to afford the fee, so every node has
+// to start applying it at the same block.
+const UpgradeFeeSponsor = "feesponsor"
+
 var (
 	upgradesMu sync.RWMutex
 	upgrades   = map[string]uint64{}
@@ -35,7 +48,7 @@ var (
 // one by name is told immediately if it is misspelled, rather than running with a
 // rule that silently never activates — which on a network where the others did
 // activate means being forked off it.
-var knownUpgrades = []string{UpgradeDustLimit, UpgradeMultiOutput}
+var knownUpgrades = []string{UpgradeDustLimit, UpgradeMultiOutput, UpgradeVault, UpgradeFeeSponsor}
 
 // Upgrades lists the upgrade names this build understands.
 func Upgrades() []string { return append([]string(nil), knownUpgrades...) }

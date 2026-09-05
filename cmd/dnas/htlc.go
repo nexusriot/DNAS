@@ -29,11 +29,12 @@ import (
 // contract balance to -to minus the fee.
 func runHTLC(args []string) {
 	if len(args) == 0 {
-		fmt.Println(`usage: dnas htlc <new | address | claim | refund> [flags]
+		fmt.Println(`usage: dnas htlc <new | address | claim | refund | swap> [flags]
   new                                  print a fresh preimage and its sha256 hash
   address -hash -recipient -sender -timeout      derive the contract address (offline)
-  claim   -wallet -hash -sender -timeout -preimage -to [-api -fee]   spend via the hashlock
-  refund  -wallet -hash -recipient -timeout -to     [-api -fee]      reclaim after timeout`)
+  claim   -wallet -hash -sender -timeout -preimage -to [-asset ID] [-api -fee]  spend via the hashlock
+  refund  -wallet -hash -recipient -timeout -to     [-asset ID] [-api -fee]     reclaim after timeout
+  swap    -hash -asset-owner -coin-owner -asset ID ...   plan both legs of an asset-for-coin swap`)
 		return
 	}
 	switch args[0] {
@@ -45,6 +46,8 @@ func runHTLC(args []string) {
 		htlcSpend(args[1:], true)
 	case "refund":
 		htlcSpend(args[1:], false)
+	case "swap":
+		htlcSwap(args[1:])
 	default:
 		fmt.Println("unknown htlc command:", args[0])
 	}
@@ -91,7 +94,8 @@ func htlcSpend(args []string, claim bool) {
 	hash := fs.String("hash", "", "sha256(preimage) hex")
 	timeout := fs.Uint64("timeout", 0, "refund timeout height")
 	to := fs.String("to", "", "address to sweep the contract balance to")
-	fee := fs.Uint64("fee", core.DefaultMinRelayFee, "fee in base units")
+	fee := fs.Uint64("fee", core.DefaultMinRelayFee*1000, "fee in base units")
+	asset := fs.String("asset", "", "sweep this native asset instead of coin (the fee is still paid in the contract's coin)")
 	preimage := fs.String("preimage", "", "preimage hex (claim only)")
 	sender := fs.String("sender", "", "sender public key hex (claim only; the counterparty)")
 	recipient := fs.String("recipient", "", "recipient public key hex (refund only; the counterparty)")
@@ -114,21 +118,32 @@ func htlcSpend(args []string, claim bool) {
 		log.Fatalf("bad script: %v", err)
 	}
 	base := ensureHTTP(*apiAddr)
+	adoptNetwork(base) // the spend is signed below, and signatures are network-bound
 
 	acc, err := fetchAccount(base, addr)
 	if err != nil {
 		log.Fatalf("fetch contract account: %v", err)
 	}
-	if acc.Balance <= *fee {
-		log.Fatalf("contract balance %d does not cover the fee %d", acc.Balance, *fee)
+	// Fees are always paid in coin, so an asset contract needs coin of its own to
+	// spend itself — funding it with only the asset leaves it stuck.
+	if acc.Balance < *fee {
+		log.Fatalf("contract coin balance %s does not cover the fee %s",
+			core.FormatAmount(acc.Balance), core.FormatAmount(*fee))
+	}
+	amount := acc.Balance - *fee // coin sweep: everything the fee leaves behind
+	if *asset != "" {
+		if amount = acc.Assets[*asset]; amount == 0 {
+			log.Fatalf("contract holds none of asset %s", *asset)
+		}
 	}
 	tx := core.Transaction{
-		From:   addr,
-		To:     *to,
-		Amount: acc.Balance - *fee, // sweep the whole contract
-		Fee:    *fee,
-		Nonce:  acc.Nonce,
-		HTLC:   &core.HTLCScript{Hash: *hash, Recipient: recPub, Sender: sndPub, Timeout: *timeout},
+		From:    addr,
+		To:      *to,
+		Amount:  amount,
+		Fee:     *fee,
+		Nonce:   acc.Nonce,
+		AssetID: *asset,
+		HTLC:    &core.HTLCScript{Hash: *hash, Recipient: recPub, Sender: sndPub, Timeout: *timeout},
 	}
 	if claim {
 		raw, err := hex.DecodeString(*preimage)
@@ -149,8 +164,12 @@ func htlcSpend(args []string, claim bool) {
 	if claim {
 		kind = "claim"
 	}
+	what := core.FormatAmount(tx.Amount)
+	if *asset != "" {
+		what = fmt.Sprintf("%d of asset %s", tx.Amount, short(*asset))
+	}
 	fmt.Printf("submitted %s of %s (%s) from %s to %s\n",
-		kind, core.FormatAmount(tx.Amount), short(tx.Hash()), short(addr), short(*to))
+		kind, what, short(tx.Hash()), short(addr), short(*to))
 }
 
 // loadWallet loads a wallet key file, honouring DNAS_WALLET_PASSPHRASE for
@@ -164,8 +183,9 @@ func loadWallet(path string) (*wallet.Wallet, error) {
 
 // account mirrors the JSON returned by GET /account/{addr}.
 type account struct {
-	Balance uint64 `json:"balance"`
-	Nonce   uint64 `json:"nonce"`
+	Balance uint64            `json:"balance"`
+	Nonce   uint64            `json:"nonce"`
+	Assets  map[string]uint64 `json:"assets"`
 }
 
 func fetchAccount(base, addr string) (account, error) {

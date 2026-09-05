@@ -4,14 +4,18 @@ This is the honest backlog of what DNAS does **not** do yet. For what it *does*
 do, see [README.md](README.md) and [DESIGN.md](DESIGN.md); the trade-offs behind
 each shortcut are catalogued in [DESIGN.md §21 "Known limitations"](DESIGN.md).
 
-Where DNAS stands today: the three properties that separate a real coin from a
-demo are in place — **unbounded proof-of-work difficulty** (an LWMA-retargeted
-256-bit `nBits` target with no hard cap; `NoRetarget` only for regtest), a
-**canonical, implementation-independent consensus encoding** ([core/codec.go](core/codec.go))
-with a height-activated **upgrade path** ([core/upgrade.go](core/upgrade.go)), and
-a **permissionless, eclipse/DoS-hardened network** (open handshake, inbound caps,
-per-peer rate limiting). What remains is the long tail that turns a correct toy
-into something you could defend on a live network.
+Where DNAS stands today: the properties that separate a real coin from a demo are
+in place — **unbounded proof-of-work difficulty** (an LWMA-retargeted 256-bit
+`nBits` target with no hard cap; `NoRetarget` only for regtest), a **canonical,
+implementation-independent consensus encoding** ([core/codec.go](core/codec.go))
+with a height-activated **upgrade path** ([core/upgrade.go](core/upgrade.go)),
+**separate networks** whose id is bound into the genesis block, the signing
+preimage and the peer handshake ([core/network.go](core/network.go)), so a
+signature cannot be replayed across chains and nodes on different networks never
+try to converge, and a **permissionless, eclipse/DoS-hardened network** (open
+handshake, inbound caps, per-peer rate limiting, a node identity that is its own
+key rather than the operator's wallet). What remains is the long tail that turns
+a correct toy into something you could defend on a live network.
 
 It is still a learning project. Nothing below should be read as a promise to ship,
 and none of it makes DNAS money. **Do not point it at the internet.**
@@ -29,11 +33,19 @@ sections matter most for "toy → real".
   account *membership*, never *absence* (§21). A Merkle-Patricia or Verkle trie on
   disk gives O(1)-memory state, incremental root updates, and sorted-tree
   *non-membership* proofs. This also unblocks the item below.
-- **`[M]` Persist the fast-synced (pruned) chain.** Snapshot fast-sync verifies
-  state against the header state root and an anchoring checkpoint, but the pruned
-  chain then lives in memory (§21). Wire `SnapshotAt`/`NewFromSnapshot` through the
-  index-based block store with a base-offset so a fast-synced node restarts
-  without re-downloading.
+- **`[M]` Persist the fast-synced (pruned) chain, and prune the STORE.** A node
+  can now drop old bodies from memory (`-prune`, `core/prune.go`) and reports
+  honestly what it can no longer serve, but the append-only file on disk still
+  holds every block and a restart replays all of it — so pruning bounds resident
+  size, not disk. Wire `SnapshotAt`/`NewFromSnapshot` through the index-based
+  block store with a base offset, so a fast-synced or pruned node restarts
+  without re-downloading and without keeping what it discarded.
+- **`[M]` Fetch the filter-header chain during fast sync.** A fast-synced node
+  never saw the bodies below its snapshot, so it cannot fold their filter
+  commitments and reports `filter_base` above them (410 for anything lower).
+  Fetching the chain from a peer during fast-sync — and checking it against a
+  checkpoint — would close the one gap where such a node cannot serve a light
+  client at all.
 - **`[L]` A second implementation + cross-client consensus vectors.** The canonical
   codec makes a spec *possible*; only a second client (or, cheaper first step, a
   golden-vector suite — serialized tx/block/state hex → expected hash/validity)
@@ -89,7 +101,9 @@ sections matter most for "toy → real".
 - **`[M]` Authenticated / Tor-friendly transport.** The open handshake is anonymous
   and has no MITM authentication (§21). Optional peer-key pinning, an onion
   transport, and NAT traversal would harden and widen reach without giving up the
-  permissionless default.
+  permissionless default. Peer-key pinning now has something to pin: a node's
+  identity is a stable key of its own ([node/identity.go](node/identity.go))
+  rather than its wallet key.
 - **`[M]` Network-adjusted time.** Timestamp checks use the local clock; a
   median-of-peers offset (bounded, bitcoind-style) resists a node with a skewed
   clock being fooled on MTP/timestamp rules.
@@ -105,14 +119,20 @@ sections matter most for "toy → real".
   validates it. Per-message-type limits plus an `http.MaxBytesReader` on the write
   endpoints would price that properly. The `MsgGetChain` fallback is the same shape
   of problem: it serializes the whole chain (throttled per peer, but unbounded in
-  size) where a ranged request would do.
+  size) where a ranged request would do. The HTTP *read* side is now bounded —
+  `/chain`, `/headers`, `/cfilters` and `/cfheaders` are paged — so what remains
+  is inbound bodies and the P2P frames.
 
 ## 3. Programmability
 
-- **`[L]` Authorization script VM.** Multisig and HTLC are hand-rolled special
-  cases in consensus. A small, deterministic, gas/opcount-metered predicate
-  language would unify them behind one verifier and unlock covenants, vaults, and
-  richer spend conditions — the single highest-leverage expressiveness change.
+- **`[L]` Authorization script VM.** Multisig, HTLC and now the time-delayed
+  vault ([§5.2 in DESIGN.md](DESIGN.md)) are hand-rolled special cases in
+  consensus — the vault is the cheap version of exactly what a VM would express
+  generically, and it is the third of them, which is the argument for the VM
+  rather than a fourth. A small, deterministic, gas/opcount-metered predicate
+  language would unify them behind one verifier and unlock covenants, richer
+  vault policies, and arbitrary spend conditions — the single highest-leverage
+  expressiveness change.
 - **`[M]` Richer native-asset operations + optional per-asset fees.** Assets today
   support issue and transfer only, and fees are always paid in coin (§21). Add
   mint/burn/freeze authority ops and (optionally) allow fees to be paid in an
@@ -135,7 +155,11 @@ sections matter most for "toy → real".
   announced and pulled; transactions are still pushed in full to every peer, so
   each one crosses each link once per peer whether or not the peer already has it.
   Announcing the txid and letting peers request what they lack is the biggest
-  bandwidth win left after compact blocks.
+  bandwidth win left after compact blocks. A node now *reconciles* its pool once
+  per peer on catch-up (`MsgGetMempool`), which fixes the cold-start hole but is
+  not continuous reconciliation: a transaction broadcast in the gap between that
+  request and the next push is still missed until someone rebroadcasts. Announcing
+  by hash subsumes both.
 - **`[S/M]` Weight-based congestion signal.** The EIP-1559 base fee currently
   responds to transaction *count* (§9); switching the signal to block weight/bytes
   makes it track real demand.
@@ -150,32 +174,88 @@ sections matter most for "toy → real".
 ## 5. Wallet & UX
 
 - **`[M]` SLIP-0010 / BIP32 HD + hardware wallets.** HD derivation is a simple
-  HMAC-SHA512 scheme (§21). Standard derivation is the prerequisite for Ledger /
-  Trezor support and cross-wallet interop.
+  HMAC-SHA512 scheme (§21), and it is *hardened*, so there is no extended public
+  key to hand out — the light wallet's watch-only export is an address list
+  instead ([cmd/dnas/spvlabels.go](cmd/dnas/spvlabels.go)). Standard derivation is
+  the prerequisite for a real xpub, for Ledger / Trezor support, and for
+  cross-wallet interop.
 - **`[M]` bech32 addresses with consensus-checked checksums.** Recipient checksums
   are validated client-side only (§21), so a malicious client can still burn coins.
   A bech32 address format checked in consensus makes fat-finger and buggy-client
   burns impossible.
-- **`[M]` PSBT-style partially-signed transactions.** A portable partial-signature
-  format so multisig co-signers can pass a transaction around and sign offline.
-- **`[S]` BIP21 payment URIs + message sign/verify.** `dnas:` payment URIs for the
-  wallet/explorer, and detached "prove I own this address" signatures.
+- **`[S]` Fresh addresses per invoice.** `dnas invoice` matches a payment by
+  (address, amount, height), so two invoices for the same amount at the same
+  address are indistinguishable — the file says so, which is not the same as
+  fixing it. An HD-derived address per invoice would, and needs the standard
+  derivation above to be worth exporting.
+- **`[M]` A watch-only daemon around `invoice watch`.** Watching is a foreground
+  poll (`-wait`, `-every`): a shop wants something that survives a restart,
+  remembers which invoices are outstanding, and calls a webhook when one settles
+  rather than holding a terminal open.
+- **`[M]` PSBT-style partial signatures as a FORMAT.** `dnas multisig` and
+  `dnas sponsor` pass a transaction between signers as a JSON envelope carrying
+  the network it is for, which works and is not interoperable with anything: a
+  documented, versioned partial-signature encoding would be.
+- **`[S]` `dnas:` URIs in the clients.** `dnas invoice new` prints a
+  `dnas:ADDRESS?amount=…&memo=…` URI and `dnas invoice pay` reads the invoice
+  file, but nothing PARSES a pasted URI — not the TUI, the GUI or the explorer,
+  which is where somebody would paste one.
 
 ## 6. Ops, tooling & observability
 
 - **`[S]` Finish the Prometheus metrics + a Grafana dashboard.** `GET /metrics`
   already exports height, difficulty, mempool depth, peer count, the relay floor,
-  the base fee and the mining flag ([api/api.go](api/api.go)). What is missing is
-  the *counters* — reorgs, bans, orphans, blocks mined, block interval — which
-  need the node to keep them rather than the handler to read a gauge, plus a
-  dashboard JSON to ship alongside.
+  the base fee, the mining flag and the share ledger ([api/api.go](api/api.go)),
+  and the node now KEEPS the counters that were missing — reorg totals and depth
+  ([node/reorghist.go](node/reorghist.go)), orphan depth, ban scores, block
+  intervals and hashrate ([core/chainstats.go](core/chainstats.go)). What remains
+  is exporting them as Prometheus counters rather than only as JSON, plus a
+  dashboard to ship alongside.
 - **`[M]` JSON-RPC 2.0 interface.** The HTTP API is REST; a bitcoind-style JSON-RPC
   surface eases integration with existing tooling and block explorers.
 - **`[S]` systemd unit + RPM + wider release matrix.** A `.deb` and tagged CI
   releases exist; add a hardened systemd unit, an RPM, and darwin/windows to the
   default `dist` targets.
-- **`[S/M]` Richer web explorer.** Supply / difficulty / fee-rate charts, a rich
-  list, and per-address history on top of the existing in-browser SPV explorer.
+- **`[S/M]` Charts in the web explorer.** The page now has a universal search (a
+  height, a block hash, a transaction hash or an address), the asset registry, and
+  a panel for what the node can serve. What is still missing is anything over
+  TIME: supply / difficulty / fee-rate charts and a rich list. Every input exists
+  server-side — per-address history (`/address/{addr}/history` with `-addrindex`),
+  the mempool's fee-rate distribution (`/mempool/stats`), and hashrate / block
+  timing / fee flow (`/chainstats`) — so this is purely a rendering job. The TUI
+  draws the histogram and the PyQt client shows the stats; the web explorer is the
+  one client still showing only status, blocks and mempool.
+- **`[M]` Persist the address index.** It is in memory and rebuilt at every
+  startup ([core/addrindex.go](core/addrindex.go)), which is fine for a devnet and
+  not for a chain of any length. It also grows with an address's usage rather than
+  with the chain, so it wants an on-disk, paged representation rather than a map
+  of slices.
+- **`[M]` A real mining pool, not just shares.** Shares exist
+  ([node/shares.go](node/shares.go)) but the pool side does not: no per-miner
+  share difficulty (everyone gets the same target regardless of hashrate), no
+  variance-smoothing payout scheme (PPLNS/PPS), no persistence — the ledger is
+  lost on restart — and no authentication of who is submitting. Any of those makes
+  the current implementation a demonstration rather than something to point real
+  hashpower at.
+- **`[S/M]` A public testnet with seeds and a hosted faucet.** The pieces exist —
+  a distinct `testnet` network with its own genesis, and `-faucet` — but nothing is
+  hosted, so joining still means knowing someone's address. It wants DNS seeds
+  (the addrman item in §2), a public node, and a faucet whose abuse control is
+  better than a per-IP cooldown.
+- **`[M]` Persist the reorg history and the share ledger.** Both are in-memory
+  rings today ([node/reorghist.go](node/reorghist.go), [node/shares.go](node/shares.go)),
+  so a restart loses exactly the record you want after an incident, and a pool
+  loses its accounting. They want the same treatment the peer/ban/mempool soft
+  state already gets in [node/persist.go](node/persist.go).
+- **`[S]` Size-bound the HTTP write endpoints.** The API now has a per-client
+  token bucket (`-apirate`/`-apiburst`, 429 + `Retry-After`), but the write
+  endpoints still read a request body without `http.MaxBytesReader`, so a single
+  enormous POST is bounded only by the transaction size check that follows it.
+  The P2P side has both halves.
+- **`[S]` Binary block bodies on disk.** The block store's framing is binary but
+  each record is still the block's JSON ([core/store.go](core/store.go)).
+  Switching records to the canonical codec shrinks the file and speeds startup;
+  `dnas db export`/`import` already provides the migration path.
 - **`[S]` Expose the empty-block interval to operators.** The miner's idle throttle
   is a `node.Config` field (`EmptyBlockInterval`, default one `TargetBlockTime`),
   reachable only in Go — there is no `-emptyinterval` flag or `node.json` key, so a

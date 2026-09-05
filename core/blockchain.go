@@ -32,7 +32,26 @@ type Blockchain struct {
 	undos   [][]undoEntry    // undos[i] reverts blocks[i]'s state changes (undos[0] is nil)
 	store   *blockStore      // append-only persistence (nil = in-memory only)
 	txIndex map[string]TxLoc // txid -> where it is confirmed (see txindex.go)
-	burned  uint64           // cumulative base fee burned by connected blocks (see supply.go)
+	// addrIndex maps an address to every transaction that touched it. Optional
+	// (nil = disabled, the default) because its size is unbounded by the chain —
+	// see addrindex.go.
+	addrIndex map[string][]TxLoc
+	// assets describes every asset the chain has issued (id -> ticker, issuer,
+	// supply). Always on: it is bounded by the number of issuances, and without it
+	// an asset balance is an opaque id (see assetindex.go).
+	assets map[string]AssetInfo
+	burned uint64 // cumulative base fee burned by connected blocks (see supply.go)
+	// pruneKeep is how many recent block bodies to keep in memory; 0 keeps all of
+	// them (the default). pruned counts the bodies discarded so far. See prune.go.
+	pruneKeep uint64
+	pruned    uint64
+	// filterHeaders is the BIP157-style filter-header chain, cached as blocks
+	// connect and covering heights filterBase..tip. It is cached rather than
+	// recomputed because it is a running hash over block BODIES: once a body is
+	// pruned its filter cannot be rebuilt, and folding over what remains would
+	// produce a chain that disagrees with every other node's (see cfilter.go).
+	filterHeaders []string
+	filterBase    uint64
 	// sigCache remembers which transactions have already had their authorization
 	// verified, so a payment's signature is not re-checked when the block carrying
 	// it arrives (see valcache.go). Shared with the mempool by the node.
@@ -52,13 +71,16 @@ type undoEntry struct {
 	existed bool
 }
 
-// GenesisBlock is fixed and identical on every node; without this, two fresh
-// nodes would compute different genesis hashes and never agree on a chain.
+// GenesisBlock is fixed and identical on every node of a network; without this,
+// two fresh nodes would compute different genesis hashes and never agree on a
+// chain. It differs BETWEEN networks (the network id is bound into PrevHash, see
+// network.go), so a testnet or regtest chain can never be mistaken for the real
+// one — on mainnet the id is empty and the genesis hash is unchanged.
 func GenesisBlock() Block {
 	b := Block{
 		Index:     0,
 		Timestamp: GenesisTimestamp,
-		PrevHash:  GenesisPrevHash,
+		PrevHash:  genesisPrevHash(),
 		Bits:      GenesisBits,
 	}
 	b.MerkleRoot = MerkleRoot(b.Transactions)
@@ -72,12 +94,14 @@ func GenesisBlock() Block {
 func NewBlockchain() *Blockchain {
 	genesis := GenesisBlock()
 	return &Blockchain{
-		blocks:   []Block{genesis},
-		state:    map[string]Account{},
-		work:     BlockWork(genesis.Bits),
-		undos:    [][]undoEntry{nil}, // genesis has no undo (it is never rolled back)
-		txIndex:  map[string]TxLoc{}, // genesis carries no transactions
-		sigCache: NewValidationCache(DefaultValidationCacheSize),
+		filterHeaders: FilterHeaderChain([]BlockFilter{BuildBlockFilter(genesis)}),
+		blocks:        []Block{genesis},
+		state:         map[string]Account{},
+		work:          BlockWork(genesis.Bits),
+		undos:         [][]undoEntry{nil}, // genesis has no undo (it is never rolled back)
+		txIndex:       map[string]TxLoc{}, // genesis carries no transactions
+		assets:        map[string]AssetInfo{},
+		sigCache:      NewValidationCache(DefaultValidationCacheSize),
 	}
 }
 
@@ -276,6 +300,8 @@ func (bc *Blockchain) AddBlock(block Block) error {
 	bc.work.Add(bc.work, BlockWork(block.Bits))
 	bc.indexBlock(block)
 	bc.burned += blockBurned(block)
+	bc.extendFilterHeadersLocked(block)
+	bc.pruneLocked() // a no-op unless this node prunes (see prune.go)
 	return nil
 }
 
@@ -403,10 +429,15 @@ func (bc *Blockchain) reorgLocked(fork int, suffix []Block) (bool, []Block, erro
 	bc.state = state
 	bc.undos = undos
 	bc.work = candWork
+	bc.truncateFilterHeadersLocked(uint64(fork))
 	for i := fork + 1; i < len(blocks); i++ {
 		bc.indexBlock(blocks[i])
 		bc.burned += blockBurned(blocks[i])
+		bc.extendFilterHeadersLocked(blocks[i])
 	}
+	// A reorg can advance the tip by many blocks at once, which moves the prune
+	// cutoff with it.
+	bc.pruneLocked()
 	return true, disconnected, nil
 }
 
@@ -821,8 +852,11 @@ func validateCoinbaseShape(cb Transaction) error {
 	if cb.PubKey != "" || cb.Signature != "" || len(cb.Signatures) > 0 {
 		return errors.New("coinbase must not carry signatures")
 	}
-	if cb.Multisig != nil || cb.HTLC != nil || cb.Preimage != "" {
+	if cb.Multisig != nil || cb.HTLC != nil || cb.Vault != nil || cb.Preimage != "" {
 		return errors.New("coinbase must not carry an authorization script")
+	}
+	if cb.FeePayer != "" || cb.FeePayerPubKey != "" || cb.FeePayerSig != "" {
+		return errors.New("coinbase must not carry a fee sponsor (it pays no fee)")
 	}
 	if len(cb.Memo) > MaxMemoBytes {
 		return fmt.Errorf("coinbase memo too long (%d > %d)", len(cb.Memo), MaxMemoBytes)
@@ -856,6 +890,17 @@ func checkTxAtHeight(tx Transaction, height uint64) error {
 	}
 	if tx.HTLCRefundNotReady(height) {
 		return fmt.Errorf("htlc refund before timeout (timeout %d > height %d)", tx.HTLC.Timeout, height)
+	}
+	if tx.VaultHotNotReady(height) {
+		return fmt.Errorf("vault hot-key spend before unlock (unlock %d > height %d)", tx.Vault.Unlock, height)
+	}
+	// Height-activated rule (consensus upgrade): vault-authorized spends.
+	if tx.IsVault() && !IsUpgradeActive(UpgradeVault, height) {
+		return errors.New("vault spends are not active at this height")
+	}
+	// Height-activated rule (consensus upgrade): fee sponsorship.
+	if tx.IsSponsored() && !IsUpgradeActive(UpgradeFeeSponsor, height) {
+		return errors.New("fee sponsorship is not active at this height")
 	}
 	// Height-activated rule (consensus upgrade): multi-recipient transfers are
 	// only valid from their activation height, so the whole network starts
@@ -922,7 +967,14 @@ func applyTxsAndCoinbase(state map[string]Account, blocks []Block, block Block, 
 		}
 		seen[h] = true
 		reserve := immatureCoinbase(blocks, height, tx.From)
-		if err := applyTxTo(state, tx, reserve, set, cache); err != nil {
+		// A fee sponsor spends coin too, so its own immature coinbase is reserved
+		// exactly as the sender's is — otherwise a miner could pay everyone's fees
+		// out of a reward a reorg may yet take away.
+		var payerReserve uint64
+		if tx.IsSponsored() {
+			payerReserve = immatureCoinbase(blocks, height, tx.FeePayer)
+		}
+		if err := applyTxTo(state, tx, reserve, payerReserve, set, cache); err != nil {
 			return fail(&TxRejection{Index: i, Err: err})
 		}
 		tips += tx.Fee - minFee // base fee × size is burned; miner keeps only the tip
@@ -961,15 +1013,15 @@ func (bc *Blockchain) NextStateRoot(candidate Block) (string, error) {
 // applyTxTo validates a single signed transfer against state and applies it via
 // set (which records undo information). reserve is the sender's immature
 // coinbase amount that must remain unspent (coinbase maturity).
-func applyTxTo(state map[string]Account, tx Transaction, reserve uint64, set func(string, Account), cache *ValidationCache) error {
+func applyTxTo(state map[string]Account, tx Transaction, reserve, payerReserve uint64, set func(string, Account), cache *ValidationCache) error {
 	if err := cache.Verify(tx); err != nil {
 		return err
 	}
 	if tx.IsIssue() {
-		return applyIssue(state, tx, reserve, set)
+		return applyIssue(state, tx, reserve, payerReserve, set)
 	}
 	if tx.IsAssetTransfer() {
-		return applyAssetTransfer(state, tx, reserve, set)
+		return applyAssetTransfer(state, tx, reserve, payerReserve, set)
 	}
 	out, ok := tx.TotalOut()
 	if !ok {
@@ -978,7 +1030,7 @@ func applyTxTo(state map[string]Account, tx Transaction, reserve uint64, set fun
 	if out == 0 && tx.Fee == 0 {
 		return errors.New("empty transfer")
 	}
-	total := out + tx.Fee
+	total := out + senderFee(tx)
 	if total < out {
 		return errors.New("amount+fee overflow")
 	}
@@ -996,6 +1048,9 @@ func applyTxTo(state map[string]Account, tx Transaction, reserve uint64, set fun
 	sender.Balance -= total
 	sender.Nonce++
 	set(tx.From, sender)
+	if err := chargeSponsor(state, tx, payerReserve, set); err != nil {
+		return err
+	}
 
 	// Credit each recipient in turn, reading state back every time so a repeated
 	// recipient accumulates and a transaction paying its own sender nets correctly.
@@ -1013,7 +1068,7 @@ func applyTxTo(state map[string]Account, tx Transaction, reserve uint64, set fun
 // applyIssue mints a new asset to the sender: it pays the coin fee (respecting
 // coinbase maturity via reserve) and is credited Supply units of a fresh asset
 // whose id is bound to (issuer, ticker, nonce).
-func applyIssue(state map[string]Account, tx Transaction, reserve uint64, set func(string, Account)) error {
+func applyIssue(state map[string]Account, tx Transaction, reserve, payerReserve uint64, set func(string, Account)) error {
 	if err := validTicker(tx.Issue.Ticker); err != nil {
 		return err
 	}
@@ -1024,25 +1079,26 @@ func applyIssue(state map[string]Account, tx Transaction, reserve uint64, set fu
 	if tx.Nonce != sender.Nonce {
 		return fmt.Errorf("bad nonce for %s: got %d, want %d", tx.From, tx.Nonce, sender.Nonce)
 	}
-	need := tx.Fee + reserve
-	if need < tx.Fee {
+	fee := senderFee(tx)
+	need := fee + reserve
+	if need < fee {
 		return errors.New("fee+reserve overflow")
 	}
 	if sender.Balance < need {
-		return fmt.Errorf("insufficient spendable balance for %s: have %d, need fee %d (%d immature)", tx.From, sender.Balance, tx.Fee, reserve)
+		return fmt.Errorf("insufficient spendable balance for %s: have %d, need fee %d (%d immature)", tx.From, sender.Balance, fee, reserve)
 	}
-	sender.Balance -= tx.Fee
+	sender.Balance -= fee
 	sender.Nonce++
 	sender = sender.withAssetDelta(AssetID(tx.From, tx.Issue.Ticker, tx.Nonce), int64(tx.Issue.Supply))
 	set(tx.From, sender)
-	return nil
+	return chargeSponsor(state, tx, payerReserve, set)
 }
 
 // applyAssetTransfer moves tx.Amount of asset tx.AssetID from sender to
 // recipient. The fee is paid in coin (respecting coinbase maturity); the asset
 // amount is checked against the sender's asset balance. Supplies are capped
 // (MaxAssetSupply) so the arithmetic can't overflow.
-func applyAssetTransfer(state map[string]Account, tx Transaction, reserve uint64, set func(string, Account)) error {
+func applyAssetTransfer(state map[string]Account, tx Transaction, reserve, payerReserve uint64, set func(string, Account)) error {
 	if tx.Amount == 0 {
 		return errors.New("empty asset transfer")
 	}
@@ -1050,24 +1106,67 @@ func applyAssetTransfer(state map[string]Account, tx Transaction, reserve uint64
 	if tx.Nonce != sender.Nonce {
 		return fmt.Errorf("bad nonce for %s: got %d, want %d", tx.From, tx.Nonce, sender.Nonce)
 	}
-	need := tx.Fee + reserve
-	if need < tx.Fee {
+	fee := senderFee(tx)
+	need := fee + reserve
+	if need < fee {
 		return errors.New("fee+reserve overflow")
 	}
 	if sender.Balance < need {
-		return fmt.Errorf("insufficient coin for fee for %s: have %d, need %d (%d immature)", tx.From, sender.Balance, tx.Fee, reserve)
+		return fmt.Errorf("insufficient coin for fee for %s: have %d, need %d (%d immature)", tx.From, sender.Balance, fee, reserve)
 	}
 	if sender.Assets[tx.AssetID] < tx.Amount {
 		return fmt.Errorf("insufficient asset for %s: have %d, need %d", tx.From, sender.Assets[tx.AssetID], tx.Amount)
 	}
-	sender.Balance -= tx.Fee
+	sender.Balance -= fee
 	sender.Nonce++
 	sender = sender.withAssetDelta(tx.AssetID, -int64(tx.Amount))
 	set(tx.From, sender)
+	if err := chargeSponsor(state, tx, payerReserve, set); err != nil {
+		return err
+	}
 
 	recip := state[tx.To] // reflects the sender update when From == To
 	recip = recip.withAssetDelta(tx.AssetID, int64(tx.Amount))
 	set(tx.To, recip)
+	return nil
+}
+
+// senderFee is the part of a transaction's fee that comes out of the SENDER's
+// balance: all of it normally, none of it when a sponsor pays (see
+// chargeSponsor). The fee itself is unchanged either way — the base-fee portion
+// is still burned and the tip still goes to the miner; only who is debited moves.
+func senderFee(tx Transaction) uint64 {
+	if tx.IsSponsored() {
+		return 0
+	}
+	return tx.Fee
+}
+
+// chargeSponsor debits a sponsored transaction's fee from the fee payer, subject
+// to the payer's own coinbase-maturity reserve. It is a no-op for an unsponsored
+// transaction.
+//
+// The sponsor's NONCE is deliberately untouched: it is not the sponsor's
+// transaction. Replay is already impossible because the sponsor's signature
+// covers the sender and the sender's nonce, which the ledger consumes exactly
+// once — so a sponsorship is spent along with the transfer it paid for. Leaving
+// the nonce alone also means sponsoring does not disturb transactions the payer
+// has of its own in flight.
+func chargeSponsor(state map[string]Account, tx Transaction, reserve uint64, set func(string, Account)) error {
+	if !tx.IsSponsored() {
+		return nil
+	}
+	payer := state[tx.FeePayer]
+	need := tx.Fee + reserve
+	if need < tx.Fee {
+		return errors.New("fee+reserve overflow")
+	}
+	if payer.Balance < need {
+		return fmt.Errorf("fee sponsor %s cannot cover the fee: have %d, need %d (%d immature)",
+			tx.FeePayer, payer.Balance, tx.Fee, reserve)
+	}
+	payer.Balance -= tx.Fee
+	set(tx.FeePayer, payer)
 	return nil
 }
 

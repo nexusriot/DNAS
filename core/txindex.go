@@ -31,6 +31,8 @@ func (bc *Blockchain) indexBlock(b Block) {
 		}
 		bc.txIndex[h] = TxLoc{Height: b.Index, Index: i}
 	}
+	bc.indexBlockAddressesLocked(b)
+	bc.indexBlockAssetsLocked(b)
 }
 
 // unindexBlock drops b's transactions from the index, leaving entries that point
@@ -43,6 +45,8 @@ func (bc *Blockchain) unindexBlock(b Block) {
 			delete(bc.txIndex, h)
 		}
 	}
+	bc.unindexBlockAddressesLocked(b)
+	bc.unindexBlockAssetsLocked(b)
 }
 
 // buildTxIndex indexes a whole chain from scratch, for a Blockchain assembled

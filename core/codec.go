@@ -18,6 +18,20 @@ import "encoding/binary"
 // flag then their fields; slices a 4-byte count then each element.
 const txCodecVersion byte = 1
 
+// Leading tag bytes for the optional trailing blocks of the encoding. They are
+// chosen so no two optional blocks can begin with the same byte: the multi-output
+// block is untagged (it predates them) and begins with the high byte of its u32
+// count, which is 0x00 for any transaction that passes validation (CheckTxSanity
+// bounds the count by MaxTxOutputs). Nothing weaker is needed — a transaction
+// that fails validation is never applied, and a signature is only ever verified
+// against the one network whose id is in the preimage.
+const (
+	netIDTag    byte = 1 // network id, in the signed fields
+	feePayerTag byte = 2 // fee sponsor address, in the signed fields
+	feeAuthTag  byte = 3 // fee sponsor key + signature, in the authorization fields
+	vaultTag    byte = 4 // vault script, in the authorization fields
+)
+
 // cbuf is a tiny append-only canonical-encoding buffer.
 type cbuf struct{ b []byte }
 
@@ -66,17 +80,35 @@ func (t Transaction) signedFields(c *cbuf) {
 		c.byte(0)
 	}
 	c.str(t.Memo)
-	// Multi-recipient outputs are appended ONLY when present, so a single-output
-	// transaction encodes exactly as it did before they existed: its txid, its
-	// signing bytes and its fee-bearing size are all unchanged, and a stored chain
-	// still replays. Nothing is ambiguous either — every field before this is
-	// length-prefixed, so the trailing block cannot be confused with Memo's content.
+	// Everything below is appended ONLY when present, so a plain single-output,
+	// unsponsored transaction on mainnet encodes exactly as it did before any of
+	// these existed: its txid, its signing bytes and its fee-bearing size are all
+	// unchanged, and a stored chain still replays. The blocks are also mutually
+	// unambiguous — each optional one begins with a distinct leading byte (see the
+	// tag constants), and every field is length-prefixed, so no trailing block can
+	// be confused with the content of the field before it.
+	//
+	// The network id binds a signature to ONE chain: the same transfer signed on
+	// testnet produces a different preimage than on mainnet, so it cannot be
+	// replayed across networks (see network.go). Mainnet's id is empty and writes
+	// nothing.
+	if id := NetworkID(); id != "" {
+		c.byte(netIDTag)
+		c.str(id)
+	}
 	if len(t.Outputs) > 0 {
 		c.u32(uint32(len(t.Outputs)))
 		for _, o := range t.Outputs {
 			c.str(o.To)
 			c.u64(o.Amount)
 		}
+	}
+	// The fee payer is signed by the SENDER as well as by the sponsor: the sender
+	// authorizes who is charged, and binding it here keeps it from being a
+	// malleability handle (an unsigned field covered by the txid).
+	if t.FeePayer != "" {
+		c.byte(feePayerTag)
+		c.str(t.FeePayer)
 	}
 }
 
@@ -116,5 +148,21 @@ func (t Transaction) canonicalBytes() []byte {
 		c.byte(0)
 	}
 	c.str(t.Preimage)
+	// Appended only when present, for the same reason as the optional signed
+	// blocks above: a transaction that uses neither feature encodes as it always
+	// did. The sponsor's authorization is NOT part of the signing bytes (the
+	// sender cannot produce it), but it is part of the txid, so it is covered by
+	// the block's merkle root once mined.
+	if t.FeePayer != "" {
+		c.byte(feeAuthTag)
+		c.str(t.FeePayerPubKey)
+		c.str(t.FeePayerSig)
+	}
+	if t.Vault != nil {
+		c.byte(vaultTag)
+		c.str(t.Vault.Hot)
+		c.str(t.Vault.Cold)
+		c.u64(t.Vault.Unlock)
+	}
 	return c.b
 }

@@ -1,7 +1,11 @@
 package main
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/nexusriot/DNAS/core"
@@ -113,7 +117,7 @@ func TestSPVWalletSendBuildAndNonce(t *testing.T) {
 	w, _ := wallet.New()
 	bob, _ := wallet.New()
 
-	tx, err := buildSend(w, bob.Address(), 3*core.Coin, 1000, 5, "")
+	tx, err := buildSend(w, bob.Address(), 3*core.Coin, 1000, 5, "", sendOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -218,7 +222,7 @@ func TestBuildSendManyIsSignedOverEveryOutput(t *testing.T) {
 	b, _ := wallet.New()
 	outs := []core.Output{{To: a.Address(), Amount: 100}, {To: b.Address(), Amount: 200}}
 
-	tx, err := buildSendMany(w, outs, 5000, 3)
+	tx, err := buildSendMany(w, outs, 5000, 3, sendOptions{})
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -233,4 +237,137 @@ func TestBuildSendManyIsSignedOverEveryOutput(t *testing.T) {
 	if err := tampered.VerifySignature(); err == nil {
 		t.Error("the signature still verifies after an output amount was changed")
 	}
+}
+
+// Memo, expiry and lock-until are signed consensus fields that no client could
+// set: the transaction struct carried them, the node validated them, and every
+// wallet built transactions with all three left at zero. So a payment could not
+// be given a deadline, which is the only thing that stops a signed transfer from
+// being minable indefinitely at a nonce that has not moved.
+func TestSendOptionsAreSignedIntoTheTransaction(t *testing.T) {
+	w, _ := wallet.New()
+	bob, _ := wallet.New()
+	opts := sendOptions{Memo: "invoice 42", Expiry: 900, LockUntil: 100}
+
+	tx, err := buildSend(w, bob.Address(), core.Coin, 1000, 5, "", opts)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if tx.Memo != opts.Memo || tx.Expiry != opts.Expiry || tx.LockUntil != opts.LockUntil {
+		t.Fatalf("options were dropped: %+v", tx)
+	}
+	if err := tx.VerifySignature(); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	// They must be COVERED by the signature, or they are advisory decoration a
+	// relay could rewrite: the memo would be forgeable and the deadline removable.
+	for _, tamper := range []func(*core.Transaction){
+		func(x *core.Transaction) { x.Memo = "invoice 43" },
+		func(x *core.Transaction) { x.Expiry = 0 },
+		func(x *core.Transaction) { x.LockUntil = 0 },
+	} {
+		altered := tx
+		tamper(&altered)
+		if err := altered.VerifySignature(); err == nil {
+			t.Fatalf("a rewritten field still verified: %+v", altered)
+		}
+	}
+
+	// The same three fields on a batch payment.
+	outs := []core.Output{{To: bob.Address(), Amount: core.Coin}}
+	batch, err := buildSendMany(w, outs, 5000, 3, opts)
+	if err != nil {
+		t.Fatalf("build batch: %v", err)
+	}
+	if batch.Memo != opts.Memo || batch.Expiry != opts.Expiry || batch.LockUntil != opts.LockUntil {
+		t.Fatalf("options were dropped from a batch: %+v", batch)
+	}
+	if err := batch.VerifySignature(); err != nil {
+		t.Fatalf("verify batch: %v", err)
+	}
+}
+
+// The checks that must happen before signing, because after signing the wallet
+// has already advanced its own nonce and the node's answer is a bare rejection.
+func TestSendOptionsRefuseWhatCannotBeMined(t *testing.T) {
+	w, _ := wallet.New()
+	bob, _ := wallet.New()
+	for _, tc := range []struct {
+		name string
+		opts sendOptions
+	}{
+		{"memo over the consensus limit", sendOptions{Memo: strings.Repeat("x", core.MaxMemoBytes+1)}},
+		{"lock above expiry", sendOptions{Expiry: 100, LockUntil: 200}},
+	} {
+		if _, err := buildSend(w, bob.Address(), core.Coin, 1000, 0, "", tc.opts); err == nil {
+			t.Errorf("%s was signed anyway", tc.name)
+		}
+		if _, err := buildSendMany(w, []core.Output{{To: bob.Address(), Amount: 1}}, 1000, 0, tc.opts); err == nil {
+			t.Errorf("%s was signed anyway on a batch", tc.name)
+		}
+	}
+	// A memo exactly at the limit is fine — the boundary is inclusive.
+	if _, err := buildSend(w, bob.Address(), core.Coin, 1000, 0, "",
+		sendOptions{Memo: strings.Repeat("x", core.MaxMemoBytes)}); err != nil {
+		t.Fatalf("a memo at exactly the limit was refused: %v", err)
+	}
+	// And consensus agrees about the impossible window, so the client is not
+	// enforcing a rule of its own invention.
+	dead := core.Transaction{From: w.Address(), To: bob.Address(), Amount: 1, Fee: 1,
+		Expiry: 100, LockUntil: 200}
+	if err := core.CheckTxSanity(dead); err == nil {
+		t.Fatal("consensus accepts a transaction whose height window cannot be satisfied")
+	}
+}
+
+// The relative forms are what a person actually means ("expire in 20 blocks"),
+// but a signature has to commit to an absolute height, so they are resolved
+// against the node's tip before signing.
+func TestSendOptionsResolveRelativeHeights(t *testing.T) {
+	base := heightServer(t, 500)
+
+	got, err := sendOptions{expireIn: 20, lockFor: 5}.resolveHeights(base)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if got.Expiry != 520 || got.LockUntil != 505 {
+		t.Fatalf("resolved to expiry %d / lock %d, want 520 / 505", got.Expiry, got.LockUntil)
+	}
+	// Absolute values are passed through untouched.
+	got, err = sendOptions{Expiry: 501, LockUntil: 500}.resolveHeights(base)
+	if err != nil {
+		t.Fatalf("resolve absolute: %v", err)
+	}
+	if got.Expiry != 501 || got.LockUntil != 500 {
+		t.Fatalf("absolute heights were rewritten: %+v", got)
+	}
+	// An expiry already in the past cannot be mined, so it is refused here rather
+	// than by the node after the nonce has been spent locally.
+	if _, err := (sendOptions{Expiry: 500}).resolveHeights(base); err == nil {
+		t.Fatal("an expiry at the current height was accepted")
+	}
+	if _, err := (sendOptions{Expiry: 12}).resolveHeights(base); err == nil {
+		t.Fatal("an expiry below the current height was accepted")
+	}
+	// Giving both forms of the same bound is a contradiction, not a merge.
+	if _, err := (sendOptions{Expiry: 600, expireIn: 10}).resolveHeights(base); err == nil {
+		t.Fatal("-expiry and -expire-in were both accepted")
+	}
+	if _, err := (sendOptions{LockUntil: 600, lockFor: 10}).resolveHeights(base); err == nil {
+		t.Fatal("-lock-until and -lock-for were both accepted")
+	}
+	// Nothing set means no node call at all, so an offline build still works.
+	if _, err := (sendOptions{}).resolveHeights("http://127.0.0.1:1"); err != nil {
+		t.Fatalf("plain send needed the node: %v", err)
+	}
+}
+
+// heightServer serves an /info reporting the given height.
+func heightServer(t *testing.T, height uint64) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"height": height, "network": core.NetworkName()})
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
 }

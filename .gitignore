@@ -18,6 +18,39 @@ node.json
 *.log
 pid
 
+# KEY MATERIAL. A node's identity key is a private key like the wallet's — it
+# is created on first run beside -db (so it can land in a subdirectory, hence no
+# leading slash) and committing it would publish the identity peers know a node
+# by. Backups are key material too, encrypted or not.
+nodekey*.json
+dnas-backup*.json
+
+# Light-client caches: the verified header chain (-cache) and the per-wallet
+# copy each `spv wallet` keeps beside its state file. Derived from the chain and
+# rebuilt on demand.
+spvheaders*.json
+*.headers
+
+# The transaction files the multi-party flows pass between signers, and the
+# receipts `dnas anchor add` leaves beside the file it anchored. Each is either
+# a half-authorized transaction or a claim about someone's document — local
+# working state, and in the sponsor/multisig case a spend somebody is still
+# collecting signatures for.
+multisig-spend*.json
+escrow*.json
+sponsored-tx*.json
+invoice*.json
+*.dnasanchor
+
+# Every other .json in the REPOSITORY ROOT. The docs walk a reader through
+# creating key files and half-signed transactions by name — m1.json, cold.json,
+# buyer.json, spend.json, sig.json, bundle.json and a couple of dozen more — and
+# enumerating them here goes stale the moment a new flow is documented. Nothing
+# legitimately tracked lives at the root as .json today (the only committed one
+# in the repo is .claude/launch.json, which this does not match). If that ever
+# changes, add a `!name.json` exception below rather than dropping the rule.
+/*.json
+
 # ---- Go build output ----
 # root-built binaries (go build -o dnas ./cmd/dnas), race build, and the TUI
 # binaries; make writes to bin/ and dist/

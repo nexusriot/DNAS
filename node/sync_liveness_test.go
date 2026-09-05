@@ -2,7 +2,9 @@ package node
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
+	"net"
 	"testing"
 	"time"
 
@@ -54,7 +56,7 @@ func TestOutOfOrderBlocksStillConnect(t *testing.T) {
 // The pool is bounded and refuses blocks that are invalid on their own terms, so
 // a peer cannot use it to spend a node's memory cheaply.
 func TestOrphanPoolIsBoundedAndPicky(t *testing.T) {
-	pool := newOrphanPool(3)
+	pool := newOrphanPool(3, orphanPoolBytes)
 	blocks := chainOfBlocks(t, 5)
 	for _, b := range blocks {
 		pool.add(b)
@@ -223,4 +225,122 @@ func recordingPeer(t *testing.T) (*peer, chan Message) {
 		}
 	}()
 	return p, out
+}
+
+// A pool bounded only by a block COUNT is not bounded in memory: at the old cap
+// of 200 blocks, 200 maximum-size blocks come to half a gigabyte, and a peer can
+// send them for the cost of mining nothing at all (an orphan's proof of work is
+// checked, but on a low-difficulty fork that is cheap). So the pool carries a
+// byte budget as well, and whichever binds first evicts.
+func TestOrphanPoolHoldsAByteBudget(t *testing.T) {
+	blocks := chainOfBlocks(t, 5)
+	one := blockBytes(blocks[0])
+	if one == 0 {
+		t.Fatal("a block with a coinbase should not measure 0 bytes")
+	}
+
+	// Room for two blocks by bytes, with the count cap far above that, so bytes bind.
+	pool := newOrphanPool(100, 2*one+one/2)
+	for _, b := range blocks {
+		pool.add(b)
+	}
+	if pool.len() >= len(blocks) {
+		t.Fatalf("pool holds all %d blocks, so the byte budget evicted nothing", pool.len())
+	}
+	if pool.byteLen() > pool.maxBytes {
+		t.Fatalf("pool holds %d bytes, over its %d-byte budget", pool.byteLen(), pool.maxBytes)
+	}
+
+	// The accounting must survive removal too, or the budget leaks until the pool
+	// refuses everything.
+	for _, b := range blocks {
+		pool.takeChildren(b.PrevHash)
+	}
+	if pool.len() != 0 || pool.byteLen() != 0 {
+		t.Fatalf("after draining: %d blocks, %d bytes", pool.len(), pool.byteLen())
+	}
+
+	// A single block larger than the whole budget is refused rather than accepted
+	// and then evicting everything else to make room for itself.
+	tiny := newOrphanPool(100, 1)
+	if tiny.add(blocks[0]) {
+		t.Fatal("a block larger than the entire budget was buffered")
+	}
+	if tiny.byteLen() != 0 {
+		t.Fatalf("the refused block still accounts for %d bytes", tiny.byteLen())
+	}
+}
+
+// A dead peer address was retried every 3 seconds for as long as the node ran:
+// 1200 connection attempts an hour, per address, forever. The interval has to
+// grow, and it has to stop growing.
+func TestDialBackoffGrowsAndIsCapped(t *testing.T) {
+	d := dialRetryInterval
+	for i := 0; i < 20; i++ {
+		next := nextDialDelay(d, dialRetryInterval)
+		if next < d {
+			t.Fatalf("delay went backwards: %v then %v", d, next)
+		}
+		if next > dialRetryMax {
+			t.Fatalf("delay %v is above the %v cap", next, dialRetryMax)
+		}
+		d = next
+	}
+	if d != dialRetryMax {
+		t.Fatalf("after 20 failures the delay is %v, want the %v cap", d, dialRetryMax)
+	}
+	// It must grow FAST enough to matter: reaching the cap should take a handful
+	// of failures, not hundreds.
+	var steps int
+	for d := dialRetryInterval; d < dialRetryMax; d = nextDialDelay(d, dialRetryInterval) {
+		steps++
+		if steps > 12 {
+			t.Fatalf("took more than 12 failures to reach the cap")
+		}
+	}
+	// And a zero or negative delay (a misconfigured caller) must not spin.
+	if got := nextDialDelay(0, dialRetryInterval); got != dialRetryInterval {
+		t.Fatalf("nextDialDelay(0) = %v, want %v", got, dialRetryInterval)
+	}
+	if got := nextDialDelay(-time.Second, dialRetryInterval); got != dialRetryInterval {
+		t.Fatalf("nextDialDelay(-1s) = %v, want %v", got, dialRetryInterval)
+	}
+}
+
+// The backoff must not punish a good peer: a connection that was established and
+// later dropped is retried promptly, because that peer has just proven it exists.
+func TestDialBackoffResetsAfterAGoodConnection(t *testing.T) {
+	n, _, _ := testNode(t)
+	defer n.Shutdown()
+	n.dialBase = 5 * time.Millisecond // the backoff SHAPE is what matters, not the seconds
+
+	var attempts int
+	established := make(chan struct{}, 1)
+	n.dialFn = func(addr string) (net.Conn, error) {
+		attempts++
+		if attempts == 3 {
+			// Hand back a connection that immediately closes: handleConn returns and
+			// the loop retries, but the backoff should be back to its floor.
+			mine, theirs := net.Pipe()
+			theirs.Close()
+			select {
+			case established <- struct{}{}:
+			default:
+			}
+			return mine, nil
+		}
+		return nil, errors.New("refused")
+	}
+
+	go n.dialLoop("192.0.2.1:19999")
+	select {
+	case <-established:
+	case <-time.After(30 * time.Second):
+		t.Fatalf("the dial loop gave up after %d attempts", attempts)
+	}
+	// Two failures, each waited out at a doubled interval, then the successful
+	// dial — reached without ever waiting the capped interval.
+	if attempts < 3 {
+		t.Fatalf("only %d attempts", attempts)
+	}
 }

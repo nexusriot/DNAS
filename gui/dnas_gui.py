@@ -31,6 +31,46 @@ from PyQt6.QtWidgets import (
 COIN = 100_000_000
 
 
+def header_string(hdr) -> str:
+    """The exact preimage a block header hashes over. It must match
+    core.Header.headerString byte for byte, or every proof-of-work check here is
+    meaningless — this client fell out of step with it once already, when the
+    chain moved from a leading-zero difficulty to a 256-bit nBits target and
+    gained a state root."""
+    return "%d|%d|%s|%s|%s|%d|%d|%d" % (
+        hdr["index"], hdr["timestamp"], hdr["prev_hash"], hdr["merkle_root"],
+        hdr["state_root"], hdr["base_fee"], hdr["bits"], hdr["nonce"])
+
+
+def compact_to_big(bits: int) -> int:
+    """Decode a compact nBits target into the 256-bit integer it represents
+    (mantissa x 256^(exponent-3)), mirroring core.CompactToBig."""
+    mantissa = bits & 0x007FFFFF
+    exponent = bits >> 24
+    if exponent <= 3:
+        return mantissa >> (8 * (3 - exponent))
+    return mantissa << (8 * (exponent - 3))
+
+
+def difficulty_of(bits: int) -> str:
+    """Human-readable difficulty (PowLimit / target), the display-only ratio
+    core.TargetDifficulty computes. Blocks carry `bits`, not a difficulty."""
+    target = compact_to_big(bits)
+    if target <= 0:
+        return "—"
+    pow_limit = (1 << 244) - 1
+    return "%.2f" % (pow_limit / target)
+
+
+def meets_target(block_hash: str, bits: int) -> bool:
+    """Proof of work is a target comparison, not a count of leading zeros: the
+    hash read as a big-endian integer must be <= the target."""
+    try:
+        return int(block_hash, 16) <= compact_to_big(bits)
+    except ValueError:
+        return False
+
+
 def sha(s: str) -> str:
     return hashlib.sha256(s.encode()).hexdigest()
 
@@ -74,8 +114,11 @@ class Api:
     def balance(self, addr):
         return self._get("/balance/" + addr).get("balance_fmt", "")
 
-    def chain(self):
-        return self._get("/chain")
+    def chain(self, last=12):
+        """The NEWEST `last` blocks. The bulk reads are paged, so a plain
+        /chain returns the first page — the oldest blocks once a chain passes
+        the page limit, which would freeze this view in the past."""
+        return self._get("/chain?last=%d" % last)
 
     def mempool(self):
         return self._get("/mempool")
@@ -101,11 +144,12 @@ class Api:
         return r.get("mnemonic", ""), r.get("addresses", [])
 
     def verify(self, txh: str) -> str:
+        """Light-client check, done here rather than trusted: recompute the
+        header hash, check it meets the 256-bit target the header commits to,
+        then fold the merkle proof up to the header's root."""
         pr = self._get("/proof/" + txh)
         hdr = self._get("/header/%d" % pr["block_index"])
-        hs = "%d|%d|%s|%s|%d|%d" % (hdr["index"], hdr["timestamp"], hdr["prev_hash"],
-                                    hdr["merkle_root"], hdr["difficulty"], hdr["nonce"])
-        pow_ok = sha(hs) == hdr["hash"] and hdr["hash"].startswith("0" * hdr["difficulty"])
+        pow_ok = sha(header_string(hdr)) == hdr["hash"] and meets_target(hdr["hash"], hdr["bits"])
         h = txh
         for step in pr["proof"]:
             h = sha(h + step["hash"]) if step["right"] else sha(step["hash"] + h)
@@ -114,21 +158,139 @@ class Api:
             return "PROVEN in block %d (%d confirmations)" % (pr["block_index"], pr["confirmations"])
         return "FAILED (pow=%s inclusion=%s)" % (pow_ok, inc)
 
+    # --- the surfaces the node grew and this client had not caught up with ---
+
+    def peers_detail(self):
+        return self._get("/peers")
+
+    def chain_stats(self, window=0):
+        return self._get("/chainstats" + ("?window=%d" % window if window else ""))
+
+    def mempool_stats(self):
+        return self._get("/mempool/stats")
+
+    def health(self):
+        """Readiness, which /info cannot report: it answers 200 while syncing,
+        un-peered or sitting on a stale tip. A 503 body carries the reasons."""
+        try:
+            return self._get("/health")
+        except urllib.error.HTTPError as e:
+            try:
+                return json.load(e)
+            except (ValueError, json.JSONDecodeError):
+                raise
+        except urllib.error.URLError:
+            raise
+
+    def address_history(self, addr, limit=25):
+        return self._get("/address/%s/history?limit=%d" % (addr, limit))
+
+    def faucet(self, addr):
+        return self._post("/faucet", {"address": addr})
+
+    def vault_address(self, hot, cold, unlock):
+        r = self._post("/vault/address", {"hot": hot, "cold": cold, "unlock": unlock})
+        return r.get("address", "")
+
+
+class LocalWallet:
+    """Spending your OWN key from the GUI.
+
+    Every payment this GUI could make went through POST /send, which asks the
+    NODE to sign with the node's wallet: fine for a private node you own, and
+    useless otherwise — against a shared node you would be spending somebody
+    else's coin, and to spend your own you would have to hand them your key.
+
+    Signing locally here would mean re-implementing Ed25519 signing AND the
+    canonical transaction encoding in Python. That encoding is consensus
+    critical, and a second hand-written copy of it in a UI is exactly how a
+    client comes to produce signatures a node rejects — this GUI has already had
+    that bug once, in its SPV header format. So the signing is delegated to the
+    `dnas` binary, which holds the one implementation:
+
+        dnas spv -api URL wallet -f STATE -key KEY [-memo M] send <to> <amount> [fee]
+
+    The key file never leaves the machine and the node only ever receives a
+    signed transaction.
+    """
+
+    def __init__(self, dnas_bin: str, key_file: str, state_file: str = "spvwallet.json"):
+        self.dnas_bin = dnas_bin
+        self.key_file = key_file
+        self.state_file = state_file
+        self.address = ""
+
+    def enabled(self) -> bool:
+        return bool(self.key_file)
+
+    def _run(self, args, timeout=60):
+        """Run the binary, returning (code, stdout, stderr) SEPARATELY.
+
+        Keeping them apart matters: the CLI writes its log lines to stderr and
+        its result to stdout, so a merged stream has no reliable last line — the
+        log would be read as the outcome.
+        """
+        out = subprocess.run([self.dnas_bin] + args, capture_output=True, text=True, timeout=timeout)
+        return out.returncode, (out.stdout or "").strip(), (out.stderr or "").strip()
+
+    def resolve(self) -> str:
+        """Return the key file's address, raising if the setup does not work.
+
+        Done before any payment, so a missing key file or a wrong binary is
+        reported up front rather than in the middle of sending money.
+        """
+        code, out, err = self._run(["wallet", "address", "-o", self.key_file], timeout=20)
+        addr = last_line(out)
+        if code != 0 or not addr.startswith("dnas"):
+            raise RuntimeError(last_line(err) or out or "no output from " + self.dnas_bin)
+        self.address = addr
+        return addr
+
+    def send(self, api: str, to: str, amount: str, fee: str = "", memo: str = "") -> str:
+        args = ["spv", "-api", api, "wallet", "-f", self.state_file, "-key", self.key_file]
+        if memo:
+            args += ["-memo", memo]
+        args += ["send", to, amount]
+        if fee:
+            args.append(fee)
+        code, out, err = self._run(args)
+        line = last_line(out)
+        # A refusal the CLI handles itself (an insufficient balance, a rejected
+        # transaction) is printed with a ZERO exit status, so the outcome has to be
+        # read rather than inferred from the exit code.
+        if code != 0 or not line.startswith("submitted"):
+            raise RuntimeError(line or last_line(err) or "send failed")
+        return line
+
+
+def last_line(text: str) -> str:
+    """The final non-empty line of some output: the CLI's result, after any logs."""
+    for line in reversed((text or "").strip().splitlines()):
+        if line.strip():
+            return line.strip()
+    return ""
+
 
 class Poller(QObject):
     """Background poller; emits state to the GUI thread via a Qt signal."""
     updated = pyqtSignal(dict)
     failed = pyqtSignal(str)
 
-    def __init__(self, api: Api):
+    def __init__(self, api: Api, own_address: str = ""):
         super().__init__()
         self.api = api
+        # The address whose balance the wallet panel should show. Empty means the
+        # node's own, which is the right answer only in node-signed mode.
+        self.own_address = own_address
         self._stop = False
 
     def run(self):
         while not self._stop:
             try:
-                addr = self.api.address()
+                # In self-custodial mode the wallet panel is about the LOCAL key;
+                # showing the node's own balance there would be showing money the
+                # user cannot spend.
+                addr = self.own_address or self.api.address()
                 data = {
                     "info": self.api.info(),
                     "addr": addr,
@@ -136,6 +298,16 @@ class Poller(QObject):
                     "chain": self.api.chain(),
                     "mempool": self.api.mempool(),
                 }
+                # The rest are newer node surfaces; a node that predates any of
+                # them still polls fine, so each is best-effort rather than
+                # fatal to the whole snapshot.
+                for key, fetch in (("stats", self.api.chain_stats),
+                                   ("health", self.api.health),
+                                   ("peers", self.api.peers_detail)):
+                    try:
+                        data[key] = fetch()
+                    except Exception:  # noqa: BLE001 (optional surface)
+                        pass
                 self.updated.emit(data)
             except Exception as e:  # noqa: BLE001 (report any connectivity error)
                 self.failed.emit(str(e))
@@ -146,9 +318,17 @@ class Poller(QObject):
 
 
 class Main(QWidget):
-    def __init__(self, api_addr: str, dnas_bin: str):
+    def __init__(self, api_addr: str, dnas_bin: str, key_file: str = "", state_file: str = "spvwallet.json"):
         super().__init__()
         self.dnas_bin = dnas_bin
+        self.wallet = LocalWallet(dnas_bin, key_file, state_file)
+        if self.wallet.enabled() and not self.wallet.address:
+            # main() has normally resolved this already (and exits if it cannot);
+            # doing it here too keeps a directly-constructed window working.
+            try:
+                self.wallet.resolve()
+            except Exception:  # noqa: BLE001 (reported by main(); the panel just shows nothing)
+                pass
         self.node_proc = None
         self.mining = False
         self.setWindowTitle("DNAS")
@@ -176,17 +356,25 @@ class Main(QWidget):
         ov = QGroupBox("Overview")
         g = QGridLayout(ov)
         self.lbl = {}
-        for i, k in enumerate(["height", "difficulty", "work", "mempool", "min fee", "peers", "mining"]):
+        for i, k in enumerate(["network", "height", "difficulty", "work", "mempool",
+                               "min fee", "peers", "mining", "hashrate"]):
             g.addWidget(QLabel(k + ":"), i // 3, (i % 3) * 2)
             self.lbl[k] = QLabel("—")
             g.addWidget(self.lbl[k], i // 3, (i % 3) * 2 + 1)
+        # Readiness, which the overview numbers cannot express: a node answers
+        # /info happily while syncing, un-peered, or sitting on a stale tip.
+        self.health_lbl = QLabel("—")
+        self.health_lbl.setWordWrap(True)
+        g.addWidget(self.health_lbl, 3, 0, 1, 6)
         self.mine_btn = QPushButton("Toggle mining")
         self.mine_btn.clicked.connect(self._toggle_mining)
-        g.addWidget(self.mine_btn, 3, 0, 1, 6)
+        g.addWidget(self.mine_btn, 4, 0, 1, 6)
         root.addWidget(ov)
 
         # wallet
-        wal = QGroupBox("This node's wallet")
+        # Which key a payment comes from is not a detail: node-signed spends the
+        # node's coin, self-custodial spends yours. The panel title says which.
+        wal = QGroupBox("Your wallet (signed locally)" if self.wallet.enabled() else "This node's wallet")
         wl = QVBoxLayout(wal)
         self.addr_lbl = QLabel("—")
         self.addr_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -249,13 +437,34 @@ class Main(QWidget):
         tgl.addWidget(self.hd_result, 6, 0, 1, 2)
         root.addWidget(tools)
 
+        # node tools: the faucet (testnet/regtest only) and address history
+        nt = QGroupBox("Node tools (faucet / address history)")
+        ng = QGridLayout(nt)
+        self.faucet_addr = QLineEdit()
+        self.faucet_addr.setPlaceholderText("address to fund (blank = this node's own wallet)")
+        faucet_btn = QPushButton("Ask the faucet")
+        faucet_btn.clicked.connect(self._faucet)
+        self.hist_addr = QLineEdit()
+        self.hist_addr.setPlaceholderText("address to look up (needs a node started with -addrindex)")
+        hist_btn = QPushButton("Show history")
+        hist_btn.clicked.connect(self._history)
+        self.node_result = QLabel("")
+        self.node_result.setWordWrap(True)
+        self.node_result.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        ng.addWidget(QLabel("faucet"), 0, 0); ng.addWidget(self.faucet_addr, 0, 1); ng.addWidget(faucet_btn, 0, 2)
+        ng.addWidget(QLabel("history"), 1, 0); ng.addWidget(self.hist_addr, 1, 1); ng.addWidget(hist_btn, 1, 2)
+        ng.addWidget(self.node_result, 2, 0, 1, 3)
+        root.addWidget(nt)
+
         # tables
         tabs = QHBoxLayout()
         self.blocks = self._table(["#", "hash", "tx", "diff"])
         self.mp = self._table(["from", "to", "amount", "fee"])
+        self.peers = self._table(["peer", "dir", "ver", "up", "score"])
         bg = QGroupBox("Recent blocks"); QVBoxLayout(bg).addWidget(self.blocks)
         mg = QGroupBox("Mempool"); QVBoxLayout(mg).addWidget(self.mp)
-        tabs.addWidget(bg); tabs.addWidget(mg)
+        pg = QGroupBox("Peers"); QVBoxLayout(pg).addWidget(self.peers)
+        tabs.addWidget(bg); tabs.addWidget(mg); tabs.addWidget(pg)
         root.addLayout(tabs, 1)
 
     def _table(self, cols):
@@ -270,7 +479,7 @@ class Main(QWidget):
         self.api = Api(addr)
         self.api_edit.setText(addr)
         self._stop_poller()
-        self.poller = Poller(self.api)
+        self.poller = Poller(self.api, self.wallet.address if self.wallet.enabled() else "")
         self.poller.updated.connect(self.apply_state)
         self.poller.failed.connect(lambda e: self.status.setText("● offline: " + e))
         self._thread = threading.Thread(target=self.poller.run, daemon=True)
@@ -286,6 +495,7 @@ class Main(QWidget):
         info = d.get("info", {})
         self.mining = bool(info.get("mining"))
         self.status.setText("● live — " + self.api.base)
+        self.lbl["network"].setText(str(info.get("network", "—")))
         self.lbl["height"].setText(str(info.get("height", "—")))
         self.lbl["difficulty"].setText(str(info.get("next_difficulty", "—")))
         self.lbl["work"].setText(str(info.get("work", "—")))
@@ -293,17 +503,31 @@ class Main(QWidget):
         self.lbl["min fee"].setText("%.8f" % (info.get("min_relay_fee", 0) / COIN))
         self.lbl["peers"].setText(str(len(info.get("peers") or [])))
         self.lbl["mining"].setText("ON" if self.mining else "off")
+        stats = d.get("stats") or {}
+        self.lbl["hashrate"].setText(stats.get("hashrate_fmt") or "—")
         self.addr_lbl.setText("address: " + (d.get("addr") or "(none)"))
         self.bal_lbl.setText("balance: " + (d.get("balance") or "—"))
+
+        health = d.get("health") or {}
+        if health:
+            if health.get("ok"):
+                self.health_lbl.setText("ready — tip %s old, %d block(s) behind" % (
+                    health.get("tip_age", "?"), health.get("blocks_behind", 0)))
+            else:
+                self.health_lbl.setText("NOT READY: " + "; ".join(health.get("reasons") or ["unknown"]))
 
         blocks = d.get("chain") or []
         recent = list(reversed(blocks))[:12]
         self.blocks.setRowCount(len(recent))
         for r, b in enumerate(recent):
+            # Blocks commit a compact nBits target, not the old integer
+            # difficulty this column used to read (which rendered as "None").
             vals = [str(b.get("index")), (b.get("hash") or "")[:14],
-                    str(len(b.get("transactions") or [])), str(b.get("difficulty"))]
+                    str(len(b.get("transactions") or [])), difficulty_of(b.get("bits", 0))]
             for c, v in enumerate(vals):
                 self.blocks.setItem(r, c, QTableWidgetItem(v))
+
+        self._fill_peers(d.get("peers") or [])
 
         mp = d.get("mempool") or []
         self.mp.setRowCount(len(mp))
@@ -313,6 +537,45 @@ class Main(QWidget):
             for c, v in enumerate(vals):
                 self.mp.setItem(r, c, QTableWidgetItem(v))
 
+    def _fill_peers(self, peers):
+        self.peers.setRowCount(len(peers))
+        for r, p in enumerate(peers):
+            addr = p.get("addr") or (p.get("ip", "") + " (no hello)")
+            vals = [addr, "in" if p.get("inbound") else "out", str(p.get("version", "")),
+                    p.get("connected", ""), str(p.get("ban_score", 0))]
+            for c, v in enumerate(vals):
+                self.peers.setItem(r, c, QTableWidgetItem(v))
+
+    def _faucet(self):
+        """Ask the node's faucet for coin. It only exists on testnet/regtest and
+        only when the operator enabled it, so a refusal here is normal."""
+        addr = self.faucet_addr.text().strip() or (self.addr_lbl.text().split(": ", 1)[-1])
+        try:
+            r = self.api.faucet(addr)
+            self.node_result.setText("faucet sent %s to %s (%s)" % (
+                r.get("amount_fmt", "?"), r.get("to", addr), (r.get("hash") or "")[:12]))
+        except Exception as e:  # noqa: BLE001
+            self.node_result.setText("faucet: " + str(e))
+
+    def _history(self):
+        """Show an address's history from the node's index, if it keeps one."""
+        addr = self.hist_addr.text().strip()
+        if not addr:
+            self.node_result.setText("give an address to look up")
+            return
+        try:
+            r = self.api.address_history(addr)
+            lines = ["%d entr%s (total %d):" % (r.get("count", 0),
+                                                "y" if r.get("count") == 1 else "ies",
+                                                r.get("total", 0))]
+            for e in r.get("entries") or []:
+                lines.append("  block %s  %s  (%s confs)" % (
+                    e.get("height"), (e.get("hash") or "")[:12], e.get("confirmations")))
+            self.node_result.setText("\n".join(lines))
+        except Exception as e:  # noqa: BLE001
+            self.node_result.setText("history: " + str(e) +
+                                     "  (the node needs -addrindex)")
+
     def _toggle_mining(self):
         try:
             self.api.set_mining(not self.mining)
@@ -321,6 +584,15 @@ class Main(QWidget):
 
     def _send(self):
         try:
+            if self.wallet.enabled():
+                # Signed locally. The amount and fee are passed through as written,
+                # so the CLI's parser is the only thing that interprets them.
+                line = self.wallet.send(
+                    self.api.base, self.to_edit.text().strip(),
+                    self.amt_edit.text().strip(), self.fee_edit.text().strip(),
+                    self.memo_edit.text().strip())
+                self.send_result.setText(line)
+                return
             amount = round(float(self.amt_edit.text()) * COIN)
             fee = round(float(self.fee_edit.text() or "0") * COIN)
             h = self.api.send(self.to_edit.text().strip(), amount, fee, self.memo_edit.text().strip())
@@ -380,10 +652,21 @@ class Main(QWidget):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--api", default="localhost:8080")
-    ap.add_argument("--dnas", default="dnas", help="path to the dnas binary (for Launch local node)")
+    ap.add_argument("--dnas", default="dnas", help="path to the dnas binary (for Launch local node and --key)")
+    ap.add_argument("--key", default="", help="sign payments locally with this key file (self-custodial; the node never sees it)")
+    ap.add_argument("--wallet", default="spvwallet.json", help="light-wallet state file used with --key")
     args = ap.parse_args()
     app = QApplication(sys.argv)
-    win = Main(args.api, args.dnas)
+    # A broken self-custodial setup is reported before the window opens, rather
+    # than when somebody presses Send.
+    if args.key:
+        probe = LocalWallet(args.dnas, args.key, args.wallet)
+        try:
+            print("signing locally as", probe.resolve())
+        except Exception as e:  # noqa: BLE001
+            print("self-custodial mode:", e, file=sys.stderr)
+            sys.exit(1)
+    win = Main(args.api, args.dnas, args.key, args.wallet)
     win.show()
     sys.exit(app.exec())
 

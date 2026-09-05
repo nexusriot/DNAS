@@ -116,13 +116,26 @@ func TestDandelionRollFluffDistribution(t *testing.T) {
 // TestNodeCapsAndRelayFallback checks capability advertisement and that a stem
 // relay with no capable successor safely fluffs without arming an embargo.
 func TestNodeCapsAndRelayFallback(t *testing.T) {
+	has := func(caps []string, want string) bool {
+		for _, c := range caps {
+			if c == want {
+				return true
+			}
+		}
+		return false
+	}
 	on := New(Config{ListenAddr: ":0", Dandelion: true}, core.NewBlockchain(), core.NewMempool(), nil)
-	if caps := on.caps(); len(caps) != 1 || caps[0] != CapDandelion {
-		t.Fatalf("caps = %v, want [%s]", caps, CapDandelion)
+	if caps := on.caps(); !has(caps, CapDandelion) {
+		t.Fatalf("caps = %v, want it to include %s", caps, CapDandelion)
 	}
 	off := New(Config{ListenAddr: ":0"}, core.NewBlockchain(), core.NewMempool(), nil)
-	if caps := off.caps(); len(caps) != 0 {
-		t.Fatalf("caps = %v, want empty", caps)
+	if caps := off.caps(); has(caps, CapDandelion) {
+		t.Fatalf("caps = %v, want it to exclude %s", caps, CapDandelion)
+	}
+	// Mempool reconciliation is not optional the way Dandelion++ is: every node
+	// answers a pool request.
+	if caps := off.caps(); !has(caps, CapMempool) {
+		t.Fatalf("caps = %v, want it to include %s", caps, CapMempool)
 	}
 
 	// No peers: originating on the stem must fluff (no successor), not arm an embargo.

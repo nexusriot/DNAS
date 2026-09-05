@@ -142,14 +142,25 @@ func VerifyOps(tx Transaction) int {
 	if tx.IsCoinbase() {
 		return 0
 	}
-	if tx.IsMultisig() {
-		ops := len(tx.Signatures) * len(tx.Multisig.PubKeys)
-		if ops < 1 {
+	ops := 1
+	switch {
+	case tx.IsMultisig():
+		if ops = len(tx.Signatures) * len(tx.Multisig.PubKeys); ops < 1 {
 			ops = 1
 		}
-		return ops
+	case tx.IsVault():
+		// A vault spend is verified once for its authorization and, below the unlock
+		// height, once more to decide which of the two keys signed it (the height
+		// rule must be answerable without the authorization cache, see
+		// Transaction.VaultHotNotReady).
+		ops = 2
 	}
-	return 1
+	// A sponsored transaction carries a second signature over the same bytes, so
+	// it costs the block one more verification than its authorization alone.
+	if tx.FeePayer != "" {
+		ops++
+	}
+	return ops
 }
 
 // BlockVerifyOps is the total worst-case verification cost of a block's

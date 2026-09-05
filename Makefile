@@ -9,6 +9,8 @@ BINDIR    := $(DESTDIR)$(PREFIX)/bin
 VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo 0.1.0)
 LDFLAGS   := -s -w -X main.version=$(VERSION)
 GOMODS    := ./core/... ./node/... ./api/... ./cmd/... ./wallet/...
+# Plain directories, for the tools that take paths rather than package patterns.
+GODIRS    := core node api cmd wallet e2e
 PLATFORMS ?= linux/amd64 linux/arm64
 ARCHES    ?= amd64 arm64
 
@@ -52,9 +54,12 @@ test:
 	fi
 
 ## test-race: run the Go tests under the race detector
+# The timeout is explicit because go's default is 10 minutes and the core suite
+# under -race is a real proof-of-work workload — it sat at roughly six minutes
+# here, which is too little headroom for a slower CI runner to be trusted with.
 test-race:
-	$(GO) test -race $(GOMODS)
-	cd tui && $(GO) test -race ./...
+	$(GO) test -race -timeout 20m $(GOMODS)
+	cd tui && $(GO) test -race -timeout 20m ./...
 
 ## e2e: run the black-box end-to-end suite against a binary built from this tree
 e2e:
@@ -76,9 +81,13 @@ vet:
 	cd tui && $(GO) vet ./...
 
 ## fmt: gofmt all modules
+# `go fmt` resolves its package patterns against a single main module, which the
+# repo root is not — it fails with "directory prefix core does not contain main
+# module" for every entry in GOMODS. gofmt takes directories and does not care,
+# and it is what CI checks with, so both agree.
 fmt:
-	$(GO) fmt $(GOMODS)
-	cd tui && $(GO) fmt ./...
+	gofmt -l -w $(GODIRS)
+	cd tui && gofmt -l -w .
 
 ## dist: cross-compile release tarballs (PLATFORMS) into dist/
 dist:

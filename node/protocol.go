@@ -12,6 +12,13 @@ const (
 	MsgPeers    MsgType = "peers"    // known peer addresses (for discovery)
 	MsgTx       MsgType = "tx"       // a pending transaction
 
+	// Mempool reconciliation: ask a peer for what it has pending. Transactions are
+	// otherwise only ever PUSHED as they arrive, so a node that starts up after a
+	// payment was broadcast never learns of it until someone rebroadcasts or it is
+	// mined — and a miner that just joined builds emptier blocks than it should.
+	MsgGetMempool MsgType = "getmempool"
+	MsgMempool    MsgType = "mempool"
+
 	// Block propagation: announce a hash, let peers pull the body they lack.
 	MsgInv     MsgType = "inv"     // announce a block (index + hash)
 	MsgGetData MsgType = "getdata" // request a block body by index
@@ -44,11 +51,15 @@ const (
 	// ProtocolVersion is the wire-protocol version this node speaks; peers below
 	// MinProtocolVersion are dropped. Capability strings let features roll out
 	// without a version bump.
-	ProtocolVersion    = 1
+	ProtocolVersion    = 2
 	MinProtocolVersion = 1
 
 	// CapDandelion advertises support for Dandelion++ stem/fluff transaction relay.
 	CapDandelion = "dand"
+	// CapMempool advertises that the peer answers MsgGetMempool. Gating on a
+	// capability rather than the version number means a node that does not want to
+	// serve its pool simply stops advertising it.
+	CapMempool = "mpool"
 )
 
 // Protocol limits (caps on what a single message may carry, to bound work).
@@ -56,6 +67,10 @@ const (
 	maxGossipPeers  = 256
 	maxHeadersBatch = 2000
 	maxBlocksBatch  = 256
+	// maxMempoolBatch bounds how many pending transactions one mempool answer
+	// carries, so serving a peer's pool request cannot be turned into an unbounded
+	// message (the pool itself holds up to core.DefaultMempoolSize).
+	maxMempoolBatch = 256
 )
 
 // Message is the single JSON envelope exchanged between peers over the
@@ -74,14 +89,20 @@ type Message struct {
 	// version / capability negotiation
 	Version int      `json:"version,omitempty"`
 	Caps    []string `json:"caps,omitempty"`
+	// Network is the peer's network name (mainnet/testnet/regtest). Nodes on
+	// different networks have different genesis blocks and incompatible
+	// signatures, so they disconnect here rather than failing to converge later.
+	// An empty value comes from a pre-network peer and is read as mainnet.
+	Network string `json:"network,omitempty"`
 
 	// transactions / blocks
 	Tx    *core.Transaction `json:"tx,omitempty"`
 	Stem  bool              `json:"stem,omitempty"` // Dandelion++: tx still in the private stem phase
 	Block *core.Block       `json:"block,omitempty"`
 
-	Blocks []core.Block `json:"blocks,omitempty"`
-	Chain  []core.Block `json:"chain,omitempty"`
+	Txs    []core.Transaction `json:"txs,omitempty"` // a batch of pending transactions
+	Blocks []core.Block       `json:"blocks,omitempty"`
+	Chain  []core.Block       `json:"chain,omitempty"`
 
 	// headers-first sync
 	Headers []core.Header `json:"headers,omitempty"`

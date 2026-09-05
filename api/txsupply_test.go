@@ -165,3 +165,83 @@ func TestSupplyEndpoint(t *testing.T) {
 		t.Error("supply is missing its formatted amounts")
 	}
 }
+
+// An asset balance is an opaque id without somewhere to look it up, so the
+// registry has to be reachable over the API too.
+func TestAssetEndpoints(t *testing.T) {
+	srv, chain, _, w := spendableServer(t)
+
+	if list := getArr(t, srv.URL+"/assets"); len(list) != 0 {
+		t.Fatalf("a chain with no issuances lists %d assets", len(list))
+	}
+	issue := core.Transaction{From: w.Address(), Fee: 1_000_000, Nonce: 0,
+		Issue: &core.AssetIssue{Ticker: "GOLD", Supply: 1000}}
+	if err := issue.Sign(w); err != nil {
+		t.Fatal(err)
+	}
+	mineOnto(t, chain, w.Address(), []core.Transaction{issue})
+	id := core.AssetID(w.Address(), "GOLD", 0)
+
+	list := getArr(t, srv.URL+"/assets")
+	if len(list) != 1 {
+		t.Fatalf("/assets returned %d entries, want 1", len(list))
+	}
+	entry := list[0].(map[string]any)
+	if entry["ticker"] != "GOLD" || entry["id"] != id {
+		t.Fatalf("/assets entry = %+v", entry)
+	}
+	if byTicker := getArr(t, srv.URL+"/assets?ticker=GOLD"); len(byTicker) != 1 {
+		t.Fatalf("?ticker=GOLD returned %d entries", len(byTicker))
+	}
+	if none := getArr(t, srv.URL+"/assets?ticker=SILVER"); len(none) != 0 {
+		t.Fatalf("?ticker=SILVER returned %d entries", len(none))
+	}
+
+	one := getObj(t, srv.URL+"/asset/"+id)
+	asset := one["asset"].(map[string]any)
+	if asset["issuer"] != w.Address() || asset["supply"].(float64) != 1000 {
+		t.Fatalf("/asset/{id} = %+v", asset)
+	}
+	holders := one["holders"].([]any)
+	if len(holders) != 1 {
+		t.Fatalf("holders = %+v", holders)
+	}
+	// The held total is served next to the issued supply so a client can check
+	// conservation rather than trust the supply figure.
+	if one["held"].(float64) != 1000 {
+		t.Fatalf("held = %v, want the whole 1000-unit supply", one["held"])
+	}
+	if code := statusOf(t, srv.URL+"/asset/toknotreal"); code != http.StatusNotFound {
+		t.Fatalf("an unknown asset id returned %d, want 404", code)
+	}
+	if code := statusOf(t, srv.URL+"/asset/"); code != http.StatusBadRequest {
+		t.Fatalf("an empty asset id returned %d, want 400", code)
+	}
+}
+
+// /account grew the formatted balance because the explorer's address search
+// rendered "balance undefined": every client would otherwise have to divide by
+// the coin unit itself, and every one of them could get the decimals wrong.
+func TestAccountReportsAFormattedBalance(t *testing.T) {
+	srv, _, _, w := spendableServer(t)
+	acc := getObj(t, srv.URL+"/account/"+w.Address())
+	raw, ok := acc["balance"].(float64)
+	if !ok || raw == 0 {
+		t.Fatalf("balance = %v", acc["balance"])
+	}
+	fmtd, ok := acc["balance_fmt"].(string)
+	if !ok || fmtd == "" {
+		t.Fatal("/account does not report a formatted balance")
+	}
+	// The two must agree, or a client showing one and checking the other would be
+	// showing a different number than it is acting on.
+	if want := core.FormatAmount(uint64(raw)); fmtd != want {
+		t.Fatalf("balance_fmt = %q, want %q", fmtd, want)
+	}
+	// An account nobody has touched answers with zeroes rather than 404, which is
+	// what lets a lookup say "nothing here" instead of failing.
+	empty := getObj(t, srv.URL+"/account/dnasnobodyatall")
+	if empty["balance_fmt"] != core.FormatAmount(0) {
+		t.Fatalf("an unknown account reports %v", empty["balance_fmt"])
+	}
+}

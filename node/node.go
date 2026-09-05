@@ -46,8 +46,20 @@ const (
 	getChainCooldown = 10 * time.Second
 
 	// dialRetryInterval is how long a dial loop waits before redialing a peer,
-	// whether the dial failed or an established connection dropped.
+	// whether the dial failed or an established connection dropped. It is the
+	// FIRST wait; consecutive failures double it up to dialRetryMax (see
+	// dialLoop), because a peer that is gone stays gone.
 	dialRetryInterval = 3 * time.Second
+
+	// dialRetryMax caps that backoff. A node with a handful of dead seed
+	// addresses was dialing each one every 3 seconds forever: 1200 connection
+	// attempts an hour per address, for the whole uptime of the node. That is
+	// pointless work here and unsolicited traffic at the other end, which for a
+	// host that no longer runs a node looks exactly like being scanned.
+	//
+	// Five minutes is late enough to be cheap and early enough that a peer coming
+	// back is noticed without a restart.
+	dialRetryMax = 5 * time.Minute
 	// minePollInterval is how often a paused miner re-checks the mining toggle.
 	minePollInterval = 200 * time.Millisecond
 	// acceptRetryDelay backs the accept loop off after a transient accept error,
@@ -67,6 +79,28 @@ type Config struct {
 	Regtest       bool     // regtest mode: enable on-demand block generation (POST /generate)
 	Dandelion     bool     // relay new transactions via Dandelion++ stem/fluff (origin privacy)
 
+	// ShareFactor is how many times easier a mining share is than a block (see
+	// shares.go). Zero means core.DefaultShareFactor.
+	ShareFactor uint32
+
+	// Faucet gives coin away from the node's wallet on request. It only takes
+	// effect on a network whose parameters allow one (never mainnet) — see
+	// faucet.go. FaucetAmount and FaucetCooldown default when zero.
+	Faucet         bool
+	FaucetAmount   uint64
+	FaucetCooldown time.Duration
+
+	// Identity is the node's NETWORK identity key: the Ed25519 key it proves
+	// itself with to peers (see identity.go). It must not be the wallet key — a
+	// peer can derive an address from the identity public key it is sent — so when
+	// this is nil New falls back to the wallet only for in-process use and logs a
+	// warning. Real nodes pass their own key (`-nodekey`).
+	Identity *wallet.Wallet
+
+	// Webhooks are URLs the node POSTs every event to, for a service that wants
+	// to be called rather than hold an SSE connection open (see webhook.go).
+	Webhooks []string
+
 	// EmptyBlockInterval is how long the miner waits before minting a block with
 	// no transactions in it, so an idle network isn't flooded with empty blocks.
 	// Zero means one TargetBlockTime, which is what a real network wants; devnets
@@ -85,6 +119,9 @@ type peer struct {
 	version      int             // negotiated protocol version
 	caps         map[string]bool // advertised capabilities (e.g. Dandelion++)
 	lastGetChain time.Time       // throttles the expensive whole-chain request
+	askedMempool bool            // we have requested this peer's pending transactions
+	inbound      bool            // they dialed us (rather than the other way round)
+	since        time.Time       // when the connection was established
 }
 
 // supports reports whether the peer advertised a capability.
@@ -112,13 +149,17 @@ type Node struct {
 	inboundTotal int            // current inbound connections (loopback exempt)
 	inboundGroup map[string]int // current inbound connections per IP group
 
-	seenBlk *seenSet
-	seenTx  *seenSet
-	book    *peerbook
-	bans    *banbook
-	events  *eventBus
-	dand    *dandelion
-	orphans *orphanPool
+	seenBlk  *seenSet
+	seenTx   *seenSet
+	shares   *shareLedger
+	faucet   *faucet
+	reorgs   *reorgLog
+	book     *peerbook
+	bans     *banbook
+	events   *eventBus
+	webhooks *webhookSender
+	dand     *dandelion
+	orphans  *orphanPool
 
 	// Sync state (see sync.go): what ranged block requests are outstanding and to
 	// whom, and the highest height any peer has announced. Without this a peer that
@@ -142,6 +183,7 @@ type Node struct {
 	// Transport, injectable so tests can drive nodes over an in-memory network
 	// with controllable latency and partitions. Production uses TCP.
 	dialFn   func(string) (net.Conn, error)
+	dialBase time.Duration // first retry wait; a field so tests need not wait seconds
 	listenFn func(string) (net.Listener, error)
 }
 
@@ -160,9 +202,18 @@ func New(cfg Config, chain *core.Blockchain, mp *core.Mempool, w *wallet.Wallet)
 	// Ed25519 node identity for ban scoring). A non-empty NetKey authenticates a
 	// private network (e.g. a devnet or regtest). It is NOT defaulted to a shared
 	// key any more — a real cryptocurrency is permissionless by default.
-	identity := w
+	// Network identity: its own key when one is supplied. Falling back to the
+	// wallet lets a peer derive the wallet's address from the identity public key
+	// every handshake sends, so it is warned about; falling back to an ephemeral
+	// key (no wallet either) costs the node its peer reputation on restart, which
+	// only matters to a real node and a real node has a wallet.
+	identity := cfg.Identity
 	if identity == nil {
-		identity, _ = wallet.New()
+		if identity = w; identity != nil {
+			warnSharedIdentity(w.Address())
+		} else {
+			identity, _ = wallet.New()
+		}
 	}
 	n := &Node{
 		cfg:          cfg,
@@ -175,11 +226,14 @@ func New(cfg Config, chain *core.Blockchain, mp *core.Mempool, w *wallet.Wallet)
 		inboundGroup: map[string]int{},
 		seenBlk:      newSeenSet(seenCapacity),
 		seenTx:       newSeenSet(seenCapacity),
+		shares:       newShareLedger(),
+		faucet:       newFaucet(),
+		reorgs:       newReorgLog(),
 		book:         newPeerbook(cfg.AdvertiseAddr, cfg.MaxPeers),
 		bans:         newBanbook(banThreshold),
 		events:       newEventBus(),
 		dand:         newDandelion(),
-		orphans:      newOrphanPool(orphanPoolCapacity),
+		orphans:      newOrphanPool(orphanPoolCapacity, orphanPoolBytes),
 		inflight:     map[*peer]*blockRequest{},
 		quit:         make(chan struct{}),
 	}
@@ -190,6 +244,9 @@ func New(cfg Config, chain *core.Blockchain, mp *core.Mempool, w *wallet.Wallet)
 	// admission, rather than again when the block carrying it is applied.
 	mp.UseAccounts(chain).UseValidationCache(chain.ValidationCache())
 	n.dialFn = func(addr string) (net.Conn, error) { return net.Dial("tcp", addr) }
+	n.dialBase = dialRetryInterval
+	n.webhooks = newWebhookSender(cfg.Webhooks, n.quit,
+		core.NetworkName, func() uint64 { return n.chain.Height() })
 	n.listenFn = func(addr string) (net.Listener, error) { return net.Listen("tcp", addr) }
 	n.mining.Store(cfg.Mine)
 	return n
@@ -249,12 +306,16 @@ func (n *Node) Start() {
 		n.maybeDial(a)
 	}
 	go n.syncLoop() // times out unanswered block requests and keeps ranges in flight
+	if n.webhooks != nil {
+		go n.webhooks.run()
+		Infof("webhooks enabled", "urls", len(n.webhooks.urls))
+	}
 	// The miner runs whenever the node has a wallet; the atomic flag gates
 	// whether it actually produces blocks, so it can be toggled at runtime.
 	if n.wallet != nil {
 		go n.mineLoop()
 	} else if n.cfg.Mine {
-		log.Print("mining requested but no wallet; disabled")
+		Warnf("mining requested but no wallet; disabled")
 	}
 }
 
@@ -301,6 +362,16 @@ func (n *Node) Chain() *core.Blockchain { return n.chain }
 func (n *Node) Mempool() *core.Mempool  { return n.mempool }
 func (n *Node) Wallet() *wallet.Wallet  { return n.wallet }
 
+// IdentityKey is this node's network identity public key (hex) — what peers know
+// it by, and what ban scores are attributed to.
+func (n *Node) IdentityKey() string { return n.identity.PublicKeyHex() }
+
+// IdentityIsWallet reports whether the node is running with its wallet key as
+// its network identity, which leaks the wallet address to every peer.
+func (n *Node) IdentityIsWallet() bool {
+	return n.wallet != nil && n.identity.PublicKeyHex() == n.wallet.PublicKeyHex()
+}
+
 // Subscribe registers for real-time node events (new blocks, reorgs, mempool
 // transactions). It returns a receive channel and a function that unsubscribes
 // and closes it; callers must invoke the latter when done. Slow consumers miss
@@ -314,7 +385,7 @@ func (n *Node) publishBlock(reorg bool) {
 	if reorg {
 		typ = "reorg"
 	}
-	n.events.publish(Event{Type: typ, Height: tip.Index, Hash: tip.Hash, Txs: len(tip.Transactions)})
+	n.emit(Event{Type: typ, Height: tip.Index, Hash: tip.Hash, Txs: len(tip.Transactions)})
 }
 
 // publishTx emits a mempool-transaction event. A multi-recipient transfer is
@@ -327,7 +398,14 @@ func (n *Node) publishTx(tx core.Transaction) {
 		e.Amount = total
 		e.Outputs = len(tx.Outputs)
 	}
+	n.emit(e)
+}
+
+// emit publishes an event to the in-process subscribers AND to any webhooks, so
+// there is one path and the two cannot come to carry different events.
+func (n *Node) emit(e Event) {
 	n.events.publish(e)
+	n.webhooks.notify(e) // a nil sender is a no-op
 }
 
 // PeerAddrs returns the distinct advertised addresses of connected peers.
@@ -395,7 +473,7 @@ func (n *Node) listen() {
 	if !n.setListener(ln) {
 		return
 	}
-	log.Printf("p2p listening on %s (advertising %s)", n.cfg.ListenAddr, n.cfg.AdvertiseAddr)
+	Infof("p2p listening", "listen", n.cfg.ListenAddr, "advertise", n.cfg.AdvertiseAddr)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -414,7 +492,7 @@ func (n *Node) listen() {
 		}
 		go func() {
 			defer n.releaseInbound(ip)
-			n.handleConn(conn)
+			n.handleConn(conn, true, "") // inbound: they dialed us
 		}()
 	}
 }
@@ -481,17 +559,47 @@ func (n *Node) maybeDial(addr string) {
 }
 
 func (n *Node) dialLoop(addr string) {
+	base := n.dialBase
+	if base <= 0 {
+		base = dialRetryInterval
+	}
+	delay := base
 	for !n.stopped() {
 		if conn, err := n.dialFn(addr); err == nil {
-			n.handleConn(conn) // blocks until the connection drops
+			// A connection that was ESTABLISHED resets the backoff: this peer is real
+			// and reachable, and a drop after an hour of good service should be
+			// retried promptly rather than at whatever interval past failures reached.
+			delay = base
+			n.handleConn(conn, false, addr) // outbound; blocks until the connection drops
+		} else {
+			delay = nextDialDelay(delay, base)
 		}
-		if !n.wait(dialRetryInterval) {
+		// A dial that turned out to reach ourselves is not retried: the peerbook
+		// learned the address is us (see handleConn).
+		if n.book.isSelf(addr) {
+			return
+		}
+		if !n.wait(delay) {
 			return
 		}
 	}
 }
 
-func (n *Node) handleConn(rawConn net.Conn) {
+// nextDialDelay doubles a retry delay, stopping at dialRetryMax.
+func nextDialDelay(d, base time.Duration) time.Duration {
+	if base <= 0 {
+		base = dialRetryInterval
+	}
+	if d <= 0 {
+		return base
+	}
+	if d >= dialRetryMax/2 {
+		return dialRetryMax
+	}
+	return d * 2
+}
+
+func (n *Node) handleConn(rawConn net.Conn, inbound bool, dialed string) {
 	ip := remoteIP(rawConn)
 	if n.bans.banned(ip) {
 		_ = rawConn.Close()
@@ -506,15 +614,15 @@ func (n *Node) handleConn(rawConn net.Conn) {
 	// other. (Peer identity is still proven via Ed25519 below, open net or not.)
 	sc, sid, err := secureHandshake(rawConn, n.psk)
 	if err != nil {
-		log.Printf("rejected peer %s: handshake failed: %v", ip, err)
+		Warnf("peer rejected", "ip", ip, "reason", "handshake failed", "err", err)
 		if bannableIP(ip) && n.bans.add(ip, banHandshake) {
-			log.Printf("banning ip %s: repeated handshake failures", ip)
+			Warnf("peer banned", "ip", ip, "reason", "repeated handshake failures")
 		}
 		_ = rawConn.Close()
 		return
 	}
 
-	p := &peer{conn: sc, enc: json.NewEncoder(sc), ip: ip}
+	p := &peer{conn: sc, enc: json.NewEncoder(sc), ip: ip, inbound: inbound, since: time.Now()}
 	dec := json.NewDecoder(sc)
 
 	// Authenticated identity exchange: each side proves it holds its identity
@@ -527,7 +635,7 @@ func (n *Node) handleConn(rawConn net.Conn) {
 		return
 	}
 	if idm.Type != MsgIdentity || !wallet.Verify(idm.PubKey, idm.Sig, sid) {
-		log.Printf("rejected peer %s: identity authentication failed", ip)
+		Warnf("peer rejected", "ip", ip, "reason", "identity authentication failed")
 		if bannableIP(ip) {
 			n.bans.add(ip, banHandshake)
 		}
@@ -535,6 +643,20 @@ func (n *Node) handleConn(rawConn net.Conn) {
 		return
 	}
 	p.id = idm.PubKey
+	// A connection to OURSELVES: two peers cannot be told apart by address (we
+	// advertise ":3000" while a peer reaches us as "localhost:3000", and a string
+	// comparison sees two different hosts), but they can by identity. Left
+	// unchecked this burns an outbound slot, an inbound slot and a goroutine on a
+	// loop back to the same process, and gossips the alias onward so other nodes
+	// dial us twice.
+	if p.id == n.identity.PublicKeyHex() {
+		if dialed != "" {
+			n.book.noteSelf(dialed)
+			Infof("stopped dialing our own address", "addr", dialed)
+		}
+		_ = sc.Close()
+		return
+	}
 	if n.bans.banned(p.id) {
 		_ = sc.Close()
 		return
@@ -543,7 +665,7 @@ func (n *Node) handleConn(rawConn net.Conn) {
 	// Protocol version + capability negotiation: drop peers speaking an
 	// incompatible version, and record capabilities (e.g. Dandelion++) for feature
 	// gating.
-	p.send(Message{Type: MsgVersion, Version: ProtocolVersion, Caps: n.caps()})
+	p.send(Message{Type: MsgVersion, Version: ProtocolVersion, Caps: n.caps(), Network: core.NetworkName()})
 	_ = sc.SetReadDeadline(time.Now().Add(handshakeTimeout))
 	var vm Message
 	if err := dec.Decode(&vm); err != nil {
@@ -551,7 +673,20 @@ func (n *Node) handleConn(rawConn net.Conn) {
 		return
 	}
 	if vm.Type != MsgVersion || vm.Version < MinProtocolVersion {
-		log.Printf("rejected peer %s: incompatible protocol version %d", ip, vm.Version)
+		Warnf("peer rejected", "ip", ip, "reason", "incompatible protocol version", "version", vm.Version)
+		_ = sc.Close()
+		return
+	}
+	// Different networks have different genesis blocks and mutually invalid
+	// signatures, so peering across them can only produce a connection that never
+	// converges. Drop it here instead. A peer that predates network names sends
+	// none, which means mainnet.
+	peerNet := vm.Network
+	if peerNet == "" {
+		peerNet = core.MainNet
+	}
+	if peerNet != core.NetworkName() {
+		Warnf("peer rejected", "ip", ip, "reason", "different network", "their_network", peerNet, "our_network", core.NetworkName())
 		_ = sc.Close()
 		return
 	}
@@ -563,7 +698,7 @@ func (n *Node) handleConn(rawConn net.Conn) {
 
 	n.addPeer(p)
 	defer n.removePeer(p)
-	log.Printf("peer connected %s id=%s", ip, short(p.id))
+	Infof("peer connected", "ip", ip, "peer", short(p.id))
 
 	// Keep the connection alive: ping the peer periodically and drop it if it
 	// falls silent past the idle timeout (a half-open/dead connection).
@@ -585,7 +720,7 @@ func (n *Node) handleConn(rawConn net.Conn) {
 			return
 		}
 		if !limiter.allow(time.Now()) {
-			log.Printf("dropping peer %s: inbound message rate exceeded", ip)
+			Warnf("peer dropped", "ip", ip, "reason", "inbound message rate exceeded")
 			return
 		}
 		n.handleMessage(p, m)
@@ -649,6 +784,14 @@ func (n *Node) handleMessage(p *peer, m Message) {
 		n.relayTx(*m.Tx, p, m.Stem)
 		n.publishTx(*m.Tx)
 
+	case MsgGetMempool:
+		if txs := n.mempoolBatch(); len(txs) > 0 {
+			p.send(Message{Type: MsgMempool, Txs: txs})
+		}
+
+	case MsgMempool:
+		n.onMempoolBatch(p, m.Txs)
+
 	// block propagation: announce a hash, pull the body we lack
 	case MsgInv:
 		n.noteBestHeight(m.Index)
@@ -673,7 +816,7 @@ func (n *Node) handleMessage(p *peer, m Message) {
 		// doesn't link to our tip is just a fork, handled below with a re-sync.
 		if err := m.Block.SelfValid(); err != nil {
 			if n.bans.add(p.id, banInvalidBlock) {
-				log.Printf("banning peer id=%s: invalid block: %v", short(p.id), err)
+				Warnf("peer banned", "peer", short(p.id), "reason", "invalid block", "err", err)
 			}
 			return
 		}
@@ -686,7 +829,7 @@ func (n *Node) handleMessage(p *peer, m Message) {
 			p.send(n.getHeadersMsg())
 			return
 		}
-		log.Printf("accepted block %d %s", m.Block.Index, short(m.Block.Hash))
+		Infof("accepted block", "height", m.Block.Index, "hash", short(m.Block.Hash))
 		n.connectOrphans()
 		n.afterNewBlock(false)
 		n.broadcastExcept(Message{Type: MsgInv, Index: m.Block.Index, Hash: m.Block.Hash}, p)
@@ -723,8 +866,8 @@ func (n *Node) handleMessage(p *peer, m Message) {
 
 	case MsgChain:
 		if replaced, disconnected, err := n.chain.ReplaceChain(m.Chain); err == nil && replaced {
-			log.Printf("adopted chain via fallback (height=%d)", n.chain.Height())
-			n.resurrectTxs(disconnected)
+			Infof("adopted chain via fallback", "height", n.chain.Height())
+			n.noteReorg(disconnected, n.resurrectTxs(disconnected))
 			n.afterNewBlock(true)
 		}
 
@@ -751,7 +894,7 @@ func (n *Node) onHeaders(p *peer, headers []core.Header) {
 	}
 	if err := core.ValidateHeaderChain(headers, parent.Hash, parent.Index); err != nil {
 		if n.bans.add(p.id, banBadHeaders) {
-			log.Printf("banning peer id=%s: %v", short(p.id), err)
+			Warnf("peer banned", "peer", short(p.id), "err", err)
 		}
 		return
 	}
@@ -785,10 +928,10 @@ func (n *Node) onBlocks(p *peer, blocks []core.Block) {
 		for _, b := range blocks {
 			n.markSeenBlock(b.Hash)
 		}
-		n.resurrectTxs(disconnected)
+		n.noteReorg(disconnected, n.resurrectTxs(disconnected))
 		n.afterNewBlock(true)
 		tip := n.chain.Tip()
-		log.Printf("reorged onto fork, height=%d %s", tip.Index, short(tip.Hash))
+		Infof("reorged onto fork", "height", tip.Index, "hash", short(tip.Hash))
 		n.broadcastExcept(Message{Type: MsgInv, Index: tip.Index, Hash: tip.Hash}, p)
 		if len(blocks) == maxBlocksBatch { // fork may be deeper than one batch
 			p.send(n.getHeadersMsg())
@@ -820,7 +963,7 @@ func (n *Node) onBlocks(p *peer, blocks []core.Block) {
 	}
 	n.afterNewBlock(false)
 	tip := n.chain.Tip()
-	log.Printf("synced %d block(s), height=%d", applied, tip.Index)
+	Infof("synced blocks", "count", applied, "height", tip.Index)
 	n.broadcastExcept(Message{Type: MsgInv, Index: tip.Index, Hash: tip.Hash}, p)
 	if applied >= len(blocks) { // a full batch: there may be more
 		p.send(n.getHeadersMsg())
@@ -864,11 +1007,56 @@ func (n *Node) broadcastExcept(m Message, except *peer) {
 
 // caps returns this node's advertised protocol capabilities.
 func (n *Node) caps() []string {
-	var c []string
+	c := []string{CapMempool}
 	if n.cfg.Dandelion {
 		c = append(c, CapDandelion)
 	}
 	return c
+}
+
+// mempoolBatch is what we serve in answer to MsgGetMempool: our pending
+// transactions, capped so one request cannot make us serialize a full pool.
+func (n *Node) mempoolBatch() []core.Transaction {
+	txs := n.mempool.All()
+	if len(txs) > maxMempoolBatch {
+		txs = txs[:maxMempoolBatch]
+	}
+	return txs
+}
+
+// onMempoolBatch folds a peer's pending transactions into our own pool. It is
+// the answer to MsgGetMempool, sent once per connection, so the batch is bounded
+// and each transaction goes through exactly the same admission path a gossiped
+// one does — nothing is trusted because it arrived in bulk.
+//
+// Anything newly admitted is relayed onward in the fluff phase: it is not ours to
+// originate, so it gets no Dandelion++ stem, and the peer that sent it obviously
+// has it already.
+func (n *Node) onMempoolBatch(from *peer, txs []core.Transaction) {
+	if len(txs) > maxMempoolBatch {
+		txs = txs[:maxMempoolBatch]
+	}
+	next := n.chain.Height() + 1
+	learned := 0
+	for _, tx := range txs {
+		if tx.IsExpiredAt(next) {
+			continue
+		}
+		h := tx.Hash()
+		if n.markSeenTx(h) {
+			continue
+		}
+		if added, err := n.mempool.Add(tx); err != nil || !added {
+			continue
+		}
+		learned++
+		n.fluff(tx, from)
+		n.publishTx(tx)
+	}
+	if learned > 0 {
+		Infof("learned pending transactions", "count", learned, "peer", short(from.id))
+		n.onNewTx() // a miner idling between blocks should build with them
+	}
 }
 
 // relayTx propagates a transaction using Dandelion++ when enabled: in the stem
@@ -962,11 +1150,11 @@ func (n *Node) buildBlockFor(minerAddr string) (core.Block, []core.Transaction) 
 		if attempt+1 >= maxBuildAttempts || !errors.As(err, &rej) || rej.Index < 1 || rej.Index > len(txs) {
 			// Not attributable to one transaction (or too many tries): leave the state
 			// root empty, which the miner treats as "do not mine this".
-			log.Printf("cannot build a block on the current tip: %v", err)
+			Errorf("cannot build a block on the current tip", "err", err)
 			return candidate, txs
 		}
 		bad := txs[rej.Index-1] // Transactions[0] is the coinbase
-		log.Printf("dropping unmineable transaction %s from the mempool: %v", short(bad.Hash()), rej.Err)
+		Warnf("dropped unmineable transaction", "tx", short(bad.Hash()), "err", rej.Err)
 		n.mempool.Remove([]core.Transaction{bad})
 	}
 }
@@ -1024,8 +1212,8 @@ func (n *Node) SubmitMinedBlock(b core.Block) error {
 	if len(b.Transactions) > 1 {
 		n.mempool.Remove(b.Transactions[1:])
 	}
-	log.Printf("accepted externally-mined block %d diff=%.2f %s",
-		b.Index, core.TargetDifficulty(b.Bits), short(b.Hash))
+	Infof("accepted externally-mined block", "height", b.Index,
+		"difficulty", core.TargetDifficulty(b.Bits), "hash", short(b.Hash))
 	n.afterNewBlock(false)
 	n.broadcast(Message{Type: MsgInv, Index: b.Index, Hash: b.Hash})
 	return nil
@@ -1038,8 +1226,8 @@ func (n *Node) commitMined(mined core.Block, txs []core.Transaction) error {
 		return err
 	}
 	n.markSeenBlock(mined.Hash)
-	log.Printf("mined block %d diff=%.2f txs=%d reward=%s %s",
-		mined.Index, core.TargetDifficulty(mined.Bits), len(txs), core.FormatAmount(core.BlockReward(mined.Index)), short(mined.Hash))
+	Infof("mined block", "height", mined.Index, "difficulty", core.TargetDifficulty(mined.Bits),
+		"txs", len(txs), "reward", core.FormatAmount(core.BlockReward(mined.Index)), "hash", short(mined.Hash))
 	n.mempool.Remove(txs)
 	n.onTipChanged()
 	// Announce the new block by inventory; peers pull the body if they lack it.
@@ -1059,7 +1247,7 @@ func (n *Node) emptyBlockInterval() time.Duration {
 }
 
 func (n *Node) mineLoop() {
-	log.Printf("miner ready for %s (mining=%v)", n.wallet.Address(), n.Mining())
+	Infof("miner ready", "address", n.wallet.Address(), "mining", n.Mining())
 	for !n.stopped() {
 		if !n.mining.Load() {
 			if !n.wait(minePollInterval) { // paused; poll for the toggle
@@ -1072,7 +1260,7 @@ func (n *Node) mineLoop() {
 			// The candidate is already known-invalid (see buildBlockFor). Hashing it
 			// would burn a core to produce a block the chain will refuse, so wait for
 			// something to change instead of spinning.
-			log.Print("no valid block can be built on the current tip; waiting")
+			Warnf("no valid block can be built on the current tip; waiting")
 			n.sleepInterruptible(n.emptyBlockInterval())
 			continue
 		}
@@ -1092,7 +1280,7 @@ func (n *Node) mineLoop() {
 			continue // tip changed; rebuild on the new tip
 		}
 		if err := n.commitMined(mined, txs); err != nil {
-			log.Printf("discarded our block %d: %v", mined.Index, err)
+			Warnf("discarded our own block", "height", mined.Index, "err", err)
 			// Usually this means we lost the race and the tip already moved, in which
 			// case the next round rebuilds on it. If the tip did NOT move, the block
 			// was refused for a reason rebuilding won't change (an operator pinning a
@@ -1182,7 +1370,7 @@ func (n *Node) resurrectTxs(disconnected []core.Block) int {
 		}
 	}
 	if count > 0 {
-		log.Printf("returned %d transaction(s) from %d orphaned block(s) to the mempool", count, len(disconnected))
+		Infof("returned orphaned transactions to the mempool", "txs", count, "blocks", len(disconnected))
 	}
 	return count
 }

@@ -70,6 +70,14 @@
 <div class="wrap">
   <div class="chips" id="chips"></div>
 
+  <div class="card">
+    <div class="field"><label>search — a height, a block hash, a transaction hash, or an address</label>
+      <input id="search" placeholder="1234 · block hash · tx hash · dnas…"
+             onkeydown="if(event.key==='Enter')doSearch()"></div>
+    <button onclick="doSearch()">Search</button>
+    <div class="result" id="searchResult"></div>
+  </div>
+
   <div class="grid">
     <div>
       <h2>This node's wallet</h2>
@@ -108,6 +116,12 @@
 
   <h2>Mempool (<span id="mpcount">0</span>)</h2>
   <div id="mempool"></div>
+
+  <h2>Assets</h2>
+  <div id="assets"></div>
+
+  <h2>This node</h2>
+  <div id="nodeinfo"></div>
 </div>
 
 <script>
@@ -121,6 +135,15 @@ async function j(url, opts) {
   const r = await fetch(url, opts);
   if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || ("HTTP " + r.status));
   return r.json();
+}
+
+// jAny is j for the endpoints whose FAILURE is also a documented answer:
+// /health returns 503 with the reasons a node is not ready, and treating that as
+// a transport error throws away the very thing it came to say — the readiness
+// line would simply be missing on exactly the nodes that are not ready.
+async function jAny(url) {
+  const r = await fetch(url);
+  return r.json().catch(() => null);
 }
 
 // SHA-256 helpers so the browser can verify proofs like a light client.
@@ -153,12 +176,45 @@ function difficultyOf(bits) {
   return target <= 0n ? 0 : Number((POW_LIMIT * 1000n) / target) / 1000;
 }
 
+// A transaction line has to be able to describe every form the ledger allows,
+// not just the plain one: a page that renders a multi-output payment as a
+// transfer of zero to nobody, or drops a memo and a deadline that are signed
+// parts of the transaction, is showing something that did not happen.
 function txLine(tx) {
   if (tx.from === "COINBASE")
     return `<div class="tx"><span class="tag cb">coinbase</span> → ${short(tx.to)} <span class="idx">+${fmt(tx.amount)}</span></div>`;
-  const exp = tx.expiry ? ` <span class="muted">exp@${tx.expiry}</span>` : "";
-  return `<div class="tx">${short(tx.from)} → ${short(tx.to)} <span class="idx">${fmt(tx.amount)}</span>`
-    + ` <span class="muted">fee ${fmt(tx.fee)} · nonce ${tx.nonce}${exp}</span></div>`;
+
+  let head;
+  if (tx.outputs && tx.outputs.length) {
+    const total = tx.outputs.reduce((n, o) => n + Number(o.amount), 0);
+    head = `${short(tx.from)} → ${tx.outputs.length} recipients <span class="idx">${fmt(total)}</span>`;
+  } else if (tx.issue) {
+    head = `${short(tx.from)} <span class="tag">issues</span> ${esc(tx.issue.ticker)} ` +
+      `<span class="idx">${tx.issue.supply}</span> units`;
+  } else if (tx.asset_id) {
+    head = `${short(tx.from)} → ${short(tx.to)} <span class="idx">${tx.amount}</span> ` +
+      `<span class="muted">of ${short(tx.asset_id, 10)}</span>`;
+  } else {
+    head = `${short(tx.from)} → ${short(tx.to)} <span class="idx">${fmt(tx.amount)}</span>`;
+  }
+
+  const notes = [`fee ${fmt(tx.fee)}`, `nonce ${tx.nonce}`];
+  if (tx.lock_until) notes.push(`not before ${tx.lock_until}`);
+  if (tx.expiry) notes.push(`exp@${tx.expiry}`);
+  if (tx.multisig) notes.push(`${tx.multisig.threshold}-of-${(tx.multisig.pubkeys || []).length} multisig`);
+  if (tx.htlc) notes.push(tx.preimage ? "HTLC claim" : "HTLC refund");
+  if (tx.vault) notes.push("vault");
+  if (tx.fee_payer) notes.push(`fee paid by ${short(tx.fee_payer, 10)}`);
+  // A memo is arbitrary data from a stranger, so it is escaped like everything
+  // else on this page — it is the one field an attacker chooses freely.
+  const memo = tx.memo ? ` <span class="muted">“${esc(tx.memo)}”</span>` : "";
+
+  let line = `<div class="tx">${head} <span class="muted">${notes.join(" · ")}</span>${memo}`;
+  if (tx.outputs && tx.outputs.length) {
+    line += tx.outputs.map(o =>
+      `<div class="muted mono">  → ${short(o.to)} ${fmt(o.amount)}</div>`).join("");
+  }
+  return line + `</div>`;
 }
 
 function renderBlocks(chain) {
@@ -188,11 +244,139 @@ function renderMempool(txs) {
     : '<div class="card muted">empty</div>';
 }
 
+// One box for every kind of identifier, because a person looking something up
+// has a string, not a category: a height, a block hash, a transaction hash or an
+// address. Guessing from the shape of the input is what makes it one box —
+// heights are digits, addresses carry the dnas prefix and a checksum, and the
+// two 64-character hashes are told apart by asking the node.
+async function doSearch() {
+  const raw = document.getElementById("search").value.trim();
+  const out = document.getElementById("searchResult");
+  if (!raw) { out.textContent = ""; return; }
+  out.textContent = "looking…";
+  try {
+    if (/^[0-9]+$/.test(raw)) { out.innerHTML = await searchHeight(raw); return; }
+    if (raw.startsWith("dnas")) { out.innerHTML = await searchAddress(raw); return; }
+    if (/^[0-9a-fA-F]{64}$/.test(raw)) { out.innerHTML = await searchHash(raw.toLowerCase()); return; }
+    out.textContent = "that is not a height, an address, or a 64-character hash";
+  } catch (e) {
+    out.textContent = "not found: " + e.message;
+  }
+}
+
+async function searchHeight(h) {
+  const b = await j("/block/" + h);
+  return `<div class="mono">block ${b.index} — ${esc(b.hash)}</div>` +
+    `<div class="muted">${when(b.timestamp)} · ${(b.transactions || []).length} tx · ` +
+    `state root ${short(b.state_root, 16)}</div>` +
+    (b.transactions || []).map(t => txLine(t)).join("");
+}
+
+async function searchAddress(a) {
+  const acc = await j("/account/" + a);
+  let html = `<div class="mono">${esc(a)}</div><div>balance <span class="idx">${esc(acc.balance_fmt)}</span>` +
+    ` · nonce ${acc.nonce}</div>`;
+  // An account holding assets looked empty before: the balance line is coin only.
+  const assets = acc.assets || {};
+  for (const [id, amount] of Object.entries(assets)) {
+    html += `<div class="muted mono">${amount} units of ${esc(short(id, 16))}</div>`;
+  }
+  return html;
+}
+
+// A 64-character hash is either a transaction or a block, and the node is the
+// thing that knows which. Transactions are tried first because that is what
+// somebody pasting a hash almost always has.
+async function searchHash(h) {
+  try {
+    const st = await j("/tx/" + h);
+    const t = st.tx || {};
+    return `<div class="mono">transaction ${esc(h)}</div>` +
+      `<div class="muted">${esc(st.status)}${st.status === "confirmed" ?
+        ` in block ${st.height} · ${st.confirmations} confirmation(s)` : ""}</div>` +
+      txLine(t);
+  } catch (e) {
+    // Not a transaction: walk the recent blocks for a matching hash. Only the
+    // recent ones, because a node has no index from block hash to height —
+    // saying so is better than pretending the search covered the whole chain.
+    const chain = await j("/chain?last=200");
+    const b = (chain || []).find(b => b.hash === h);
+    if (!b) throw new Error("no transaction with that hash, and no block with it in the last 200");
+    return await searchHeight(b.index);
+  }
+}
+
+function renderAssets(list) {
+  const el = document.getElementById("assets");
+  if (!list || !list.length) {
+    el.innerHTML = '<div class="card muted">none issued on this chain</div>';
+    return;
+  }
+  // The same ticker from two issuers is legitimate and is the one thing here
+  // that can mislead, so the issuer is always shown next to it.
+  el.innerHTML = list.map(a => `<div class="card">
+      <span class="idx">${esc(a.ticker)}</span>
+      <span class="mono muted">${esc(short(a.id, 16))}</span>
+      <div class="muted">supply ${a.supply} · issued in block ${a.height} · issuer ${esc(short(a.issuer, 14))}</div>
+    </div>`).join("");
+}
+
+// What this node can and cannot answer. A pruning or fast-synced node cannot
+// serve old bodies, their proofs or their filters, and a page that did not say
+// so would make "not found" look like "not in the chain".
+function renderNodeInfo(info, health, stats, reorgs) {
+  const rows = [];
+  if (health) {
+    rows.push(health.ok
+      ? `<span class="ok">ready</span> — tip ${esc(health.tip_age || "?")} old, ${health.blocks_behind || 0} behind`
+      : `<span class="offline">NOT READY</span> — ${esc((health.reasons || []).join("; "))}`);
+  }
+  if (stats && stats.window > 1) {
+    rows.push(`hashrate ${esc(stats.hashrate_fmt)} · median block interval ${stats.median_interval}s ` +
+      `against a ${stats.target_interval}s target`);
+  }
+  if (reorgs) {
+    rows.push(`${reorgs.total} reorg(s), deepest ${reorgs.deepest} of a ${reorgs.max_depth} limit · ` +
+      `${reorgs.orphans} orphan block(s) buffered`);
+  }
+  if (info) {
+    rows.push(info.pruned
+      ? `<span class="muted">pruned</span>: bodies from height ${info.body_height} ` +
+        `(keeping ${info.prune_keep}; ${info.pruned_bodies} discarded). Older bodies, proofs and ` +
+        `filters must come from another node.`
+      : `holding every block body from height ${info.body_height}`);
+    if (info.filter_base > 0) {
+      rows.push(`<span class="muted">filter headers start at height ${info.filter_base}</span> ` +
+        `(this node fast-synced, so it never saw the bodies below that)`);
+    }
+    if (info.webhooks) rows.push("webhooks configured");
+    if (info.address_index) rows.push("address index enabled (/address/{addr}/history)");
+    if (info.faucet) rows.push("faucet enabled");
+  }
+  document.getElementById("nodeinfo").innerHTML =
+    `<div class="card">${rows.map(r => `<div>${r}</div>`).join("")}</div>`;
+}
+
 async function refresh() {
   const st = document.getElementById("status");
   try {
-    const [info, chain, mp, supply] = await Promise.all([j("/info"), j("/chain"), j("/mempool"), j("/supply")]);
+    // ?last= asks for the NEWEST blocks. The bulk reads are paged, so a plain
+    // /chain returns the first page — past the page limit that is the oldest
+    // blocks, and this panel would sit frozen in the distant past.
+    const [info, chain, mp, supply] = await Promise.all(
+      [j("/info"), j("/chain?last=12"), j("/mempool"), j("/supply")]);
+    // The panels below are best-effort: a node that predates any of these
+    // endpoints still renders the rest of the page rather than going blank.
+    const [assets, health, stats, reorgs] = await Promise.all([
+      j("/assets").catch(() => null),
+      jAny("/health").catch(() => null),
+      j("/chainstats").catch(() => null),
+      j("/reorgs").catch(() => null),
+    ]);
     const chips = [
+      // Which chain this is. Testnet and regtest have their own genesis and their
+      // own signatures, so it matters that the page says which one you are on.
+      ["network", info.network || "mainnet"],
       ["height", info.height],
       ["tip", short(info.tip, 10)],
       ["next diff", Number(info.next_difficulty).toFixed(2)],
@@ -209,6 +393,8 @@ async function refresh() {
       chips.map(([k, v]) => `<div class="chip"><div class="k">${k}</div><div class="v">${esc(v)}</div></div>`).join("");
     renderBlocks(chain);
     renderMempool(mp || []);
+    renderAssets(assets);
+    renderNodeInfo(info, health, stats, reorgs);
     st.textContent = "● live";
     st.className = "sub ok";
   } catch (e) {

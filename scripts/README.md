@@ -19,6 +19,16 @@ node it funds two hash-time-locked contracts and settles one via the **claim**
 (preimage) branch and the other via the **refund** (timeout) branch. Edit the
 `190xx` ports at the top if they are taken.
 
+## swap-demo.sh
+
+`./scripts/swap-demo.sh` settles a full **asset-for-coin atomic swap** on one
+node: Alice issues a native asset and wants coin, Bob has coin and wants the
+asset, and neither has to trust the other. It derives both HTLC legs with
+`dnas htlc swap`, funds them (including the coin an asset contract needs to pay
+its own claim fee), and settles — Alice's claim publishes the preimage on-chain,
+which is what lets Bob take the asset. Edit the `191xx` ports at the top if they
+are taken.
+
 ## build.sh
 
 Cross-compiles static (CGO-free) `dnas` + `dnas-tui` binaries for one or more

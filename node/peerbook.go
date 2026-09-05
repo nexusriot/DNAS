@@ -6,11 +6,17 @@ import "sync"
 // ones it has already started dialing (so it never opens duplicate dial loops
 // or dials itself, and never exceeds a maximum number of outbound peers).
 type peerbook struct {
-	mu      sync.Mutex
-	self    string          // our own advertised address, never dialed
-	max     int             // maximum outbound dials
-	known   map[string]bool // every address we've heard of (for gossip)
-	dialing map[string]bool // addresses we've launched a dial loop for
+	mu   sync.Mutex
+	self string // our own advertised address, never dialed
+	// selfAliases are other spellings of our own address, learned the hard way:
+	// a peer that reached us as "localhost:3000" gossips that, while we advertise
+	// ":3000", and a string comparison does not see they are the same host. The
+	// self-connection is then detected by IDENTITY during the handshake (see
+	// handleConn) and the address recorded here so we stop dialing it.
+	selfAliases map[string]bool
+	max         int             // maximum outbound dials
+	known       map[string]bool // every address we've heard of (for gossip)
+	dialing     map[string]bool // addresses we've launched a dial loop for
 }
 
 func newPeerbook(self string, max int) *peerbook {
@@ -18,10 +24,11 @@ func newPeerbook(self string, max int) *peerbook {
 		max = 1
 	}
 	return &peerbook{
-		self:    self,
-		max:     max,
-		known:   map[string]bool{},
-		dialing: map[string]bool{},
+		self:        self,
+		selfAliases: map[string]bool{},
+		max:         max,
+		known:       map[string]bool{},
+		dialing:     map[string]bool{},
 	}
 }
 
@@ -33,7 +40,31 @@ func (pb *peerbook) note(addr string) {
 	}
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
+	if pb.selfAliases[addr] {
+		return // another spelling of us; gossiping it would send peers in a circle
+	}
 	pb.known[addr] = true
+}
+
+// noteSelf records an address that turned out to be this node, so it is never
+// dialed or gossiped again. Called when a handshake reveals our own identity on
+// the other end.
+func (pb *peerbook) noteSelf(addr string) {
+	if addr == "" {
+		return
+	}
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+	pb.selfAliases[addr] = true
+	delete(pb.known, addr)
+	delete(pb.dialing, addr) // free the outbound slot it was holding
+}
+
+// isSelf reports whether addr is known to be this node under another name.
+func (pb *peerbook) isSelf(addr string) bool {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+	return pb.selfAliases[addr]
 }
 
 // shouldDial reports whether we should open a new dial loop to addr, and if so
@@ -45,7 +76,7 @@ func (pb *peerbook) shouldDial(addr string) bool {
 	}
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
-	if pb.dialing[addr] {
+	if pb.selfAliases[addr] || pb.dialing[addr] {
 		return false
 	}
 	if len(pb.dialing) >= pb.max {

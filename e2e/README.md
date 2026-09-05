@@ -12,7 +12,13 @@ make e2e-docker   # the same suite, hermetically, in a container (needs only Doc
 ```
 
 They are behind the `e2e` build tag, so `make test` and `go test ./core/...`
-never pick them up: they spawn processes, bind sockets, and take ~15 s.
+never pick them up: they spawn processes, bind sockets, and take ~20 s.
+
+Most commands print their errors and still exit 0, so assertions are on the
+output text (`mustContain`). A few deliberately exit **non-zero** — `dnas health`
+when a node is not ready, `dnas peers unban` on an unknown key, a bad
+`-loglevel` — and those are driven with `cliAllowFail`, which returns the exit
+status so the test can require it.
 
 ## Isolation
 
@@ -48,9 +54,16 @@ runtime image holds nothing else — no toolchain, no sources, no build cache:
 | Filesystem | `--read-only` root plus a `tmpfs` for `TMPDIR`; `$HOME` points into the read-only root, so a test that writes there fails loudly |
 | Privileges | non-root user, `--cap-drop ALL`, `--security-opt no-new-privileges` |
 
-[.dockerignore](../.dockerignore) keeps local state (`chain.db`, `wallet.json`)
-and everything the image does not compile out of the build context, so the image
-is a function of the source and nothing else.
+[.dockerignore](../.dockerignore) keeps local state out of the build context, so
+the image is a function of the source and nothing else. That means the chain and
+the soft state (`chain.db`, `peers.json`) — a "fresh" node in the container must
+not start on somebody else's — and it also means **key material**: `wallet.json`,
+the node identity `nodekey.json`, and a `dnas-backup.json` bundle have no
+business inside an image. The signing flows' working files
+(`multisig-spend.json`, `escrow.json`, an `invoice.json`) and the light-client
+caches are excluded for the same reason plus a simpler one: nothing here
+compiles them. The build needs no JSON from the repository root at all, so the
+root `*.json` is excluded wholesale.
 
 That the build fetches nothing is checkable, not just claimed — with the base
 images already pulled:
@@ -93,6 +106,37 @@ arm64 hosts resolve the same pin.
 | `TestSPVHistoryReconstructsTransfers` | light-wallet history reconstruction |
 | `TestFastSyncBootstrapsFromSnapshot` | snapshot verification against the header state root |
 | `TestExternalMinerProducesABlock` | the `/blocktemplate` → `/submitblock` mining protocol |
+| `TestNetworkSeparation` | a chain store or a client being usable on the wrong network |
+| `TestMempoolReconciliationOnJoin` | a late-joining node never learning a pending payment |
+| `TestAddressHistoryIndex` | the address index missing a payment, or paging the wrong way round |
+| `TestAddressHistoryUnavailableWithoutTheIndex` | "no index" being reported as "no history" |
+| `TestMinerSubmitsShares` | a share the node rejects — i.e. the miner and node disagreeing structurally |
+| `TestFaucetHandsOutCoinOverHTTP` | the faucet not paying, or its cooldown not holding |
+| `TestFaucetRefusedWithoutTheFlag` | a node giving coin away without being asked to |
+| `TestFaucetCLIFundsAWallet` | the `dnas faucet` client path |
+| `TestVaultColdKeySweepsImmediately` | a hot key spending early, or the cold key unable to rescue |
+| `TestSponsoredTransfer` | the two-party fee-sponsorship flow, and a broke sender being unable to pay |
+| `TestDBVerifyExportImport` | `dnas db` mis-reading, mis-verifying, or losing a chain on a round trip |
+| `TestNodeIdentityIsNotTheWallet` | a node publishing its wallet address to every peer via its identity key |
+| `TestSPVHeaderCache` | the light client re-downloading the whole header chain on every command |
+| `TestPagedReadEndpoints` | a bulk read serializing the whole chain into one response |
+| `TestPeersAndBansCLI` | peers/bans becoming unobservable or unmanageable — and a node connecting to itself |
+| `TestStatsAndHealthAndReorgsCLI` | hashrate/timing/reorg reporting, and `health` failing to exit non-zero when unready |
+| `TestBumpAndCancelCLI` | replace-by-fee being unreachable from a client, or a bump paying twice |
+| `TestStructuredLogging` | `-logjson`/`-loglevel` silently not applying |
+| `TestPrintConfigShowsTheResolvedSettings` | `-printconfig` starting the node, or hiding a resolved default |
+| `TestMultisigSpendEndToEnd` | a funded multisig account being unspendable, or a stranger/duplicate signature being accepted |
+| `TestEscrowReleaseEndToEnd` | one party moving escrowed coin alone, or a shared role passing as a 2-of-3 |
+| `TestAnchorEndToEnd` | an unmined or altered file verifying as anchored |
+| `TestInvoiceLifecycleEndToEnd` | an unpaid or 1-confirmation invoice being reported as settled |
+| `TestWalletMessageSigningEndToEnd` | a forged address claim or a changed message verifying |
+| `TestWalletPassphraseRotationEndToEnd` | a rotation losing the key, or an encrypted file failing unhelpfully |
+| `TestBackupEndToEnd` | a backup that omits a key, includes the chain, or clobbers live files on restore |
+| `TestTxInspectEndToEnd` | `tx verify` passing a transaction the node would refuse |
+| `TestAssetRegistryEndToEnd` | an asset id with no way to learn what it is, or an unknown id printing as blank |
+| `TestSendOptionsEndToEnd` | memo/expiry/lock-until not reaching the wire, or a dead-on-arrival expiry being signed |
+| `TestPruningNodeReportsWhatItHolds` | `-prune` not being applied, or its floor not being enforced |
+| `TestConsoleAnswersTheReadCommands` | the console losing a command, or `-console` not forcing the prompt |
 
 ## Adding a test
 
@@ -102,5 +146,20 @@ restart tests), then `generate`, `send`, `getJSON`, `post`, and `cli` to drive
 it. `waitFor` polls anything asynchronous — never sleep on a fixed duration for
 propagation.
 
-Assert on behaviour a user could observe. The CLI prints its errors and still
-exits 0, so check the output text (`mustContain`) rather than the exit status.
+Assert on behaviour a user could observe. Most CLI commands print their errors
+and still exit 0, so check the output text (`mustContain`); for the ones whose
+exit status is part of the contract (`dnas health`, `anchor verify`,
+`invoice watch`, `tx verify`) use `cliAllowFail` and assert on both. `cliEnv`
+passes a secret through the environment (a passphrase must not land in shell
+history or `ps`), and `cliStdin` drives the console.
+
+Two limits of the harness worth knowing before writing a test:
+
+- **Regtest cannot mint a deep chain in one call.** Block timestamps advance a
+  second each and `MaxFutureDrift` is 120 seconds, so a single `/generate` stops
+  around 120 blocks in — a node refuses its own block as too far in the future.
+  Anything needing more (pruning's 132-body floor, say) belongs in the unit
+  suites, where the chain is built directly.
+- **This module imports no DNAS package**, so a consensus constant used in an
+  assertion has to be written out — and will not follow a change to core. Prefer
+  asserting on what the binary *reports* over hard-coding a number.

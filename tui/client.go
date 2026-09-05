@@ -42,6 +42,37 @@ type Info struct {
 	Mining         bool     `json:"mining"`
 }
 
+// FeeBucket is one band of the mempool's fee-rate distribution (GET
+// /mempool/stats). The node computes it because it needs each transaction's
+// canonical size, which a client cannot derive from the JSON it is served.
+type FeeBucket struct {
+	From  uint64 `json:"from_rate"`
+	To    uint64 `json:"to_rate"` // 0 = "and above"
+	Count int    `json:"count"`
+	Bytes int    `json:"bytes"`
+}
+
+// MempoolStats mirrors GET /mempool/stats.
+type MempoolStats struct {
+	Count      int         `json:"count"`
+	Bytes      int         `json:"bytes"`
+	MinRate    uint64      `json:"min_rate"`
+	MaxRate    uint64      `json:"max_rate"`
+	MedianRate uint64      `json:"median_rate"`
+	BaseFee    uint64      `json:"base_fee"`
+	Buckets    []FeeBucket `json:"buckets"`
+}
+
+// TxStatus mirrors GET /tx/{hash}: a transaction's position in its life, from
+// pending through confirmed.
+type TxStatus struct {
+	Status        string `json:"status"`
+	Hash          string `json:"hash"`
+	Height        uint64 `json:"height"`
+	Confirmations uint64 `json:"confirmations"`
+	Error         string `json:"error"`
+}
+
 // Tx is a transaction as returned by /chain and /mempool.
 type Tx struct {
 	From   string `json:"from"`
@@ -189,7 +220,35 @@ func (c *Client) Subscribe() (<-chan string, func(), error) {
 	return ch, cancel, nil
 }
 
-func (c *Client) Chain() ([]Block, error) { var b []Block; return b, c.getJSON("/chain", &b) }
+// RecentBlocks fetches the newest `n` blocks. It must ask for `last` rather than
+// GET /chain and keep the tail: the bulk reads are paged, so an unparameterized
+// request returns the FIRST page — which past the page limit is the oldest
+// blocks, not the newest, and looks like a chain frozen in the distant past.
+func (c *Client) RecentBlocks(n int) ([]Block, error) {
+	var b []Block
+	return b, c.getJSON(fmt.Sprintf("/chain?last=%d", n), &b)
+}
+
+// MempoolStats fetches the pending queue's fee-rate distribution.
+func (c *Client) MempoolStats() (MempoolStats, error) {
+	var st MempoolStats
+	return st, c.getJSON("/mempool/stats", &st)
+}
+
+// TxStatus looks one transaction up, whether it is pending or confirmed. A
+// transaction the node has never seen is not an error here — it is a status,
+// because a watcher polling for one it just submitted will see exactly that for
+// a moment.
+func (c *Client) TxStatus(hash string) (TxStatus, error) {
+	var st TxStatus
+	if err := c.getJSON("/tx/"+hash, &st); err != nil {
+		if strings.Contains(err.Error(), "404") {
+			return TxStatus{Status: "unknown", Hash: hash}, nil
+		}
+		return TxStatus{}, err
+	}
+	return st, nil
+}
 func (c *Client) Mempool() ([]Tx, error)  { var t []Tx; return t, c.getJSON("/mempool", &t) }
 func (c *Client) SetMining(on bool) error { return c.postJSON("/mine", map[string]bool{"on": on}, nil) }
 

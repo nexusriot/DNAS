@@ -86,6 +86,16 @@ func (h Header) HasValidPoW() bool {
 // ComputeHash returns the hash the block should have given its header.
 func (b Block) ComputeHash() string { return b.Header().ComputeHash() }
 
+// IsPlaceholder reports whether this is a header-only stand-in for a block whose
+// body the node does not have — pruned, or below a fast-sync snapshot.
+//
+// Every real block above genesis carries at least a coinbase, so an empty
+// transaction list above height 0 can only be a placeholder. It matters that
+// this is checkable: anything derived from a body (a compact filter, an
+// inclusion proof) would otherwise be computed over nothing and answer
+// confidently that the block is empty.
+func (b Block) IsPlaceholder() bool { return b.Index > 0 && len(b.Transactions) == 0 }
+
 // HasValidPoW reports whether the stored hash is correct and meets the block's
 // stated difficulty.
 func (b Block) HasValidPoW() bool { return b.Header().HasValidPoW() }

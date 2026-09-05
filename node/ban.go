@@ -66,6 +66,20 @@ func (b *banbook) snapshot() map[string]int {
 	return out
 }
 
+// clear drops a key's score entirely, reporting whether there was one. Used by
+// an operator overriding the scoring (see Node.Unban); the score is not merely
+// lowered below the threshold, because a key left at threshold-1 would be
+// re-banned by the next single infraction.
+func (b *banbook) clear(key string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if _, ok := b.score[key]; !ok {
+		return false
+	}
+	delete(b.score, key)
+	return true
+}
+
 // restore merges persisted ban scores back in (used on startup so bans survive a
 // restart instead of resetting).
 func (b *banbook) restore(scores map[string]int) {

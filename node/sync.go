@@ -1,7 +1,6 @@
 package node
 
 import (
-	"log"
 	"sync/atomic"
 	"time"
 
@@ -29,8 +28,11 @@ const (
 	// maxSyncPeers is how many ranged block requests may be outstanding at once,
 	// each with a different peer, so catch-up is not limited by one peer's upload.
 	maxSyncPeers = 3
-	// orphanPoolCapacity bounds how many parentless blocks are buffered.
+	// orphanPoolCapacity bounds how many parentless blocks are buffered, and
+	// orphanPoolBytes how much they may weigh in total — a count alone does not
+	// bound memory, since 512 full blocks is ~512 MB (see orphan.go).
 	orphanPoolCapacity = 512
+	orphanPoolBytes    = 64 << 20
 )
 
 // blockRequest is one outstanding ranged block download.
@@ -62,6 +64,18 @@ func (n *Node) bestKnownHeight() uint64 {
 		return 0
 	}
 	return uint64(h)
+}
+
+// BlocksBehind is how many blocks the best height any peer has announced is
+// ahead of our tip — 0 when we are caught up (or when nobody has told us about
+// anything higher). Announcements are hints, not proof, so this is a status
+// indicator and not a consensus input.
+func (n *Node) BlocksBehind() uint64 {
+	tip := n.chain.Height()
+	if best := n.bestKnownHeight(); best > tip {
+		return best - tip
+	}
+	return 0
 }
 
 // trackRequest records that we asked p for blocks [from, to].
@@ -98,6 +112,33 @@ func (n *Node) syncLoop() {
 func (n *Node) syncTick() {
 	n.dropStalledPeers()
 	n.requestMoreBlocks()
+	n.reconcileMempoolWithPeers()
+}
+
+// reconcileMempoolWithPeers asks each peer, once per connection, for the
+// transactions it has pending (see MsgGetMempool).
+//
+// It waits until we are CAUGHT UP before asking, which is not a nicety: mempool
+// admission is checked against confirmed state, so a node still downloading the
+// chain would reject every transaction it was told about — the sender's coin
+// does not exist yet as far as it knows. Asking after the blocks have landed is
+// the difference between reconciliation working and silently doing nothing.
+func (n *Node) reconcileMempoolWithPeers() {
+	if n.chain.Height() < n.bestKnownHeight() {
+		return
+	}
+	n.peersMu.Lock()
+	var ask []*peer
+	for p := range n.peers {
+		if !p.askedMempool && p.supports(CapMempool) {
+			p.askedMempool = true
+			ask = append(ask, p)
+		}
+	}
+	n.peersMu.Unlock()
+	for _, p := range ask {
+		p.send(Message{Type: MsgGetMempool})
+	}
 }
 
 // dropStalledPeers disconnects peers that accepted a ranged block request and
@@ -114,7 +155,7 @@ func (n *Node) dropStalledPeers() {
 	}
 	n.syncMu.Unlock()
 	for _, p := range stalled {
-		log.Printf("dropping peer id=%s: no answer to a block request in %s", short(p.id), blockRequestTimeout)
+		Warnf("peer dropped", "peer", short(p.id), "reason", "no answer to a block request", "after", blockRequestTimeout.String())
 		n.bans.add(p.id, banStalling)
 		_ = p.conn.Close() // the read loop's defer removes it from the peer set
 	}

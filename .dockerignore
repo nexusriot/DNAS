@@ -30,6 +30,28 @@ mempool.json
 spvwallet.json
 node.json
 
+# A node's IDENTITY key is a private key too — the same argument as wallet.json
+# above — and so is a backup bundle, encrypted or not.
+nodekey*.json
+dnas-backup*.json
+
+# Light-client caches, the files the multi-party signing flows pass between
+# signers, and anchor receipts. None of them is compiled, and a half-signed
+# spend copied into an image is somebody's pending payment.
+spvheaders*.json
+*.headers
+multisig-spend*.json
+escrow*.json
+sponsored-tx*.json
+invoice*.json
+*.dnasanchor
+
+# Everything else the docs have a reader create at the root by name (m1.json,
+# cold.json, spend.json, sig.json, …). The build compiles Go; it needs no JSON
+# from the root at all, so excluding the lot keeps the context a function of the
+# source rather than of whatever the last local run left behind.
+/*.json
+
 # Not part of the e2e image: tui/ is its own module with external dependencies
 # and is absent from go.work, gui/ is Python. Neither is compiled here.
 gui/

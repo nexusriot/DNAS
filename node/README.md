@@ -26,6 +26,43 @@ Module `github.com/nexusriot/DNAS/node` — the peer-to-peer daemon.
   height any peer has announced so it knows when it is behind, and keeps up to
   `maxSyncPeers` ranges in flight across different peers. Without this a peer that
   answers pings while serving no bodies stalls catch-up indefinitely.
+- `identity.go` — the node's NETWORK identity key, deliberately separate from
+  the wallet: `MsgIdentity` carries the identity's public key and a DNAS address
+  is a hash of a public key, so sharing them publishes the address holding the
+  node's coin (and undercuts the Dandelion++ origin privacy below). Defaults to
+  `nodekey.json` beside the chain; a node given none falls back to the wallet and
+  warns.
+- `peerinfo.go` — `Peers()` reports every live connection in full (identity,
+  version, capabilities, direction, uptime, ban score, whether a block request is
+  outstanding); `Bans()`/`Unban()` expose and clear the scores that were
+  previously kept, persisted and unreachable; `AddPeer()`/`DropPeer()` manage
+  connections at runtime.
+- `reorghist.go` — a bounded ring of the chain switches this node has lived
+  through (depth, fork height, both tips, transactions re-queued) plus lifetime
+  counters. The event stream announces a reorg once and forgets it.
+- `logging.go` — log levels (`error`/`warn`/`info`/`debug`) and an optional
+  one-JSON-object-per-line form, wrapping the standard logger so any remaining
+  `log.Printf` still lands at info.
+- **Self-connection detection** — a handshake that returns our own identity is
+  closed and the address recorded as a self-alias (`peerbook.noteSelf`), so it is
+  never dialed or gossiped again. Addresses cannot settle this: a node
+  advertising `:3000` is reached as `localhost:3000`.
+- `shares.go` — the pool-facing half of external mining. `WaitForTip` powers the
+  template **long poll** (`/blocktemplate?longpoll=1&prev=HASH`), so a miner starts
+  on a fresh candidate the moment the old one dies instead of hashing a dead one;
+  `SubmitShare` accepts a candidate that met the easier **share** target, credits
+  its coinbase address in a ledger (`Shares`), and submits it as a block if it also
+  met the real target. None of it is consensus — the ledger is node-local and
+  nothing is written to the chain.
+- `faucet.go` — hands out coin from the node's own wallet on a network whose
+  parameters permit one (never mainnet, by definition rather than by policy), and
+  only when the operator sets `Config.Faucet`. Rate-limited per recipient and per
+  requester, with a refused request stamping nobody's cooldown.
+- **Mempool reconciliation** — a node asks each peer once, via `MsgGetMempool`, for
+  the transactions it has pending, so one that was down when a payment was
+  broadcast learns of it on connect. The request waits until catch-up completes:
+  admission is checked against confirmed state, so a node still syncing would
+  reject everything it was told.
 - `orphan.go` — `orphanPool`: bounded, `SelfValid`-gated buffer of blocks whose
   parent has not arrived yet (gossip races, and out-of-order parallel ranges),
   connected as soon as the parent lands instead of being refetched.
@@ -43,7 +80,9 @@ Module `github.com/nexusriot/DNAS/node` — the peer-to-peer daemon.
 - Eclipse/DoS resistance: inbound connections are admitted (`admitInbound`) under
   a total and per-IP-group cap (loopback exempt); each peer read loop runs a
   token-bucket `rateLimiter` (`ratelimit.go`) and the whole-chain request is
-  throttled per peer.
+  throttled per peer. The orphan pool is bounded in **bytes** as well as in
+  count (`orphan.go`): 200 maximum-size blocks is half a gigabyte, and an
+  orphan's proof of work is cheap on a low-difficulty fork.
 - `ban.go` — `banbook`: ban scoring. Failed handshakes are scored by IP (loopback
   exempt); post-authentication fraud (bad header chains, or blocks failing their own
   `SelfValid` PoW/merkle check) by identity. A plain fork is not penalised.
@@ -76,6 +115,18 @@ Module `github.com/nexusriot/DNAS/node` — the peer-to-peer daemon.
   `Event{Type: "block"|"reorg"|"tx", …}` is emitted on mined/accepted/synced
   blocks, reorgs, and mempool txs. A slow subscriber drops events rather than
   blocking the node. The API's `/events` SSE endpoint consumes it.
+- `webhook.go` — `-webhook URL` POSTs every event to a service that wants to be
+  *called* rather than hold an SSE connection open. Delivery runs off a bounded
+  queue on its own goroutine and never blocks block processing (a receiver far
+  enough behind loses events); 5xx and transport errors are retried with a
+  growing delay, a 4xx is not, and every delivery carries the network and the
+  node's height so a receiver can spot a gap. `WebhookStats` feeds `/webhooks`,
+  because a silently failing webhook is otherwise invisible from outside.
+- **Dial backoff** — a failed dial doubles its retry interval up to
+  `dialRetryMax` (5 minutes), and an established connection resets it. A dead
+  seed address was previously retried every 3 seconds for the node's whole
+  uptime: 1200 attempts an hour, per address, which at the far end looks exactly
+  like being scanned.
 - `persist.go` — when `Config.StateDir` is set, the node persists `peers.json`,
   `bans.json`, and `mempool.json` there, loading them on `Start` and rewriting
   them on graceful `Shutdown` (via temp-file+rename). The chain stays

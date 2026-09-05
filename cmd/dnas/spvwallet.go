@@ -30,6 +30,12 @@ type SPVWallet struct {
 	// so several sends before a confirming block don't collide (it advances past
 	// the trustlessly-proven confirmed nonce as we submit).
 	NextNonce map[string]uint64 `json:"next_nonce,omitempty"`
+	// Labels names addresses and Notes annotates transactions. Both are private
+	// client-side bookkeeping — never sent anywhere, never part of consensus — and
+	// they survive a rescan, which discards everything reconstructed from the
+	// chain (see resetScan). See spvlabels.go.
+	Labels map[string]string `json:"labels,omitempty"`
+	Notes  map[string]string `json:"notes,omitempty"`
 }
 
 // AddrState is one watched address's reconstructed totals and events.
@@ -146,6 +152,15 @@ func (sw *SPVWallet) foldBlock(b core.Block) {
 // stored block hash no longer matches). It is the pure core of update(), so it is
 // unit-tested with in-memory data.
 func (sw *SPVWallet) sync(headers []core.Header, filters []core.BlockFilter, fetch func(uint64) (core.Block, error)) error {
+	return sw.syncFrom(headers, 0, filters, fetch)
+}
+
+// syncFrom is sync where `filters` covers heights [filterBase, filterBase+len)
+// rather than the whole chain, so a caller that only downloaded the new filters
+// can pass them without padding. A wallet that has scanned to H needs nothing
+// below H+1, and asking the node for the rest is the difference between a light
+// client and a heavy one.
+func (sw *SPVWallet) syncFrom(headers []core.Header, filterBase uint64, filters []core.BlockFilter, fetch func(uint64) (core.Block, error)) error {
 	if len(headers) == 0 {
 		return fmt.Errorf("no headers")
 	}
@@ -156,12 +171,18 @@ func (sw *SPVWallet) sync(headers []core.Header, filters []core.BlockFilter, fet
 	if sw.Scanned > 0 && sw.Scanned < uint64(len(headers)) && headers[sw.Scanned].Hash != sw.ScannedHash {
 		sw.resetScan()
 	}
+	// A rescan needs filters this call may not have fetched; the caller retries
+	// with a base of 0 (see update).
+	if sw.Scanned+1 < filterBase {
+		return errRescanNeeded
+	}
 
 	for h := sw.Scanned + 1; h <= tip; h++ {
-		if h >= uint64(len(filters)) {
+		idx := h - filterBase
+		if idx >= uint64(len(filters)) {
 			break
 		}
-		if !filters[h].MatchAny(sw.Addresses) {
+		if !filters[idx].MatchAny(sw.Addresses) {
 			continue // the filter proves no watched address is in this block
 		}
 		b, err := fetch(h)
@@ -179,14 +200,34 @@ func (sw *SPVWallet) sync(headers []core.Header, filters []core.BlockFilter, fet
 	return nil
 }
 
-// update syncs the wallet against a live node: it fetches and PoW-verifies the
-// header chain and filters (verifiedFilters), then folds in new matching blocks.
+// errRescanNeeded reports that a sync needs filters from further back than the
+// caller fetched — a reorg was detected below the scanned height.
+var errRescanNeeded = errors.New("rescan needed: filters are required from an earlier height")
+
+// update syncs the wallet against a live node. It downloads only the filters
+// above the height it already scanned (verified against the cached
+// filter-header chain), and falls back to the whole range when a reorg forces a
+// rescan.
 func (sw *SPVWallet) update(base string) error {
-	headers, filters, err := verifiedFilters(base)
+	from := sw.Scanned + 1
+	if sw.Scanned == 0 {
+		from = 0
+	}
+	headers, filters, err := verifiedFiltersFrom(base, from)
 	if err != nil {
 		return err
 	}
-	return sw.sync(headers, filters, func(h uint64) (core.Block, error) { return fetchBlock(base, h) })
+	fetch := func(h uint64) (core.Block, error) { return fetchBlock(base, h) }
+	err = sw.syncFrom(headers, from, filters, fetch)
+	if !errors.Is(err, errRescanNeeded) {
+		return err
+	}
+	// The reorg check reset the scan, so start again with every filter.
+	headers, filters, err = verifiedFiltersFrom(base, 0)
+	if err != nil {
+		return err
+	}
+	return sw.syncFrom(headers, 0, filters, fetch)
 }
 
 // provenAccount returns an address's balance and nonce proven trustlessly: it
@@ -227,6 +268,19 @@ func feePerByte(base string) uint64 {
 	return r.Fee
 }
 
+// tipHeight asks the node for its current height, which is what the relative
+// -expire-in / -lock-for forms are counted from. A failure is an error rather
+// than a default: guessing a height would sign the wrong window.
+func tipHeight(base string) (uint64, error) {
+	var r struct {
+		Height uint64 `json:"height"`
+	}
+	if err := getJSON(base+"/info", &r); err != nil {
+		return 0, fmt.Errorf("ask the node for its height: %w", err)
+	}
+	return r.Height, nil
+}
+
 func (sw *SPVWallet) printStatus() {
 	fmt.Printf("SPV wallet — scanned to height %d (tip %d), %d watched address(es)\n", sw.Scanned, sw.TipHeight, len(sw.Addresses))
 	if len(sw.Addresses) == 0 {
@@ -239,7 +293,7 @@ func (sw *SPVWallet) printStatus() {
 			st = &AddrState{}
 		}
 		net := int64(st.Received) - int64(st.Sent) - int64(st.Fees)
-		fmt.Printf("\n%s\n  received %s | sent %s | fees %s | net %s%s\n", addr,
+		fmt.Printf("\n%s\n  received %s | sent %s | fees %s | net %s%s\n", sw.describe(addr),
 			core.FormatAmount(st.Received), core.FormatAmount(st.Sent), core.FormatAmount(st.Fees),
 			sign(net), core.FormatAmount(abs(net)))
 		for _, e := range st.Entries {
@@ -249,9 +303,17 @@ func (sw *SPVWallet) printStatus() {
 			}
 			cp := ""
 			if e.Counterparty != "" {
-				cp = short(e.Counterparty)
+				// A labelled counterparty is shown by name: "paid rent" beats "paid dnas9f2…".
+				if l := sw.label(e.Counterparty); l != "" {
+					cp = l
+				} else {
+					cp = short(e.Counterparty)
+				}
 			}
 			fmt.Printf("  block %-4d %-9s %-14s %s  (%d confs)\n", e.Block, e.Kind, cp, core.FormatAmount(e.Amount), confs)
+			if note := sw.Notes[e.Hash]; note != "" {
+				fmt.Printf("       note: %s\n", note)
+			}
 		}
 	}
 }
@@ -262,8 +324,15 @@ func runSPVWallet(base string, args []string) {
 	file := fs.String("f", "spvwallet.json", "SPV wallet state file")
 	keyFile := fs.String("key", "", "signing key file for `new`/`send`/`issue` (encrypted if DNAS_WALLET_PASSPHRASE is set)")
 	asset := fs.String("asset", "", "for `send`: transfer this asset id (amount is in asset units, not DNAS)")
+	memo := fs.String("memo", "", "for `send`/`sendmany`: attach a memo (max "+strconv.Itoa(core.MaxMemoBytes)+" bytes)")
+	expiry := fs.Uint64("expiry", 0, "for `send`/`sendmany`: last block height at which it may be mined (0 = never expires)")
+	expireIn := fs.Uint64("expire-in", 0, "like -expiry, counted in blocks from the current tip")
+	lockUntil := fs.Uint64("lock-until", 0, "for `send`/`sendmany`: first block height at which it may be mined")
+	lockFor := fs.Uint64("lock-for", 0, "like -lock-until, counted in blocks from the current tip")
 	watch := fs.Bool("watch", false, "after updating, follow the node's /events stream and re-sync on each new block")
 	_ = fs.Parse(args)
+	opts := sendOptions{Memo: *memo, Expiry: *expiry, LockUntil: *lockUntil,
+		expireIn: *expireIn, lockFor: *lockFor}
 	rest := fs.Args()
 	cmd := "status"
 	if len(rest) > 0 {
@@ -274,6 +343,13 @@ func runSPVWallet(base string, args []string) {
 		if err := sw.save(*file); err != nil {
 			fmt.Println("save error:", err)
 		}
+	}
+
+	// Each wallet keeps its verified headers beside its own state file, so two
+	// wallets watching different addresses never share (or fight over) a cache.
+	// An explicit -cache on `dnas spv` still wins.
+	if !spvCacheExplicit {
+		spvCachePath = *file + ".headers"
 	}
 
 	sw := loadSPVWallet(*file)
@@ -308,8 +384,59 @@ func runSPVWallet(base string, args []string) {
 		fmt.Println("forgot", rest[1])
 	case "list":
 		for _, a := range sw.Addresses {
-			fmt.Println(a)
+			fmt.Println(sw.describe(a))
 		}
+	case "label":
+		// Naming an address the wallet does not watch is allowed on purpose: that is
+		// how a counterparty address book gets built.
+		if len(rest) < 2 {
+			fmt.Println("usage: dnas spv wallet label <address> [text...]   (no text clears it)")
+			return
+		}
+		if err := sw.setLabel(rest[1], strings.Join(rest[2:], " ")); err != nil {
+			fmt.Println("label error:", err)
+			return
+		}
+		saveOr(sw)
+		fmt.Println(sw.describe(rest[1]))
+	case "note":
+		if len(rest) < 2 {
+			fmt.Println("usage: dnas spv wallet note <txhash> [text...]   (no text clears it)")
+			return
+		}
+		if err := sw.setNote(rest[1], strings.Join(rest[2:], " ")); err != nil {
+			fmt.Println("note error:", err)
+			return
+		}
+		saveOr(sw)
+		fmt.Printf("%s: %s\n", short(rest[1]), sw.Notes[rest[1]])
+	case "export":
+		// A watch-only file: addresses and labels, no key material of any kind.
+		if len(rest) < 2 {
+			fmt.Println("usage: dnas spv wallet export <file.json>   (watch-only: addresses + labels, no keys)")
+			return
+		}
+		if err := sw.writeWatchOnly(rest[1]); err != nil {
+			fmt.Println("export error:", err)
+			return
+		}
+		fmt.Printf("exported %d watched address(es) to %s (no keys; it cannot spend)\n", len(sw.Addresses), rest[1])
+	case "import":
+		if len(rest) < 2 {
+			fmt.Println("usage: dnas spv wallet import <file.json>")
+			return
+		}
+		added, err := sw.readWatchOnly(rest[1])
+		if err != nil {
+			fmt.Println("import error:", err)
+			return
+		}
+		if err := sw.update(base); err != nil {
+			fmt.Println("sync error:", err)
+		}
+		saveOr(sw)
+		fmt.Printf("imported %s: %d new address(es) now watched\n", rest[1], added)
+		sw.printStatus()
 	case "update", "sync":
 		if err := sw.update(base); err != nil {
 			fmt.Println("sync error:", err)
@@ -346,17 +473,31 @@ func runSPVWallet(base string, args []string) {
 	case "send":
 		// A self-custodial send: sign locally with the key file, submit via /tx.
 		if *keyFile == "" || len(rest) < 3 {
-			fmt.Println("usage: dnas spv -api URL wallet -key FILE [-asset ID] send <to> <amount> [fee]")
+			fmt.Println("usage: dnas spv -api URL wallet -key FILE [-asset ID] [-memo TEXT] [-expire-in N] [-lock-for N] send <to> <amount> [fee]")
 			return
 		}
-		sw.send(base, *keyFile, *asset, rest[1:], func() { saveOr(sw) })
+		sw.send(base, *keyFile, *asset, rest[1:], opts, func() { saveOr(sw) })
 	case "sendmany":
 		// One transaction paying several addresses: one fee, one nonce, one signature.
 		if *keyFile == "" || len(rest) < 2 {
 			fmt.Println("usage: dnas spv -api URL wallet -key FILE sendmany <addr:amount> [addr:amount ...] [-fee AMOUNT]")
 			return
 		}
-		sw.sendMany(base, *keyFile, rest[1:], func() { saveOr(sw) })
+		sw.sendMany(base, *keyFile, rest[1:], opts, func() { saveOr(sw) })
+	case "bump":
+		// Re-send a stuck payment at a higher fee (replace-by-fee), same nonce.
+		if *keyFile == "" {
+			fmt.Println("usage: dnas spv -api URL wallet -key FILE bump <txhash> [fee]")
+			return
+		}
+		sw.bumpOrCancel(base, *keyFile, rest[1:], false, func() { saveOr(sw) })
+	case "cancel":
+		// Void a stuck payment by spending its nonce on a self-payment.
+		if *keyFile == "" {
+			fmt.Println("usage: dnas spv -api URL wallet -key FILE cancel <txhash> [fee]")
+			return
+		}
+		sw.bumpOrCancel(base, *keyFile, rest[1:], true, func() { saveOr(sw) })
 	case "issue":
 		// Mint a new native asset, signed locally.
 		if *keyFile == "" || len(rest) < 3 {
@@ -365,7 +506,9 @@ func runSPVWallet(base string, args []string) {
 		}
 		sw.issue(base, *keyFile, rest[1:], func() { saveOr(sw) })
 	default:
-		fmt.Println("unknown wallet command:", cmd, "(new | add | update | status | list | forget | send | sendmany | issue)")
+		fmt.Println("unknown wallet command:", cmd,
+			"(new | add | update | status | list | forget | send | sendmany | issue |\n"+
+				" bump | cancel | label | note | export | import)")
 	}
 }
 
@@ -381,12 +524,109 @@ func (sw *SPVWallet) nextNonce(addr string, provenNonce uint64) uint64 {
 
 // buildSend builds and signs a transfer from w (coin when assetID is empty, else
 // a native-asset transfer). Pure (no network), so it is unit-tested directly.
-func buildSend(w *wallet.Wallet, to string, amount, fee, nonce uint64, assetID string) (core.Transaction, error) {
-	tx := core.Transaction{From: w.Address(), To: to, Amount: amount, Fee: fee, Nonce: nonce, AssetID: assetID}
+func buildSend(w *wallet.Wallet, to string, amount, fee, nonce uint64, assetID string, opts sendOptions) (core.Transaction, error) {
+	if err := opts.check(); err != nil {
+		return core.Transaction{}, err
+	}
+	tx := core.Transaction{From: w.Address(), To: to, Amount: amount, Fee: fee, Nonce: nonce, AssetID: assetID,
+		Memo: opts.Memo, Expiry: opts.Expiry, LockUntil: opts.LockUntil}
 	if err := tx.Sign(w); err != nil {
 		return core.Transaction{}, err
 	}
 	return tx, nil
+}
+
+// sendOptions carries the three signed fields that consensus has always
+// supported and no client could set: a memo, and the height window the transfer
+// is valid in.
+//
+// They are not decoration. An expiry is how a payment stops being a liability:
+// without one, a transaction signed today sits in somebody's mempool and can be
+// mined next month at a nonce that has not moved, so the only way to take it
+// back is to spend the nonce on something else (see `dnas ... cancel`). A lock
+// bounds the other end — a payment that cannot be mined before a height.
+//
+// Both are absolute heights on the wire, because a signature has to commit to a
+// specific window; the relative forms are resolved against the tip before
+// signing, since "20 blocks from now" is what a person actually means.
+type sendOptions struct {
+	Memo      string
+	Expiry    uint64
+	LockUntil uint64
+
+	expireIn uint64 // blocks from the tip, resolved by resolveHeights
+	lockFor  uint64
+}
+
+// check validates what can be validated without a node, before anything is
+// signed: consensus caps the memo, and an inverted window can never be mined.
+func (o sendOptions) check() error {
+	if len(o.Memo) > core.MaxMemoBytes {
+		return fmt.Errorf("memo is %d bytes, and the limit is %d", len(o.Memo), core.MaxMemoBytes)
+	}
+	if o.Expiry != 0 && o.LockUntil > o.Expiry {
+		return fmt.Errorf("impossible window: -lock-until %d is above -expiry %d", o.LockUntil, o.Expiry)
+	}
+	return nil
+}
+
+// resolveHeights turns the relative forms into absolute heights against the
+// node's tip, and refuses an expiry that is already in the past — a transaction
+// signed with one is dead on arrival, and the node would answer with a bare
+// rejection after the wallet had already spent its nonce locally.
+func (o sendOptions) resolveHeights(base string) (sendOptions, error) {
+	if o.expireIn == 0 && o.lockFor == 0 {
+		if err := o.check(); err != nil {
+			return o, err
+		}
+		if o.Expiry != 0 || o.LockUntil != 0 {
+			height, err := tipHeight(base)
+			if err != nil {
+				return o, err
+			}
+			if o.Expiry != 0 && o.Expiry <= height {
+				return o, fmt.Errorf("-expiry %d is at or below the current height %d, so it can never be mined",
+					o.Expiry, height)
+			}
+		}
+		return o, nil
+	}
+	if o.expireIn != 0 && o.Expiry != 0 {
+		return o, errors.New("give -expiry or -expire-in, not both")
+	}
+	if o.lockFor != 0 && o.LockUntil != 0 {
+		return o, errors.New("give -lock-until or -lock-for, not both")
+	}
+	height, err := tipHeight(base)
+	if err != nil {
+		return o, err
+	}
+	if o.expireIn != 0 {
+		o.Expiry = height + o.expireIn
+	}
+	if o.lockFor != 0 {
+		o.LockUntil = height + o.lockFor
+	}
+	return o, o.check()
+}
+
+// describe renders the window for the submit line, so a wallet never quietly
+// attaches a deadline the person cannot see.
+func (o sendOptions) describe() string {
+	var parts []string
+	if o.Memo != "" {
+		parts = append(parts, fmt.Sprintf("memo %q", o.Memo))
+	}
+	if o.LockUntil != 0 {
+		parts = append(parts, fmt.Sprintf("not before height %d", o.LockUntil))
+	}
+	if o.Expiry != 0 {
+		parts = append(parts, fmt.Sprintf("expires after height %d", o.Expiry))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return ", " + strings.Join(parts, ", ")
 }
 
 // recordSent advances the wallet's local next-nonce for an address after a submit.
@@ -413,7 +653,7 @@ func resolveFee(base string, args []string) (uint64, error) {
 // the balance and nonce are proven trustlessly (state proof against a PoW-verified
 // header), the transaction is signed locally, and only the signed transaction is
 // sent to the node.
-func (sw *SPVWallet) send(base, keyFile, assetID string, args []string, save func()) {
+func (sw *SPVWallet) send(base, keyFile, assetID string, args []string, opts sendOptions, save func()) {
 	w, _, err := wallet.LoadOrCreateEncrypted(keyFile, walletPassphrase())
 	if err != nil {
 		fmt.Println("key error:", err)
@@ -447,6 +687,10 @@ func (sw *SPVWallet) send(base, keyFile, assetID string, args []string, save fun
 		return
 	}
 	nonce := sw.nextNonce(w.Address(), acc.Nonce)
+	if opts, err = opts.resolveHeights(base); err != nil {
+		fmt.Println(err)
+		return
+	}
 
 	// The fee is always coin; an asset send additionally needs enough of the asset.
 	if assetID != "" {
@@ -463,7 +707,7 @@ func (sw *SPVWallet) send(base, keyFile, assetID string, args []string, save fun
 		return
 	}
 
-	tx, err := buildSend(w, args[0], amount, fee, nonce, assetID)
+	tx, err := buildSend(w, args[0], amount, fee, nonce, assetID, opts)
 	if err != nil {
 		fmt.Println("sign:", err)
 		return
@@ -476,19 +720,23 @@ func (sw *SPVWallet) send(base, keyFile, assetID string, args []string, save fun
 	sw.addAddress(w.Address())
 	save()
 	if assetID != "" {
-		fmt.Printf("submitted %s → %s  %d units of %s (fee %s, nonce %d)\n",
-			tx.Hash()[:12], short(args[0]), amount, short(assetID), core.FormatAmount(fee), nonce)
+		fmt.Printf("submitted %s → %s  %d units of %s (fee %s, nonce %d%s)\n",
+			tx.Hash()[:12], short(args[0]), amount, short(assetID), core.FormatAmount(fee), nonce, opts.describe())
 	} else {
-		fmt.Printf("submitted %s → %s  %s (fee %s, nonce %d)\n",
-			tx.Hash()[:12], short(args[0]), core.FormatAmount(amount), core.FormatAmount(fee), nonce)
+		fmt.Printf("submitted %s → %s  %s (fee %s, nonce %d%s)\n",
+			tx.Hash()[:12], short(args[0]), core.FormatAmount(amount), core.FormatAmount(fee), nonce, opts.describe())
 	}
 }
 
 // buildSendMany builds and signs a multi-recipient coin transfer: one fee, one
 // nonce and one signature covering every output. Pure (no network), so it is
 // unit-tested directly.
-func buildSendMany(w *wallet.Wallet, outputs []core.Output, fee, nonce uint64) (core.Transaction, error) {
-	tx := core.Transaction{From: w.Address(), Outputs: outputs, Fee: fee, Nonce: nonce}
+func buildSendMany(w *wallet.Wallet, outputs []core.Output, fee, nonce uint64, opts sendOptions) (core.Transaction, error) {
+	if err := opts.check(); err != nil {
+		return core.Transaction{}, err
+	}
+	tx := core.Transaction{From: w.Address(), Outputs: outputs, Fee: fee, Nonce: nonce,
+		Memo: opts.Memo, Expiry: opts.Expiry, LockUntil: opts.LockUntil}
 	if err := tx.Sign(w); err != nil {
 		return core.Transaction{}, err
 	}
@@ -531,7 +779,7 @@ func parseOutputs(args []string) ([]core.Output, uint64, error) {
 
 // sendMany pays several addresses in one transaction, signed locally with the
 // wallet's key file. A trailing "-fee AMOUNT" overrides the estimated fee.
-func (sw *SPVWallet) sendMany(base, keyFile string, args []string, save func()) {
+func (sw *SPVWallet) sendMany(base, keyFile string, args []string, opts sendOptions, save func()) {
 	w, _, err := wallet.LoadOrCreateEncrypted(keyFile, walletPassphrase())
 	if err != nil {
 		fmt.Println("key error:", err)
@@ -567,7 +815,11 @@ func (sw *SPVWallet) sendMany(base, keyFile string, args []string, save func()) 
 		return
 	}
 	nonce := sw.nextNonce(w.Address(), acc.Nonce)
-	tx, err := buildSendMany(w, outputs, fee, nonce)
+	if opts, err = opts.resolveHeights(base); err != nil {
+		fmt.Println(err)
+		return
+	}
+	tx, err := buildSendMany(w, outputs, fee, nonce, opts)
 	if err != nil {
 		fmt.Println("sign:", err)
 		return
@@ -579,8 +831,8 @@ func (sw *SPVWallet) sendMany(base, keyFile string, args []string, save func()) 
 	sw.recordSent(w.Address(), nonce)
 	sw.addAddress(w.Address())
 	save()
-	fmt.Printf("submitted %s  %d recipients, %s total (fee %s, nonce %d)\n",
-		tx.Hash()[:12], len(outputs), core.FormatAmount(total), core.FormatAmount(fee), nonce)
+	fmt.Printf("submitted %s  %d recipients, %s total (fee %s, nonce %d%s)\n",
+		tx.Hash()[:12], len(outputs), core.FormatAmount(total), core.FormatAmount(fee), nonce, opts.describe())
 	for _, o := range outputs {
 		fmt.Printf("  → %s  %s\n", short(o.To), core.FormatAmount(o.Amount))
 	}

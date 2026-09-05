@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/nexusriot/DNAS/api"
@@ -56,6 +57,36 @@ func main() {
 		runHTLC(args[1:])
 	case "supply":
 		runSupply(args[1:])
+	case "db":
+		runDB(args[1:])
+	case "vault":
+		runVault(args[1:])
+	case "faucet":
+		runFaucet(args[1:])
+	case "sponsor":
+		runSponsor(args[1:])
+	case "multisig":
+		runMultisig(args[1:])
+	case "anchor":
+		runAnchor(args[1:])
+	case "escrow":
+		runEscrow(args[1:])
+	case "backup":
+		runBackup(args[1:])
+	case "tx":
+		runTx(args[1:])
+	case "assets":
+		runAssets(args[1:])
+	case "invoice":
+		runInvoice(args[1:])
+	case "peers":
+		runPeers(args[1:])
+	case "stats":
+		runStats(args[1:])
+	case "reorgs":
+		runReorgs(args[1:])
+	case "health":
+		runHealth(args[1:])
 	case "help", "-h", "--help":
 		usage()
 	case "version", "-v", "--version":
@@ -87,7 +118,25 @@ Usage:
   dnas miner -api URL -address ADDR   external miner (get template, mine, submit)
   dnas htlc new                       mint a preimage + hash for an atomic swap
   dnas htlc <address|claim|refund>    build hash-time-locked contract spends
+  dnas htlc swap ...                  plan a coin-for-asset atomic swap (both legs)
+  dnas vault <address|spend>          time-delayed vault: hot key after N, cold key now
   dnas supply [-api URL]              coin supply: minted, burned, circulating
+  dnas faucet -address ADDR           ask a testnet/regtest node for coin
+  dnas sponsor request|pay            have someone else pay a transaction's fee
+  dnas multisig propose|sign|submit   spend FROM an M-of-N multisig account
+  dnas anchor add|verify              timestamp a file's hash on the chain
+  dnas escrow new|release|refund      2-of-3 buyer/seller/arbiter escrow
+  dnas wallet sign|verify             prove you control an address, off-chain
+  dnas wallet passphrase              change (or remove) a key file's passphrase
+  dnas backup save|list|restore       encrypt the files a re-sync cannot replace
+  dnas tx inspect|verify              decode and check a transaction before submitting
+  dnas assets [show ID]               what assets exist, and who holds them
+  dnas invoice new|watch|pay          ask to be paid, and verify that you were
+  dnas db <info|verify|export|import> inspect, check and move a chain store
+  dnas peers [list|bans|unban|add|drop]  inspect and manage peers and bans
+  dnas stats [-window N]              hashrate, block timing, fee flow, miners
+  dnas reorgs                         chain switches this node has lived through
+  dnas health                         is this node ready to be relied on?
   dnas version                        print the build version
 
 Node flags:
@@ -103,6 +152,14 @@ Node flags:
   -minrelayfee N  base min relay fee, base units per byte; rises with load (default 10)
   -mine           enable mining
   -regtest        regtest mode: mine blocks on demand via POST /generate
+  -network NAME   mainnet (default), testnet or regtest — separate chains
+  -addrindex      index address -> transactions (serves /address/{a}/history)
+  -faucet         give coin away via POST /faucet (testnet/regtest only)
+  -sharefactor N  how many times easier a mining share is than a block
+  -nodekey FILE   network identity key (default nodekey.json beside -db)
+  -loglevel LVL   error | warn | info (default) | debug
+  -logjson        one JSON object per log line
+  -printconfig    print the effective configuration and exit
   -dandelion      Dandelion++ stem/fluff relay for origin privacy (default true)
   -checkpoints L  finality checkpoints, comma-separated height:hash pairs
   -upgrades L     consensus upgrade activations, comma-separated name:height pairs
@@ -122,9 +179,34 @@ func runWallet(args []string) {
   mnemonic                  create an HD wallet, print its BIP39 backup phrase
   restore   [-index N]      rebuild a wallet file from a mnemonic (read from stdin)
   addresses [-n N]          print the first N HD addresses for a mnemonic (stdin)
-  multisig  -threshold M -pubkeys a,b,c   print an M-of-N multisig address`)
+  multisig  -threshold M -pubkeys a,b,c   print an M-of-N multisig address
+  sign      -m TEXT | -file F   sign a message, proving you hold the address
+  verify    -in SIG [-address A]          check such a signature
+  passphrase [-remove]      re-encrypt this key file under a new passphrase`)
 		return
 	}
+	// The subcommands that take flags of their own are dispatched before the
+	// shared flag set, which knows nothing about them and would reject them. They
+	// still honour -o, pulled out of the arguments by hand (see extractFlag).
+	switch args[0] {
+	case "sign", "verify", "passphrase":
+		path, rest := extractFlag(args[1:], "o", "wallet.json")
+		switch args[0] {
+		case "sign":
+			w, err := loadWalletWith(path, walletPassphrase())
+			if err != nil {
+				log.Fatal(err)
+			}
+			walletSign(w, rest)
+		case "verify":
+			// Verification needs no key, so it never opens the wallet file.
+			walletVerify(rest)
+		case "passphrase":
+			walletPassphraseCmd(path, rest)
+		}
+		return
+	}
+
 	fs := flag.NewFlagSet("wallet", flag.ExitOnError)
 	out := fs.String("o", "wallet.json", "wallet key file")
 	index := fs.Uint("index", 0, "HD account index")
@@ -312,8 +394,23 @@ func runNode(args []string) {
 	maxPeers := fs.Int("maxpeers", cfg.integer("maxpeers", node.DefaultMaxPeers), "maximum outbound peer connections")
 	mempoolMax := fs.Int("mempool", cfg.integer("mempool", core.DefaultMempoolSize), "max pending transactions")
 	minRelayFee := fs.Int("minrelayfee", cfg.integer("minrelayfee", int(core.DefaultMinRelayFee)), "base minimum relay fee in base units (rises with mempool load; 0 disables)")
+	console := fs.Bool("console", cfg.boolean("console", false), "run the interactive console even when stdin is not a terminal (for scripts)")
+	prune := fs.Int("prune", cfg.integer("prune", 0), "keep only this many recent block bodies in memory (0 = keep all; minimum "+strconv.Itoa(core.MinPruneKeep)+")")
+	webhooks := fs.String("webhook", cfg.str("webhook", ""), "comma-separated URLs to POST every block/tx event to")
+	apiRate := fs.Int("apirate", cfg.integer("apirate", int(api.DefaultAPIRate)), "sustained HTTP API requests per second per client (0 disables the limit)")
+	apiBurst := fs.Int("apiburst", cfg.integer("apiburst", int(api.DefaultAPIBurst)), "HTTP API requests allowed back to back per client")
 	mine := fs.Bool("mine", cfg.boolean("mine", false), "enable mining")
 	regtest := fs.Bool("regtest", cfg.boolean("regtest", false), "regtest mode: enable on-demand block generation (POST /generate)")
+	network := fs.String("network", cfg.str("network", ""), "network to run on: mainnet, testnet or regtest (default mainnet; -regtest implies regtest)")
+	addrIndex := fs.Bool("addrindex", cfg.boolean("addrindex", false), "maintain an address -> transactions index (serves /address/{addr}/history)")
+	faucet := fs.Bool("faucet", cfg.boolean("faucet", false), "give coin away via POST /faucet (testnet/regtest only)")
+	faucetAmount := fs.String("faucetamount", cfg.str("faucetamount", ""), "faucet payout in DNAS (default 10)")
+	faucetCooldown := fs.Int("faucetcooldown", cfg.integer("faucetcooldown", 0), "seconds between faucet payouts to one address or requester (default 60)")
+	shareFactor := fs.Int("sharefactor", cfg.integer("sharefactor", 0), "how many times easier a mining share is than a block (default 256)")
+	nodeKey := fs.String("nodekey", cfg.str("nodekey", ""), "network identity key file (default: nodekey.json beside -db); NOT the wallet")
+	logLevelName := fs.String("loglevel", cfg.str("loglevel", "info"), "log verbosity: error, warn, info or debug")
+	logJSON := fs.Bool("logjson", cfg.boolean("logjson", false), "emit one JSON object per log line instead of prose")
+	printConfig := fs.Bool("printconfig", false, "print the effective configuration (flags merged over -config) and exit")
 	dandelion := fs.Bool("dandelion", cfg.boolean("dandelion", true), "relay new transactions via Dandelion++ stem/fluff (origin privacy)")
 	checkpoints := fs.String("checkpoints", cfg.str("checkpoints", ""), "finality checkpoints as comma-separated height:hash pairs")
 	upgrades := fs.String("upgrades", cfg.str("upgrades", ""), "consensus upgrade activations as comma-separated name:height pairs (e.g. multioutput:1000)")
@@ -328,7 +425,7 @@ func runNode(args []string) {
 			log.Fatalf("bad -checkpoints entry %q (want height:hash)", cp)
 		}
 		core.AddCheckpoint(h, strings.TrimSpace(hash))
-		log.Printf("checkpoint pinned: height %d", h)
+		node.Infof("checkpoint pinned", "height", h)
 	}
 
 	// Schedule consensus upgrades before syncing. Every node on a network must be
@@ -345,23 +442,46 @@ func runNode(args []string) {
 			log.Fatalf("unknown upgrade %q (known: %s)", name, strings.Join(core.Upgrades(), ", "))
 		}
 		core.SetUpgradeHeight(name, h)
-		log.Printf("consensus upgrade %q activates at height %d", name, h)
+		node.Infof("consensus upgrade scheduled", "name", name, "height", h)
 	}
 
-	// In regtest, isolate the network by default (a distinct pre-shared key) so a
-	// local test node can't accidentally peer with a devnet, unless the operator
-	// set -netkey explicitly, and hold difficulty fixed (no retargeting) so blocks
-	// stay instant on demand.
+	// Logging first, so everything below is emitted at the requested verbosity and
+	// in the requested format.
+	level, err := node.ParseLevel(*logLevelName)
+	if err != nil {
+		log.Fatal(err)
+	}
+	node.SetLogLevel(level)
+	node.SetLogJSON(*logJSON)
+
+	// Select the network before anything reads the genesis block or signs
+	// anything: the network id is bound into both (see core/network.go). -regtest
+	// is kept as the shorthand it has always been.
+	netName := *network
+	if netName == "" {
+		netName = core.MainNet
+	}
 	if *regtest {
-		core.NoRetarget = true
-		if *netKey == "" {
-			*netKey = "dnas-regtest"
+		if netName != core.MainNet && netName != core.RegTest {
+			log.Fatalf("-regtest conflicts with -network %s", netName)
 		}
+		netName = core.RegTest
+	}
+	if err := core.SetNetwork(netName); err != nil {
+		log.Fatal(err)
+	}
+	*regtest = netName == core.RegTest // on-demand generation follows the network
+	node.Infof("network selected", "network", core.NetworkName())
+	// A network may isolate itself with a default pre-shared key (regtest does),
+	// so a local test node can't accidentally peer with a devnet. An explicit
+	// -netkey always wins.
+	if *netKey == "" {
+		*netKey = core.Network().DefaultNetKey
 	}
 	if *netKey == "" {
-		log.Print("network: OPEN / permissionless (encrypted, no shared key; set -netkey for a private net)")
+		node.Infof("network is open/permissionless", "note", "encrypted, no shared key; set -netkey for a private net")
 	} else {
-		log.Print("network: private (authenticated by the shared -netkey)")
+		node.Infof("network is private", "note", "authenticated by the shared -netkey")
 	}
 
 	var relayFloor uint64
@@ -374,36 +494,99 @@ func runNode(args []string) {
 		log.Fatalf("wallet: %v", err)
 	}
 	if created {
-		log.Printf("created new wallet %s", *walletPath)
+		node.Infof("created wallet", "file", *walletPath)
 	}
-	log.Printf("wallet address: %s", w.Address())
+	node.Infof("wallet address", "address", w.Address())
+
+	// The node's NETWORK identity is a separate key from the wallet on purpose:
+	// its public key goes to every peer, and a DNAS address is a hash of a public
+	// key, so sharing the wallet key hands every peer the address holding the coin
+	// (see node/identity.go). It defaults to a file beside the chain.
+	identityPath := *nodeKey
+	if identityPath == "" {
+		identityPath = filepath.Join(filepath.Dir(*dbPath), node.IdentityFile)
+	}
+	identity, idCreated, err := node.LoadOrCreateIdentity(identityPath, walletPassphrase())
+	if err != nil {
+		log.Fatal(err)
+	}
+	if idCreated {
+		node.Infof("created node identity", "file", identityPath)
+	}
+
+	if *printConfig {
+		printEffectiveConfig(effectiveConfig{
+			Network: core.NetworkName(), Listen: *listen, Advertise: *advertise, API: *apiAddr,
+			Peers: parsePeers(*peersStr), NetKey: *netKey, MaxPeers: *maxPeers,
+			Wallet: *walletPath, DB: *dbPath, NodeKey: identityPath,
+			Mine: *mine, Regtest: *regtest, Dandelion: *dandelion,
+			AddrIndex: *addrIndex, Faucet: *faucet, ShareFactor: *shareFactor,
+			MempoolMax: *mempoolMax, MinRelayFee: *minRelayFee,
+			APIRate: *apiRate, APIBurst: *apiBurst, Webhooks: parsePeers(*webhooks),
+			Prune:    *prune,
+			LogLevel: level.String(), LogJSON: *logJSON,
+			Checkpoints: parsePeers(*checkpoints), Upgrades: parsePeers(*upgrades),
+			APIAuth: os.Getenv("DNAS_API_TOKEN") != "",
+		})
+		return
+	}
 
 	chain, err := core.Open(*dbPath)
 	if err != nil {
 		log.Fatalf("open chain %s: %v", *dbPath, err)
 	}
-	log.Printf("chain height=%d (%s)", chain.Height(), *dbPath)
+	node.Infof("chain opened", "height", chain.Height(), "db", *dbPath)
+	if *addrIndex {
+		chain.EnableAddressIndex() // built once here, maintained as blocks connect
+		node.Infof("address index enabled", "serves", "/address/{addr}/history")
+	}
+	if *prune > 0 {
+		keep := chain.EnablePruning(uint64(*prune))
+		node.Infof("pruning enabled", "keep_bodies", keep,
+			"note", "old bodies, their inclusion proofs and their filters cannot be served")
+		if keep != uint64(*prune) {
+			node.Warnf("prune raised to the minimum", "asked", *prune, "using", keep,
+				"why", "a node must keep the bodies a reorg can reach")
+		}
+	}
 
 	mp := core.NewMempoolWithPolicy(*mempoolMax, relayFloor)
 	if relayFloor > 0 {
-		log.Printf("min relay fee: %s (base, rises with mempool load)", core.FormatAmount(relayFloor))
+		node.Infof("min relay fee set", "per_byte", relayFloor, "note", "base; rises with mempool load")
 	}
 	n := node.New(node.Config{
-		ListenAddr:    *listen,
-		AdvertiseAddr: *advertise,
-		Peers:         parsePeers(*peersStr),
-		NetKey:        *netKey,
-		MaxPeers:      *maxPeers,
-		Mine:          *mine,
-		StateDir:      filepath.Dir(*dbPath), // persist peers/bans/mempool beside the chain
-		Regtest:       *regtest,
-		Dandelion:     *dandelion,
+		ListenAddr:     *listen,
+		AdvertiseAddr:  *advertise,
+		Peers:          parsePeers(*peersStr),
+		NetKey:         *netKey,
+		MaxPeers:       *maxPeers,
+		Mine:           *mine,
+		Identity:       identity,              // network identity, separate from the wallet
+		StateDir:       filepath.Dir(*dbPath), // persist peers/bans/mempool beside the chain
+		Regtest:        *regtest,
+		Dandelion:      *dandelion,
+		ShareFactor:    uint32(*shareFactor),
+		Faucet:         *faucet,
+		FaucetAmount:   faucetPayout(*faucetAmount),
+		FaucetCooldown: time.Duration(*faucetCooldown) * time.Second,
+		Webhooks:       parsePeers(*webhooks),
 	}, chain, mp, w)
+	if *faucet {
+		if n.FaucetEnabled() {
+			log.Printf("faucet enabled: %s per request, one per %s", core.FormatAmount(n.FaucetAmount()), n.FaucetCooldown())
+		} else {
+			log.Printf("faucet requested but unavailable on %s", core.NetworkName())
+		}
+	}
 	n.Start()
 
 	srv := api.New(n)
+	srv.SetRateLimit(float64(*apiRate), float64(*apiBurst))
+	if *apiRate <= 0 {
+		node.Infof("API rate limit disabled", "note", "any client may make unlimited requests")
+	}
 	if srv.AuthEnabled() {
-		log.Print("API write endpoints require a bearer token (DNAS_API_TOKEN)")
+		node.Infof("API writes require a bearer token", "env", "DNAS_API_TOKEN")
 	}
 	go srv.Start(*apiAddr)
 
@@ -411,10 +594,10 @@ func runNode(args []string) {
 	var once sync.Once
 	shutdown := func() {
 		once.Do(func() {
-			log.Print("shutting down…")
+			node.Infof("shutting down")
 			n.Shutdown()
 			if err := chain.Close(); err != nil {
-				log.Printf("close chain: %v", err)
+				node.Errorf("close chain", "err", err)
 			}
 		})
 	}
@@ -426,12 +609,29 @@ func runNode(args []string) {
 		os.Exit(0)
 	}()
 
-	if stdinIsTTY() {
+	// The console runs when there is somebody to type at it. -console forces it
+	// on anyway, which is what makes it drivable by a script (and testable): a
+	// pipe is not a terminal, so the auto-detection alone leaves the console
+	// unreachable to anything but a human.
+	if *console || stdinIsTTY() {
 		repl(n)
-		shutdown() // "quit" from the REPL
+		shutdown() // "quit" from the console, or stdin ran out
 	} else {
 		select {} // no terminal (e.g. background/demo); wait for a signal
 	}
+}
+
+// faucetPayout parses the -faucetamount flag (decimal DNAS); an empty value
+// leaves the node's default in place.
+func faucetPayout(s string) uint64 {
+	if strings.TrimSpace(s) == "" {
+		return 0
+	}
+	amount, err := core.ParseAmount(s)
+	if err != nil {
+		log.Fatalf("bad -faucetamount: %v", err)
+	}
+	return amount
 }
 
 func parsePeers(s string) []string {
@@ -452,90 +652,4 @@ func stdinIsTTY() bool {
 	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, os.Stdin.Fd(),
 		syscall.TCGETS, uintptr(unsafe.Pointer(&termios)))
 	return errno == 0
-}
-
-func repl(n *node.Node) {
-	fmt.Println("commands: send <to> <amount> [fee] [expiry-height] | balance [addr] | address | info | peers | mempool | help | quit")
-	sc := bufio.NewScanner(os.Stdin)
-	for {
-		fmt.Print("dnas> ")
-		if !sc.Scan() {
-			return
-		}
-		fields := strings.Fields(sc.Text())
-		if len(fields) == 0 {
-			continue
-		}
-		switch fields[0] {
-		case "send":
-			if len(fields) < 3 {
-				fmt.Println("usage: send <to> <amount> [fee] [expiry-height]")
-				continue
-			}
-			if err := wallet.ValidateAddress(fields[1]); err != nil {
-				fmt.Println("invalid recipient:", err)
-				continue
-			}
-			amount, err := core.ParseAmount(fields[2])
-			if err != nil {
-				fmt.Println(err)
-				continue
-			}
-			var fee uint64
-			if len(fields) > 3 {
-				if fee, err = core.ParseAmount(fields[3]); err != nil {
-					fmt.Println(err)
-					continue
-				}
-			}
-			var expiry uint64
-			if len(fields) > 4 {
-				if expiry, err = strconv.ParseUint(fields[4], 10, 64); err != nil {
-					fmt.Println("bad expiry height:", err)
-					continue
-				}
-			}
-			w := n.Wallet()
-			tx := core.Transaction{
-				From:   w.Address(),
-				To:     fields[1],
-				Amount: amount,
-				Fee:    fee,
-				Nonce:  n.NextNonce(w.Address()),
-				Expiry: expiry,
-			}
-			if err := tx.Sign(w); err != nil {
-				fmt.Println(err)
-				continue
-			}
-			if err := n.SubmitTx(tx); err != nil {
-				fmt.Println("rejected:", err)
-				continue
-			}
-			fmt.Println("submitted", tx.Hash()[:10])
-		case "balance":
-			addr := n.Wallet().Address()
-			if len(fields) > 1 {
-				addr = fields[1]
-			}
-			acc := n.Chain().Account(addr)
-			fmt.Printf("%s\n  balance=%s nonce=%d\n", addr, core.FormatAmount(acc.Balance), acc.Nonce)
-		case "address":
-			fmt.Println(n.Wallet().Address())
-		case "info":
-			tip := n.Chain().Tip()
-			fmt.Printf("height=%d diff(next)=%.2f tip=%s mempool=%d peers=%d\n",
-				tip.Index, core.TargetDifficulty(n.Chain().NextBits()), tip.Hash[:10], n.Mempool().Size(), len(n.PeerAddrs()))
-		case "peers":
-			fmt.Println(n.PeerAddrs())
-		case "mempool":
-			fmt.Printf("%d pending\n", n.Mempool().Size())
-		case "help":
-			fmt.Println("send <to> <amount> [fee] [expiry-height] | balance [addr] | address | info | peers | mempool | quit")
-		case "quit", "exit":
-			return
-		default:
-			fmt.Println("unknown command:", fields[0])
-		}
-	}
 }

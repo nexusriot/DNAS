@@ -58,11 +58,23 @@ type Mempool struct {
 	txs map[string]Transaction
 	// bySender indexes sender -> nonce -> txid, so conflict lookup, the
 	// contiguity check and gap-free eviction are all O(1) rather than a scan.
-	bySender    map[string]map[uint64]string
+	bySender map[string]map[uint64]string
+	// sponsored indexes fee payer -> total queued fees that payer has agreed to
+	// cover, so a sponsor's affordability can be checked across every transaction
+	// it sponsors rather than one at a time (see admissibleLocked).
+	sponsored map[string]uint64
+	// bytes is the running total of queued transaction sizes, and maxBytes bounds
+	// it. The count cap alone does not bound memory (see DefaultMempoolBytes).
+	bytes       int
+	maxBytes    int
 	max         int
 	minRelayFee uint64           // base per-byte relay floor when empty; 0 disables the fee floor
 	accounts    AccountSource    // confirmed state to validate against (may be nil)
 	sigCache    *ValidationCache // shared with the chain, so a signature is verified once (may be nil)
+	// chainHeight reports the current tip height, so admission can tell whether a
+	// queued transaction is mineable into the NEXT block (see unmineableLocked).
+	// Bound alongside accounts; nil in an isolated pool.
+	chainHeight func() uint64
 }
 
 // NewMempool returns an empty mempool with the default size limit and no fee
@@ -74,13 +86,27 @@ func NewMempool() *Mempool { return NewMempoolWithPolicy(DefaultMempoolSize, 0) 
 // The effective floor rises with occupancy (see MinFee). A minRelayFee of 0
 // disables the floor entirely.
 func NewMempoolWithPolicy(max int, minRelayFee uint64) *Mempool {
+	return NewMempoolWithLimits(max, DefaultMempoolBytes, minRelayFee)
+}
+
+// NewMempoolWithLimits bounds the pool by BOTH a transaction count and a total
+// byte budget (values <= 0 fall back to the defaults). Both matter: the count
+// stops an unbounded number of tiny transactions, and the budget stops a bounded
+// number of enormous ones — 5000 entries at MaxRelayTxBytes apiece is ~500 MB
+// that the count cap happily permits.
+func NewMempoolWithLimits(max, maxBytes int, minRelayFee uint64) *Mempool {
 	if max <= 0 {
 		max = DefaultMempoolSize
+	}
+	if maxBytes <= 0 {
+		maxBytes = DefaultMempoolBytes
 	}
 	return &Mempool{
 		txs:         map[string]Transaction{},
 		bySender:    map[string]map[uint64]string{},
+		sponsored:   map[string]uint64{},
 		max:         max,
+		maxBytes:    maxBytes,
 		minRelayFee: minRelayFee,
 	}
 }
@@ -91,8 +117,16 @@ func (m *Mempool) UseAccounts(src AccountSource) *Mempool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.accounts = src
+	if hs, ok := src.(heightSource); ok {
+		m.chainHeight = hs.Height
+	}
 	return m
 }
+
+// heightSource is the part of the chain the pool needs to judge whether a
+// transaction is mineable right now. *Blockchain satisfies it; an AccountSource
+// that does not simply leaves that check off.
+type heightSource interface{ Height() uint64 }
 
 // UseValidationCache binds the signature-verification cache the pool shares with
 // the chain, so a transaction verified on admission costs nothing to verify again
@@ -121,7 +155,15 @@ func (m *Mempool) minFeeLocked() uint64 {
 	if m.minRelayFee == 0 || m.max <= 0 {
 		return m.minRelayFee
 	}
-	fill := len(m.txs) * 100 / m.max // occupancy percent, 0..100
+	// Occupancy is whichever budget is fuller: a pool holding few but enormous
+	// transactions is just as full as one holding many small ones, and the floor
+	// should rise for both.
+	fill := len(m.txs) * 100 / m.max
+	if m.maxBytes > 0 {
+		if byFill := m.bytes * 100 / m.maxBytes; byFill > fill {
+			fill = byFill
+		}
+	}
 	if fill > 100 {
 		fill = 100
 	}
@@ -141,6 +183,10 @@ func (m *Mempool) insertLocked(h string, tx Transaction) {
 		m.bySender[tx.From] = byNonce
 	}
 	byNonce[tx.Nonce] = h
+	m.bytes += tx.Size()
+	if tx.IsSponsored() {
+		m.sponsored[tx.FeePayer] += tx.Fee
+	}
 }
 
 // deleteLocked removes the transaction stored under h from both indexes. m.mu held.
@@ -150,6 +196,14 @@ func (m *Mempool) deleteLocked(h string) {
 		return
 	}
 	delete(m.txs, h)
+	if m.bytes -= tx.Size(); m.bytes < 0 {
+		m.bytes = 0 // defensive: the total is derived, never authoritative
+	}
+	if tx.IsSponsored() {
+		if m.sponsored[tx.FeePayer] -= tx.Fee; m.sponsored[tx.FeePayer] == 0 {
+			delete(m.sponsored, tx.FeePayer)
+		}
+	}
 	if byNonce := m.bySender[tx.From]; byNonce != nil {
 		if byNonce[tx.Nonce] == h {
 			delete(byNonce, tx.Nonce)
@@ -164,14 +218,15 @@ func (m *Mempool) deleteLocked(h string) {
 // balance: an asset move or an issuance pays only the fee (the asset amount comes
 // out of the asset ledger), anything else pays amount + fee.
 func txCoinCost(tx Transaction) uint64 {
+	fee := senderFee(tx) // zero when a sponsor pays; charged to the sponsor instead
 	if tx.IsIssue() || tx.IsAssetTransfer() {
-		return tx.Fee
+		return fee
 	}
 	out, ok := tx.TotalOut()
 	if !ok {
 		return ^uint64(0) // overflowing: unaffordable by construction (CheckTxSanity rejects it)
 	}
-	return out + tx.Fee
+	return out + fee
 }
 
 // admissibleLocked reports whether tx could plausibly be mined, given the
@@ -229,6 +284,30 @@ func (m *Mempool) admissibleLocked(tx Transaction, replacing string) error {
 	}
 	if total > spendable {
 		return fmt.Errorf("sender cannot afford its queued transactions: %d needed, %d spendable", total, spendable)
+	}
+	return m.sponsorAffordableLocked(tx, replacing)
+}
+
+// sponsorAffordableLocked checks that a fee sponsor can cover every fee it has
+// agreed to pay across the pool, not merely this one. Without the running total
+// a payer could sponsor a hundred transactions it can afford one at a time, and
+// only the first would be mineable — the same "queue full of work that can never
+// be mined" problem the sender rules exist to prevent, moved one account over.
+// m.mu held.
+func (m *Mempool) sponsorAffordableLocked(tx Transaction, replacing string) error {
+	if !tx.IsSponsored() {
+		return nil
+	}
+	committed := m.sponsored[tx.FeePayer]
+	if replacing != "" {
+		if old, ok := m.txs[replacing]; ok && old.IsSponsored() && old.FeePayer == tx.FeePayer {
+			committed -= old.Fee // the replacement displaces it, so its fee is released
+		}
+	}
+	total := committed + tx.Fee
+	if spendable := m.accounts.SpendableBalance(tx.FeePayer); total > spendable {
+		return fmt.Errorf("fee sponsor %s cannot afford the fees it has queued: %d needed, %d spendable",
+			tx.FeePayer, total, spendable)
 	}
 	return nil
 }
@@ -293,7 +372,15 @@ func (m *Mempool) Add(tx Transaction) (bool, error) {
 		return false, err
 	}
 	if conflict {
-		if tx.Fee <= old.Fee {
+		// A queued transaction that CANNOT be mined into the next block has no claim
+		// on the slot it is occupying, so a replacement that can be mined displaces
+		// it regardless of fee. Without this, an unmineable transaction jams its
+		// sender's nonce until someone out-bids it — which is exactly the attack a
+		// time-delayed vault invites: a thief holding the hot key parks a spend that
+		// no block will accept until the unlock height, and the cold key's rescue
+		// (same account, same nonce) would have to pay more than the thief to get in.
+		// See VaultHotNotReady / HTLCRefundNotReady for what "unmineable" means here.
+		if tx.Fee <= old.Fee && !(m.unmineableLocked(old) && !m.unmineableLocked(tx)) {
 			return false, errors.New("replacement fee not higher than existing transaction")
 		}
 		m.deleteLocked(oldHash)
@@ -304,8 +391,15 @@ func (m *Mempool) Add(tx Transaction) (bool, error) {
 	// When full, admit only by out-bidding the cheapest evictable transaction (fee
 	// per byte), which this transaction then displaces — so block space, a per-byte
 	// resource, is allocated to the highest-paying bytes.
-	if len(m.txs) >= m.max {
+	//
+	// "Full" means either budget: too many transactions, or too many bytes. A big
+	// transaction can therefore need to displace SEVERAL small ones to fit, which
+	// is the whole point — it is asking for their room.
+	for m.overBudgetLocked(size) {
 		victimHash, victimRate := m.evictionCandidateLocked()
+		if victimHash == "" {
+			return false, errors.New("mempool full and nothing may be evicted")
+		}
 		if txRate(tx) <= victimRate {
 			return false, errors.New("mempool full and fee rate too low")
 		}
@@ -319,6 +413,27 @@ func (m *Mempool) Add(tx Transaction) (bool, error) {
 	}
 	m.insertLocked(h, tx)
 	return true, nil
+}
+
+// overBudgetLocked reports whether admitting a transaction of `size` bytes would
+// exceed either the count or the byte budget. m.mu held.
+func (m *Mempool) overBudgetLocked(size int) bool {
+	return len(m.txs) >= m.max || m.bytes+size > m.maxBytes
+}
+
+// Bytes is the total serialized size of the queued transactions, and MaxBytes
+// the budget it is held to — both reported so an operator can see how full the
+// pool is by the measure that actually bounds memory.
+func (m *Mempool) Bytes() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.bytes
+}
+
+func (m *Mempool) MaxBytes() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.maxBytes
 }
 
 // verify checks tx's authorization through the shared cache, so the block that
@@ -336,6 +451,21 @@ func (m *Mempool) admissible(tx Transaction) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.admissibleLocked(tx, m.bySender[tx.From][tx.Nonce])
+}
+
+// unmineableLocked reports whether tx would be rejected by the height rules if it
+// were put in the next block — an expired transaction, one whose time-lock has
+// not opened, an HTLC refund before its timeout, or a vault hot-key spend before
+// its unlock. Such a transaction is validly signed and may become mineable
+// later, so it is not dropped; it simply cannot outrank one that is mineable now.
+//
+// It needs the chain's height and so is a no-op on a pool with no AccountSource
+// (which is only the case in isolated tests). m.mu held.
+func (m *Mempool) unmineableLocked(tx Transaction) bool {
+	if m.chainHeight == nil {
+		return false
+	}
+	return checkTxAtHeight(tx, m.chainHeight()+1) != nil
 }
 
 // txRate is a transaction's fee per byte, used only to rank and evict within the
@@ -386,6 +516,10 @@ func (m *Mempool) Reconcile(tipHeight uint64) int {
 	if m.accounts == nil {
 		return dropped
 	}
+	// Sponsors first: a payer that can no longer cover everything it promised has
+	// its cheapest sponsorships dropped. Doing this before the per-sender pass lets
+	// that pass clean up anything left stranded behind the resulting nonce gap.
+	dropped += m.reconcileSponsorsLocked()
 	for sender, byNonce := range m.bySender {
 		confirmed := m.accounts.Account(sender).Nonce
 		spendable := m.accounts.SpendableBalance(sender)
@@ -410,6 +544,37 @@ func (m *Mempool) Reconcile(tipHeight uint64) int {
 				continue
 			}
 			want++
+		}
+	}
+	return dropped
+}
+
+// reconcileSponsorsLocked drops sponsored transactions whose fee payer can no
+// longer cover every fee it has queued, cheapest fee rate first, until what
+// remains fits the payer's spendable balance. m.mu held.
+func (m *Mempool) reconcileSponsorsLocked() int {
+	if len(m.sponsored) == 0 {
+		return 0
+	}
+	byPayer := make(map[string][]string, len(m.sponsored))
+	for h, tx := range m.txs {
+		if tx.IsSponsored() {
+			byPayer[tx.FeePayer] = append(byPayer[tx.FeePayer], h)
+		}
+	}
+	dropped := 0
+	for payer, hashes := range byPayer {
+		spendable := m.accounts.SpendableBalance(payer)
+		if m.sponsored[payer] <= spendable {
+			continue
+		}
+		sort.Slice(hashes, func(i, j int) bool { return txRate(m.txs[hashes[i]]) < txRate(m.txs[hashes[j]]) })
+		for _, h := range hashes {
+			if m.sponsored[payer] <= spendable {
+				break
+			}
+			m.deleteLocked(h)
+			dropped++
 		}
 	}
 	return dropped
@@ -521,6 +686,67 @@ func (m *Mempool) EstimateTip(baseFee uint64, capacityBytes int) uint64 {
 	return 0
 }
 
+// FeeBucket is one band of the mempool's fee-rate distribution: how many
+// transactions pay between From and To base units per byte, and how much block
+// space they occupy.
+type FeeBucket struct {
+	From  uint64 `json:"from_rate"`
+	To    uint64 `json:"to_rate"` // 0 means "and above"
+	Count int    `json:"count"`
+	Bytes int    `json:"bytes"`
+}
+
+// MempoolStats is the shape of the pending queue: how much is waiting, how much
+// space it wants, and how the fees people are paying are distributed. A single
+// "mempool: 40" number cannot tell a sender whether their fee will be picked
+// next block or sit behind a wall of higher bidders; a distribution can.
+type MempoolStats struct {
+	Count      int         `json:"count"`
+	Bytes      int         `json:"bytes"`
+	MinRate    uint64      `json:"min_rate"`
+	MaxRate    uint64      `json:"max_rate"`
+	MedianRate uint64      `json:"median_rate"`
+	Buckets    []FeeBucket `json:"buckets"`
+}
+
+// feeBucketEdges are the fee-rate (base units per byte) band boundaries. The
+// last band is open-ended.
+var feeBucketEdges = []uint64{1, 5, 10, 25, 50, 100, 250, 500}
+
+// Stats summarizes the pending queue by fee rate.
+func (m *Mempool) Stats() MempoolStats {
+	txs := m.All()
+	st := MempoolStats{Count: len(txs), Buckets: make([]FeeBucket, 0, len(feeBucketEdges))}
+	for i, edge := range feeBucketEdges {
+		b := FeeBucket{From: edge}
+		if i+1 < len(feeBucketEdges) {
+			b.To = feeBucketEdges[i+1] - 1
+		}
+		st.Buckets = append(st.Buckets, b)
+	}
+	if len(txs) == 0 {
+		return st
+	}
+	rates := make([]uint64, 0, len(txs))
+	for _, tx := range txs {
+		size := tx.Size()
+		rate := tx.Fee / uint64(size) // integer per-byte rate, the unit fees are priced in
+		rates = append(rates, rate)
+		st.Bytes += size
+		for i := len(st.Buckets) - 1; i >= 0; i-- {
+			if rate >= st.Buckets[i].From || i == 0 {
+				st.Buckets[i].Count++
+				st.Buckets[i].Bytes += size
+				break
+			}
+		}
+	}
+	sort.Slice(rates, func(i, j int) bool { return rates[i] < rates[j] })
+	st.MinRate, st.MaxRate = rates[0], rates[len(rates)-1]
+	st.MedianRate = rates[len(rates)/2]
+	return st
+}
+
 // Select greedily chooses transactions that form a valid sequence on top of the
 // current chain state: each must have the sender's next nonce, be affordable, and
 // pay at least its per-byte base fee. It is bounded by both max transactions and
@@ -561,14 +787,31 @@ func (m *Mempool) Select(bc *Blockchain, max int) []Transaction {
 		if tx.Nonce != s.nonce {
 			return false
 		}
+		// A sponsored fee comes out of the payer's simulated balance, so several
+		// transactions sharing one sponsor cannot each be selected on the strength of
+		// the same coin.
+		if tx.IsSponsored() && get(tx.FeePayer).balance < tx.Fee {
+			return false
+		}
 		switch {
 		case tx.IsIssue():
-			return s.balance >= tx.Fee
+			return s.balance >= senderFee(tx)
 		case tx.IsAssetTransfer():
-			return s.balance >= tx.Fee && s.assets[tx.AssetID] >= tx.Amount
+			return s.balance >= senderFee(tx) && s.assets[tx.AssetID] >= tx.Amount
 		default:
 			return s.balance >= txCoinCost(tx)
 		}
+	}
+	// debitSponsor charges a selected transaction's fee to its sponsor in the
+	// simulation, in the same order block application does it: after the sender is
+	// debited, before any recipient is credited.
+	debitSponsor := func(tx Transaction) {
+		if !tx.IsSponsored() {
+			return
+		}
+		p := get(tx.FeePayer)
+		p.balance -= tx.Fee
+		cache[tx.FeePayer] = p
 	}
 
 	var selected []Transaction
@@ -608,19 +851,22 @@ func (m *Mempool) Select(bc *Blockchain, max int) []Transaction {
 		s.nonce++
 		switch {
 		case pick.IsIssue():
-			s.balance -= pick.Fee
+			s.balance -= senderFee(pick)
 			s.assets[AssetID(pick.From, pick.Issue.Ticker, pick.Nonce)] += pick.Issue.Supply
 			cache[pick.From] = s
+			debitSponsor(pick)
 		case pick.IsAssetTransfer():
-			s.balance -= pick.Fee
+			s.balance -= senderFee(pick)
 			s.assets[pick.AssetID] -= pick.Amount
 			cache[pick.From] = s
+			debitSponsor(pick)
 			r := get(pick.To)
 			r.assets[pick.AssetID] += pick.Amount
 			cache[pick.To] = r
 		default:
 			s.balance -= txCoinCost(pick)
 			cache[pick.From] = s
+			debitSponsor(pick)
 			// Credit every recipient, re-reading the simulated account each time so a
 			// repeated recipient (or the sender paying itself) accumulates correctly.
 			for _, o := range pick.outputs() {

@@ -5,13 +5,20 @@ Module `github.com/nexusriot/DNAS/core` — the ledger and consensus rules.
 - `Transaction` — signed transfer (integer base units, per-account nonce,
   optional `Expiry`/`LockUntil` height window and bounded `Memo`); coinbase
   transactions mint the block reward. Authorization is a single signature, an
-  M-of-N `MultisigScript`, or a hash-time-locked `HTLCScript` (all resolved by
-  `VerifySignature`).
+  M-of-N `MultisigScript`, a hash-time-locked `HTLCScript`, or a time-delayed
+  `VaultScript` (all resolved by `VerifySignature`). A transaction may also name a
+  `FeePayer`, in which case a second signature from that account authorizes it to
+  pay the fee.
 - `Output` / `Transaction.Outputs` — a multi-recipient coin transfer: many
   recipients under one fee, one nonce and one signature, bounded by
   `MaxTxOutputs` and gated by the height-activated `UpgradeMultiOutput`. The
   outputs are appended to the canonical encoding *only when present*, so a
   single-recipient transaction's txid, signature and size are unchanged.
+- An **inverted height window** (`LockUntil > Expiry`) is refused by
+  `CheckTxSanity`: below the lock a transaction is not yet valid and above the
+  expiry it is too late, so there is no height at which it could be mined. It
+  changes the validity of no block — application already refuses it everywhere —
+  and keeps the pool from holding something unminable.
 - `CheckTxSanity` / `checkTxAtHeight` — the context-free and height-dependent
   consensus rules, shared by `Mempool.Add`, `Mempool.Select` and block
   application, so the mempool cannot admit or the miner select a transaction the
@@ -32,6 +39,65 @@ Module `github.com/nexusriot/DNAS/core` — the ledger and consensus rules.
   `verifyHTLC`; the timeout is a height rule enforced when a block is applied
   (`Transaction.HTLCRefundNotReady`), like `LockUntil`. Enables cross-chain
   atomic swaps.
+- `network.go` — `mainnet` / `testnet` / `regtest`. A network's id is bound into
+  the genesis block (via `PrevHash`), into the transaction signing preimage, and
+  into the peer handshake, so the three are separate chains, a signature made on
+  one does not authorize the same transfer on another, and nodes on different
+  networks disconnect rather than failing to converge. Mainnet's id is empty and
+  writes nothing, so every existing encoding is byte-for-byte unchanged.
+- `VaultScript{Hot, Cold, Unlock}` — a time-delayed vault. `From` is the hash of
+  the script; the **cold** key may spend at any height and the **hot** key only
+  from `Unlock` on, so a stolen hot key has to wait out the delay while the
+  offline cold key moves the coin to safety. Gated by `UpgradeVault`; the height
+  rule (`VaultHotNotReady`) re-derives which key signed, which is why a vault
+  spend costs two verifications in `VerifyOps`.
+- **Fee sponsorship** (`FeePayer`, gated by `UpgradeFeeSponsor`) — the fee is
+  charged to a third party instead of the sender, so an address holding no coin
+  can transact. The sender signs who pays and the sponsor counter-signs the same
+  bytes; the sponsor spends no nonce, so a sponsorship is bound to exactly one
+  transfer. `chargeSponsor` applies the payer's own coinbase-maturity reserve.
+- `assetindex.go` — a registry of what the chain has issued: `Asset(id)`,
+  `Assets()`, `AssetsByTicker(t)` and `AssetHolders(id)`. An asset id is
+  `hash(issuer, ticker, nonce)` and cannot be unpacked, so a balance of
+  `tok3f2a…` said nothing on its own. Built as blocks connect and rolled back
+  with them (like the transaction index), and always on — it is bounded by the
+  number of issuances, not of transfers. A ticker resolves to a LIST, because
+  anyone may issue "GOLD" and the id is the identifier.
+- `prune.go` — `EnablePruning(keep)` drops the bodies of blocks deeper than
+  `keep`, leaving the header-only placeholders a fast-synced chain already uses,
+  so a node's resident size stops tracking the chain. `MinPruneKeep` is above
+  `MaxReorgDepth` (a reorg replays the bodies it disconnects), a body-less height
+  serves NO filter (an empty filter is a proof of *absence*), and
+  `BlockBodyAt`/`ErrPrunedBody`/`BodyHeight`/`HasBody` let a caller tell "no such
+  block" from "pruned". The asset registry survives pruning; the transaction and
+  address indexes drop the entries that would point into nothing.
+- `addrindex.go` — an optional address → transactions index (`EnableAddressIndex`,
+  `AddressHistory`), maintained across reorgs like the transaction index. Off by
+  default: its size is bounded by an address's usage, not by the chain.
+- `share.go` — mining **share** targets (`ShareBits`, `MeetsShareTarget`): a
+  deliberately easier target so a miner can prove work without finding a block.
+  Pool accounting, never consensus — no share is stored in the chain.
+- `chainstats.go` — `Blockchain.Stats(window)`: estimated network hashrate (work
+  ÷ elapsed time), the block-interval distribution against `TargetBlockTime`, the
+  difficulty range, fee/burn/tip totals, and the coinbase recipients of the
+  window. Derived from headers and bodies already in memory, so it is reporting,
+  never consensus. `FormatHashrate` renders it.
+- `FoldFilterHeaders(prev, filters)` (cfilter.go) — continues the filter-header
+  chain from a previous value, so a client holding a verified prefix extends it
+  with only the new filters instead of re-folding from genesis;
+  `FilterHeaderChain` is the special case that starts at genesis.
+  `BlockFiltersFrom`/`FilterHeadersFrom` page the two accessors. The chain itself
+  is **cached** as blocks connect and truncated on reorg
+  (`extendFilterHeadersLocked`, `FilterHeaderBase`) — it is a running hash over
+  bodies, so a node that pruned them and re-folded over what remained would
+  produce values agreeing with nobody, and serving a range is now O(range)
+  instead of O(chain).
+- `dbtool.go` — operator tooling over a chain store without a running node:
+  `StoreStat` (what is in the file), `VerifyStore` (replay it and name the first
+  bad block), `ExportStore`/`ImportStore` (move a chain as a portable JSON file).
+  The first two go through `readStore`, which opens the file read-only and never
+  repairs a torn trailing record — `openStore` does repair one, which is right for
+  a node adopting its own store and wrong for a tool inspecting a live one.
 - `Block` / `MerkleRoot` / `Mine` — proof-of-work blocks; the hash commits to a
   merkle root of the transactions plus the post-block `StateRoot` and the block's
   `BaseFee`. A block's timestamp must exceed the median-time-past of the last 11
@@ -105,8 +171,10 @@ Module `github.com/nexusriot/DNAS/core` — the ledger and consensus rules.
   ticker validation, and copy-on-write asset-balance updates. Balances live in
   `Account.Assets` and are committed in the state root (`stateLeaf`), so a coin-only
   account is unchanged and asset balances are light-client-provable.
-- `Mempool` — bounded pool of pending transactions with lowest-*rate* eviction
-  (fee per byte), replace-by-fee (fee-bumping), expiry pruning, and nonce-aware,
+- `Mempool` — pool of pending transactions bounded in **both** count and bytes
+  (`DefaultMempoolBytes`, 32 MiB; `NewMempoolWithLimits`) with lowest-*rate*
+  eviction (fee per byte), replace-by-fee (fee-bumping), expiry pruning, and
+  nonce-aware,
   rate-ordered, byte-bounded block selection (`Select`, capped at `MaxBlockBytes`
   and `MaxBlockVerifyOps`). Admission requires a transaction that could plausibly
   be mined: per sender it keeps a contiguous run of nonces from that sender's
@@ -121,10 +189,14 @@ Module `github.com/nexusriot/DNAS/core` — the ledger and consensus rules.
   `fee ≥ MinFee() × size`. This is relay policy, not consensus — block validation
   ignores it. `Select` skips transactions below their per-byte base fee, and
   `EstimateTip(baseFee, capacityBytes)` estimates the tip *rate* to land within the
-  next `capacityBytes` of block space (0 when uncongested).
+  next `capacityBytes` of block space (0 when uncongested), and `Stats()` buckets
+  the queue by fee rate (served at `/mempool/stats`) so a sender can see what the
+  queue is actually paying rather than only how deep it is. A **fee sponsor** is
+  held to every fee it has promised across the pool, not one at a time.
 - `params.go` — monetary and consensus constants (coin, reward/halving,
   difficulty bounds and retarget, `CoinbaseMaturity`, `MaxReorgDepth`,
-  `MaxBlockBytes`, `MaxBlockVerifyOps`, `MaxTxOutputs`, `DefaultMinRelayFee`, the per-byte base-fee params
+  `MaxBlockBytes`, `MaxBlockVerifyOps`, `MaxTxOutputs`, `DefaultMinRelayFee`,
+  `DefaultMempoolBytes`, `MinPruneKeep`, the per-byte base-fee params
   `InitialBaseFee`/`MinBaseFee`/`BaseFeeTargetTxs`/`BaseFeeMaxChangeDenominator`,
   genesis) plus the `BaseFeeFor`, `Tips`, and `CoinbaseAmount` fee helpers.
 

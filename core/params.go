@@ -72,6 +72,24 @@ const (
 	// pays no fee, so it needs its own bound or a miner could commit an arbitrarily
 	// large block that every node must store and relay.
 	MaxCoinbaseBytes = 1024
+	// Paging bounds for the optional address index (see addrindex.go): how many
+	// history entries one query returns by default, and the most it may ask for.
+	// An address can appear in unboundedly many transactions, so a query without a
+	// cap would let one request serialize the whole chain.
+	DefaultAddressHistoryLimit = 100
+	MaxAddressHistoryLimit     = 1000
+
+	// DefaultMempoolBytes bounds the mempool by SIZE as well as by count. The
+	// count alone does not bound memory: 5000 entries at MaxRelayTxBytes each is
+	// ~500 MB, and buying that costs only the relay floor on those bytes — about
+	// one block reward — in transactions that are perfectly valid, correctly
+	// nonced and affordable, so not one of the admission rules that exist to stop
+	// pool abuse touches them. Eviction compares fee RATE, which large
+	// transactions satisfy exactly as cheaply as small ones, so nothing pushes
+	// them out either. 32 MiB holds thousands of ordinary payments while pricing
+	// the pathological case properly.
+	DefaultMempoolBytes = 32 << 20
+
 	// MaxRelayTxBytes is the largest transaction a node will queue and gossip. It
 	// is relay policy, not consensus (a bigger one is still valid inside a block):
 	// with a bounded mempool, an unbounded per-transaction size would let a

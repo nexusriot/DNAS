@@ -27,7 +27,9 @@ func TestClientInfoAndParsing(t *testing.T) {
 	mux.HandleFunc("/info", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"height":7,"mining":true,"work":"1234","next_difficulty":4,"mempool":2,"peers":["a","b"]}`)
 	})
+	var lastQuery string
 	mux.HandleFunc("/chain", func(w http.ResponseWriter, r *http.Request) {
+		lastQuery = r.URL.RawQuery
 		fmt.Fprint(w, `[{"index":0,"hash":"g"},{"index":1,"hash":"h1","bits":508715007,"transactions":[{"from":"COINBASE","to":"x","amount":5000000000}]}]`)
 	})
 	mux.HandleFunc("/mempool", func(w http.ResponseWriter, r *http.Request) {
@@ -41,9 +43,15 @@ func TestClientInfoAndParsing(t *testing.T) {
 	if err != nil || info.Height != 7 || !info.Mining || len(info.Peers) != 2 {
 		t.Fatalf("Info = %+v err=%v", info, err)
 	}
-	blocks, err := c.Chain()
+	// The dashboard asks for the TAIL of the chain, not the whole thing: /chain is
+	// paged, so an unparameterized request would return the OLDEST page and the
+	// panel would show genesis forever on a long chain.
+	blocks, err := c.RecentBlocks(12)
 	if err != nil || len(blocks) != 2 || blocks[1].Transactions[0].From != "COINBASE" {
-		t.Fatalf("Chain = %+v err=%v", blocks, err)
+		t.Fatalf("RecentBlocks = %+v err=%v", blocks, err)
+	}
+	if lastQuery != "last=12" {
+		t.Fatalf("RecentBlocks asked for %q, want last=12", lastQuery)
 	}
 	mp, err := c.Mempool()
 	if err != nil || len(mp) != 1 || mp[0].Amount != 100 {

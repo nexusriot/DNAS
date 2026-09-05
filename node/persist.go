@@ -37,7 +37,7 @@ func (n *Node) loadState() {
 	var bans map[string]int
 	if readJSONFile(n.statePath(bansFile), &bans) == nil && len(bans) > 0 {
 		n.bans.restore(bans)
-		log.Printf("restored %d ban score(s)", len(bans))
+		Infof("restored ban scores", "count", len(bans))
 	}
 	var txs []core.Transaction
 	if readJSONFile(n.statePath(mempoolFile), &txs) == nil {
@@ -57,7 +57,7 @@ func (n *Node) loadState() {
 			}
 		}
 		if restored > 0 {
-			log.Printf("restored %d mempool transaction(s)", restored)
+			Infof("restored mempool transactions", "count", restored)
 		}
 	}
 }

@@ -25,6 +25,55 @@ type blockStore struct {
 	size    int64   // total bytes of intact records
 }
 
+// readStore reads every intact block from the log at path WITHOUT opening it for
+// writing and without repairing anything. It exists for inspection (see
+// dbtool.go): openStore truncates a torn trailing record, which is the right
+// thing when a node is taking ownership of its own store and completely the
+// wrong thing when a tool is merely looking at one — a `db info` run against a
+// live node's chain would otherwise destroy a block the node had just appended.
+//
+// It reports the file's size alongside the blocks so a caller can tell that a
+// torn record IS present (bytes read < file size) without doing anything about it.
+func readStore(path string) (blocks []Block, intact, total int64, err error) {
+	f, err := os.Open(path) // read-only: no create, no truncate
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	total = fi.Size()
+
+	r := bufio.NewReader(f)
+	var off int64
+	for off < total {
+		var lenBuf [4]byte
+		if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
+			break
+		}
+		n := binary.BigEndian.Uint32(lenBuf[:])
+		if n == 0 || uint64(n) > maxStoredBlockBytes {
+			break
+		}
+		buf := make([]byte, n)
+		if _, err := io.ReadFull(r, buf); err != nil {
+			break
+		}
+		var b Block
+		if err := json.Unmarshal(buf, &b); err != nil {
+			break
+		}
+		blocks = append(blocks, b)
+		off += 4 + int64(n)
+	}
+	if len(blocks) == 0 && total > 0 {
+		return nil, 0, total, errors.New("not a DNAS block store (unrecognized or fully corrupt file)")
+	}
+	return blocks, off, total, nil
+}
+
 // openStore opens (or creates) the log at path and returns every stored block.
 // A torn trailing record (from a crash mid-append) is truncated away; a
 // non-empty file that yields no valid records is treated as foreign and left
