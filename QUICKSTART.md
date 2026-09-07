@@ -4,6 +4,63 @@ Everything you need to build DNAS, mine coins, run a wallet, send a payment,
 form a network, and verify transactions. It's a toy PoW cryptocurrency — a
 friendly devnet, not money.
 
+## Contents
+
+Sections §0–§8 are the walkthrough: read them in order and you have a node, a
+wallet, a payment and a second peer. Everything after §8 is a self-contained
+recipe — dip in for the one you need. (The numbering grew by appending, so the
+recipes are all suffixes of §8; the numbers are kept stable because the other
+documents and some code comments cite them.)
+
+**Getting started**
+[0. Build](#0-build) ·
+[1. Run a mining node](#1-run-a-mining-node-get-coins) ·
+[2. Wallet management](#2-wallet-management) ·
+[3. Send a payment](#3-send-a-payment) ·
+[4. Inspect the chain](#4-inspect-the-chain-http-api) ·
+[5. Form a network](#5-form-a-network) ·
+[6. Web explorer](#6-web-explorer) ·
+[7. Verify like a light client](#7-verify-a-payment-like-a-light-client-spv) ·
+[8. See it all at once](#8-see-it-all-at-once)
+
+**Light clients & sync**
+[8b. Verify from the command line](#8b-verify-a-payment-from-the-command-line-light-client) ·
+[8b2. Fast-sync from a snapshot](#8b2-fast-sync-from-a-snapshot-skip-replaying-history)
+
+**Running a node**
+[8c. Config file, metrics, shutdown](#8c-ops-config-file-metrics-clean-shutdown) ·
+[8c2. Networks](#8c2-networks-mainnet-testnet-regtest) ·
+[8d. Regtest: blocks on demand](#8d-regtest-mine-blocks-on-demand) ·
+[8d2. External mining](#8d2-external-mining-with-long-polling-and-shares) ·
+[8d7. Address history](#8d7-address-history-from-the-node) ·
+[8d8. Chain-store tooling](#8d8-chain-store-tooling) ·
+[8d9. Looking after a running node](#8d9-looking-after-a-running-node) ·
+[8d9b. Webhooks](#8d9b-getting-told-about-a-payment-webhooks) ·
+[8d9c. Pruning](#8d9c-running-a-node-that-does-not-grow-pruning) ·
+[8d10. Identity vs wallet](#8d10-a-nodes-identity-is-not-its-wallet) ·
+[8f. Lock down the API](#8f-lock-down-the-api)
+
+**Money: assets, fees, contracts**
+[8d3. Native assets](#8d3-native-assets-tokens) ·
+[8d4. Faucet](#8d4-free-coins-on-a-throwaway-network-faucet) ·
+[8d5. Someone else pays your fee](#8d5-someone-else-pays-your-fee) ·
+[8d6. Time-delayed vaults](#8d6-time-delayed-vaults) ·
+[8d11. Fee-bump / cancel](#8d11-fee-bumping-and-cancelling-a-stuck-payment) ·
+[8d12. Spending from a multisig](#8d12-spending-from-a-multisig-account) ·
+[8d13. Escrow](#8d13-escrow-a-2-of-3-with-names-on-the-members) ·
+[8e. Atomic swaps (HTLCs)](#8e-hash-time-locked-contracts-atomic-swaps)
+
+**Getting paid, and proving things**
+[8d14. Timestamping a file](#8d14-timestamping-a-file-on-the-chain-anchoring) ·
+[8d15. Invoices](#8d15-asking-to-be-paid-and-verifying-that-you-were) ·
+[8d16. Proving you control an address](#8d16-proving-you-control-an-address-without-spending) ·
+[8d17. Passphrases and backup](#8d17-changing-a-passphrase-and-backing-up-what-cannot-be-re-synced) ·
+[8d18. Reading a transaction first](#8d18-reading-a-transaction-before-agreeing-to-it)
+
+**Clients & housekeeping**
+[9. Desktop / terminal clients](#9-desktop--terminal-clients) ·
+[10. Files, persistence, reset](#10-files-persistence-reset)
+
 ## 0. Build
 
 The quickest way is `make` (stamps a version from git, writes to `bin/`):
@@ -361,6 +418,20 @@ equal what accounts actually hold. A `conservation BROKEN` line would mean coin
 appeared or vanished some other way.
 
 `node.json` keys mirror the flags, e.g. `{"listen":":3000","api":":8080","mine":true,"maxpeers":8}`.
+
+`/metrics` is a plain Prometheus scrape target — 36 gauges and counters covering
+the chain (height, difficulty, hashrate, block intervals), the mempool (count and
+bytes), peers (count, ban scores, the threshold), the reorgs and orphans this node
+has seen, supply, tip age and blocks-behind, the share ledger, and webhook
+delivery. The ones worth alerting on first:
+
+```sh
+curl -s localhost:8080/metrics | grep -E 'dnas_(tip_age_seconds|blocks_behind|peers|reorgs_total)'
+```
+
+A rising `dnas_tip_age_seconds` with `dnas_peers 0` is a node that has fallen off
+the network; `dnas_reorgs_total` climbing steadily means it is not agreeing with
+its peers about the chain.
 
 ## 8c2. Networks: mainnet, testnet, regtest
 
@@ -745,6 +816,26 @@ dnas invoice new   -amount 2.5 -memo "two coffees" -key shop.json
 dnas invoice watch -in invoice.json -wait     # exits 0 when it is settled
 dnas invoice pay   -in invoice.json -key mine.json    # the payer's side
 ```
+
+**Paying a pasted URI.** The payer usually gets the URI, not the file. Every
+client reads one, so nothing has to be retyped — which matters most for the
+address, because consensus does not check recipient checksums and a typo that
+keeps the length burns the coin:
+
+```sh
+# the CLI, with no invoice file at all
+dnas invoice pay -uri 'dnas:dnasABC…?amount=2.5&memo=two+coffees' -key mine.json
+
+# or through the light wallet, which signs locally
+dnas spv -api localhost:8080 wallet -key mine.json send 'dnas:dnasABC…?amount=2.5'
+```
+
+The URI carries the amount and the memo, so both are filled in for you. Typing an
+amount that disagrees with the one the URI asks for is refused rather than
+silently overridden: the payee matches on (address, amount), so paying a
+different amount is the same as not paying. The TUI's send prompt, the web
+explorer's send form and the PyQt client all accept a pasted URI in the
+recipient field too.
 
 `watch` is the part worth being careful about, because it is where money is at
 stake: it verifies the header chain's proof of work itself, uses compact filters

@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from PyQt6.QtCore import QObject, Qt, pyqtSignal
@@ -73,6 +74,32 @@ def meets_target(block_hash: str, bits: int) -> bool:
 
 def sha(s: str) -> str:
     return hashlib.sha256(s.encode()).hexdigest()
+
+
+def parse_payment_uri(text):
+    """Parse "dnas:ADDRESS?amount=DECIMAL&memo=TEXT&ref=TOKEN".
+
+    Returns a dict with address/amount/memo, or None if `text` is not a URI.
+    The amount is kept as WRITTEN so the CLI's parser stays the only thing that
+    turns it into base units. The address is not checksum-checked here: the node
+    does that on the way in, and the GUI has no wallet library to do it with.
+    """
+    text = (text or "").strip()
+    if not text.lower().startswith("dnas:"):
+        return None
+    rest = text[len("dnas:"):]
+    if rest.startswith("//"):
+        rest = rest[2:]
+    addr, _, query = rest.partition("?")
+    addr = urllib.parse.unquote(addr).strip()
+    if not addr:
+        return None
+    params = urllib.parse.parse_qs(query)
+    return {
+        "address": addr,
+        "amount": (params.get("amount", [""])[0] or "").strip(),
+        "memo": params.get("memo", [""])[0] or "",
+    }
 
 
 class Api:
@@ -582,8 +609,28 @@ class Main(QWidget):
         except Exception as e:  # noqa: BLE001
             QMessageBox.warning(self, "mining", str(e))
 
+    def _apply_payment_uri(self):
+        """Expand a `dnas:` payment URI pasted into the "to" field, in place.
+
+        A URI is what a payee hands over, and this is where it gets pasted. It
+        carries the amount and the memo, so neither has to be retyped -- and
+        retyping the ADDRESS is the dangerous part, since consensus does not
+        check recipient checksums.
+        """
+        uri = parse_payment_uri(self.to_edit.text())
+        if uri is None:
+            return
+        self.to_edit.setText(uri["address"])
+        if uri["amount"]:
+            self.amt_edit.setText(uri["amount"])
+        if uri["memo"]:
+            self.memo_edit.setText(uri["memo"])
+        self.send_result.setText("read payment URI - check the amount before sending")
+
     def _send(self):
         try:
+            # Paste-then-Send without leaving the field still works.
+            self._apply_payment_uri()
             if self.wallet.enabled():
                 # Signed locally. The amount and fee are passed through as written,
                 # so the CLI's parser is the only thing that interprets them.

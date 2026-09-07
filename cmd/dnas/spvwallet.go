@@ -472,11 +472,18 @@ func runSPVWallet(base string, args []string) {
 		sw.printStatus()
 	case "send":
 		// A self-custodial send: sign locally with the key file, submit via /tx.
-		if *keyFile == "" || len(rest) < 3 {
-			fmt.Println("usage: dnas spv -api URL wallet -key FILE [-asset ID] [-memo TEXT] [-expire-in N] [-lock-for N] send <to> <amount> [fee]")
+		// The recipient may be a pasted `dnas:` payment URI, which carries its own
+		// amount and memo — so a URI send is one argument shorter than a typed one.
+		sendArgs, sendOpts, err := expandPaymentURI(rest[1:], opts)
+		if err != nil {
+			fmt.Println("payment URI:", err)
 			return
 		}
-		sw.send(base, *keyFile, *asset, rest[1:], opts, func() { saveOr(sw) })
+		if *keyFile == "" || len(sendArgs) < 2 {
+			fmt.Println("usage: dnas spv -api URL wallet -key FILE [-asset ID] [-memo TEXT] [-expire-in N] [-lock-for N] send <to|dnas:URI> <amount> [fee]")
+			return
+		}
+		sw.send(base, *keyFile, *asset, sendArgs, sendOpts, func() { saveOr(sw) })
 	case "sendmany":
 		// One transaction paying several addresses: one fee, one nonce, one signature.
 		if *keyFile == "" || len(rest) < 2 {

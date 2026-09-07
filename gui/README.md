@@ -16,7 +16,8 @@ Features: live overview (**network**, height, difficulty, work, mempool, **min
 fee**, peers, mining, **estimated hashrate**) with a **readiness line** that says
 why a node is not usable rather than only that it is running, the node wallet's
 address + balance, a **Toggle mining** button, a send form (amount/fee in DNAS,
-optional memo), recent-blocks / mempool / **peers** tables, an **SPV verifier**
+optional memo) that expands a pasted `dnas:` payment URI into its address, amount
+and memo, recent-blocks / mempool / **peers** tables, an **SPV verifier**
 that fetches a proof + header and checks header proof-of-work and the merkle path
 in the client, a **Wallet tools** panel (M-of-N multisig address, HD/BIP39 wallet)
 and a **Node tools** panel (ask the faucet, look up an address's history). It can

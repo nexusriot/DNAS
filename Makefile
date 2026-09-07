@@ -6,7 +6,11 @@
 GO        ?= go
 PREFIX    ?= /usr/local
 BINDIR    := $(DESTDIR)$(PREFIX)/bin
-VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo 0.1.0)
+# The release number lives in the VERSION file; scripts/version.sh adds the git
+# detail (which commit, whether the tree is dirty) when git is available. That
+# keeps the version readable from the source alone — inside the e2e container,
+# which has no .git, and in a source tarball.
+VERSION   ?= $(shell ./scripts/version.sh)
 LDFLAGS   := -s -w -X main.version=$(VERSION)
 GOMODS    := ./core/... ./node/... ./api/... ./cmd/... ./wallet/...
 # Plain directories, for the tools that take paths rather than package patterns.

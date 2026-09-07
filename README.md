@@ -86,6 +86,14 @@ it would go next, see [ROADMAP.md](ROADMAP.md).
   `sha256(file)` on the chain and later proves the file existed before a block.
   `dnas invoice` states what is wanted, prints a `dnas:` URI, and verifies
   settlement with confirmations against a chain it proof-of-work-checked itself.
+- **Payment URIs that are actually read.** `dnas:ADDRESS?amount=2.5&memo=…` is
+  what a payee hands over, and every surface that would be handed one parses it:
+  `dnas invoice pay -uri`, `dnas spv wallet send <uri>`, the TUI send prompt, the
+  web explorer and the PyQt client all fill in the amount and memo it carries. The
+  address is checksum-validated on the way in, so pasting a URI is the version of
+  paying that cannot mistype the recipient — which matters because consensus does
+  not check recipient checksums. An amount typed alongside a URI that asks for a
+  different one is refused rather than silently overridden.
 - **Issuance & a per-byte EIP-1559 base fee.** New coins are created only by the
   coinbase transaction, paying the miner `reward + tips`. The reward starts at 50
   DNAS and halves every 210 000 blocks. Each block also has a **consensus base
@@ -351,6 +359,8 @@ DNAS is a **Go multi-module workspace**: each component is its own module
 is not itself a module.
 
 ```
+VERSION             the release number (scripts/version.sh stamps builds from it)
+CHANGELOG.md        what each release contains
 go.work             workspace tying the modules together
 wallet/             module .../wallet — Ed25519 keys, addresses, signing
 core/               module .../core   — transactions, blocks, chain state, work, mempool   (→ wallet)
@@ -361,6 +371,8 @@ e2e/                module .../e2e    — black-box suite driving the built bina
 tui/                terminal client — its OWN module, outside go.work (external deps)
 gui/                desktop client — Python / PyQt6
 scripts/            demos: demo.sh (three-node network), htlc-demo.sh, swap-demo.sh
+                    packaging: build.sh (cross-compiled tarballs), build-deb.sh
+                    version.sh (the version a build stamps)
 ```
 
 Dependency direction: `wallet → core → node → api → cmd` (no cycles). Each
@@ -409,9 +421,21 @@ target as a tarball; `scripts/build-deb.sh` produces `.deb` packages. Both honor
 `VERSION`, and select targets via `PLATFORMS` / `ARCHES`:
 
 ```sh
-PLATFORMS="linux/amd64 linux/arm64" VERSION=0.1.0 ./scripts/build.sh
-ARCHES="amd64 arm64"               VERSION=0.1.0 ./scripts/build-deb.sh
+PLATFORMS="linux/amd64 linux/arm64" ./scripts/build.sh
+ARCHES="amd64 arm64"                ./scripts/build-deb.sh
+
+# pin the stamped version instead of deriving it
+VERSION=1.2.3 ./scripts/build.sh
 ```
+
+**Versioning.** The release number is in the [VERSION](VERSION) file and
+`scripts/version.sh` turns it into what a build stamps — the bare number on a
+clean tree at the release commit, otherwise with the commit and dirty state
+appended (`0.3.0+g1a2b3c4.dirty`). Keeping it in the tree rather than in a git
+tag means the version survives where git does not: the e2e container excludes
+`.git`, and so does a source tarball. `make version` prints it, `dnas version`
+reports what a binary was stamped with, and [CHANGELOG.md](CHANGELOG.md) says
+what each release contains.
 
 A package installs `dnas`, `dnas-tui`, and a `dnas-gui` launcher (plus the PyQt
 script and docs); it `Recommends` `python3` + `python3-pyqt6` for the desktop
@@ -536,7 +560,7 @@ go run ./cmd/dnas node -listen :3001 -api :8081 -peers localhost:3000 -mine \
 | GET    | `/cfilter/{index}`| one block's compact filter; **410** when the body is pruned (an empty filter would falsely prove absence) |
 | GET    | `/cfheaders`      | the filter-header chain, paged (BIP157-style); **410** below a fast-synced node's snapshot |
 | GET    | `/events`         | Server-Sent Events stream of new blocks / reorgs / mempool txs |
-| GET    | `/metrics`        | Prometheus-format node metrics                                |
+| GET    | `/metrics`        | Prometheus-format node metrics: height, difficulty, mempool depth/bytes, peers, fees, plus reorgs, orphans, ban scores, hashrate, block intervals, supply, tip age and webhook delivery (36 series) |
 | GET    | `/webhooks`       | webhook delivery counters (sent / failed / dropped / queued)  |
 | POST   | `/send` 🔒        | `{"to","amount","fee","expiry"?,"lock_until"?,"memo"?,"nonce"?}` — signed by the node wallet |
 | POST   | `/tx` 🔒          | submit a fully-signed transaction (plain / multisig / HTLC / vault / fee-sponsored) |
@@ -555,6 +579,12 @@ Every request is rate-limited per client IP (a token bucket, `-apirate`/
 sees it). A refused request answers **429** with `Retry-After`. The limit covers
 reads as well as writes, because the expensive requests here are reads — a paged
 `/chain`, a `/snapshot`, a `/stateproof`.
+
+Write bodies are size-bounded before they are parsed, so an enormous POST costs
+the sender the upload rather than the node the memory: 64 KiB for the small
+control payloads, 400 KB for a transaction and 4 MB for a block. Over the limit
+answers **413**. The cap is on the reader rather than on `Content-Length`, so a
+request that understates its length is still stopped mid-stream.
 
 `/send` validates the recipient's checksum, auto-selects the next nonce (pass an
 explicit `nonce` with a higher `fee` to fee-bump a stuck transaction), and
@@ -632,6 +662,9 @@ dnas anchor verify -file report.pdf     # re-hashes, then verifies against a PoW
 dnas invoice new   -amount 2.5 -memo "two coffees" -key shop.json
 dnas invoice watch -in invoice.json -wait
 dnas invoice pay   -in invoice.json -key mine.json
+# or pay a pasted URI, with no invoice file in sight
+dnas invoice pay   -uri 'dnas:dnas1abc…?amount=2.5&memo=two+coffees' -key mine.json
+dnas spv -api localhost:8080 wallet -key mine.json send 'dnas:dnas1abc…?amount=2.5'
 
 # prove you control an address without spending from it (domain-separated, so a
 # message signature can never be replayed as a transaction)

@@ -29,6 +29,23 @@ its own claim fee), and settles — Alice's claim publishes the preimage on-chai
 which is what lets Bob take the asset. Edit the `191xx` ports at the top if they
 are taken.
 
+## version.sh
+
+Prints the version a build stamps. The release number lives in the
+[`VERSION`](../VERSION) file at the repo root; this script reads it and appends
+what only git can tell you — which commit, and whether the tree is dirty.
+
+```sh
+./scripts/version.sh          # 0.3.0, 0.3.0+g1a2b3c4, or 0.3.0+g1a2b3c4.dirty
+VERSION=1.2.3 ./scripts/version.sh   # an override wins outright
+```
+
+It replaced a bare `git describe`, which cannot answer where it matters most:
+the e2e container excludes `.git` and so does a source tarball, and both used to
+fall back to a hard-coded `0.1.0` or report `dev`. A build should be able to say
+what it is from the source it was built from. The Makefile and both build
+scripts below call it; `make version` prints the result.
+
 ## build.sh
 
 Cross-compiles static (CGO-free) `dnas` + `dnas-tui` binaries for one or more

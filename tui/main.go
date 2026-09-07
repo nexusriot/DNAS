@@ -252,9 +252,15 @@ func (m model) submit(md mode, in string) tea.Cmd {
 	c := m.c
 	switch md {
 	case modeSend:
-		f := strings.Fields(in)
+		// A pasted `dnas:` payment URI stands in for "<to> <amount>", carrying
+		// both (and a memo) so neither has to be retyped.
+		f, uriMemo, err := expandSendInput(strings.Fields(in))
+		if err != nil {
+			msg := err.Error()
+			return func() tea.Msg { return actionMsg(msg) }
+		}
 		if len(f) < 2 {
-			return func() tea.Msg { return actionMsg("usage: <to-address> <amount> [fee]") }
+			return func() tea.Msg { return actionMsg("usage: <to-address> <amount> [fee]  (or a dnas: URI)") }
 		}
 		amt, err := parseDNAS(f[1])
 		if err != nil {
@@ -271,21 +277,22 @@ func (m model) submit(md mode, in string) tea.Cmd {
 			// Signed locally by the `dnas` binary; the node only ever sees the signed
 			// transaction. The amount is passed through as written so there is one
 			// parser for it (the CLI's), not two that could round differently.
-			w, api, amount := m.wallet, c.base, f[1]
+			w, api, amount, memo := m.wallet, c.base, f[1], uriMemo
 			feeArg := ""
 			if len(f) > 2 {
 				feeArg = f[2]
 			}
 			return func() tea.Msg {
-				line, err := w.send(api, to, amount, feeArg, "")
+				line, err := w.send(api, to, amount, feeArg, memo)
 				if err != nil {
 					return actionMsg("send failed: " + err.Error())
 				}
 				return actionMsg(line)
 			}
 		}
+		memo := uriMemo
 		return func() tea.Msg {
-			h, err := c.Send(to, amt, fee, "")
+			h, err := c.Send(to, amt, fee, memo)
 			if err != nil {
 				return actionMsg("send failed: " + err.Error())
 			}
@@ -452,7 +459,7 @@ func (m model) View() string {
 		if m.wallet.selfCustodial() {
 			prompt = "send (signed locally)> "
 		}
-		fmt.Fprintln(&b, keyStyle.Render(prompt)+"<to> <amount> [fee]: "+m.input+"▏")
+		fmt.Fprintln(&b, keyStyle.Render(prompt)+"<to> <amount> [fee] or dnas: URI: "+m.input+"▏")
 	case modeVerify:
 		fmt.Fprintln(&b, keyStyle.Render("verify> ")+"tx hash: "+m.input+"▏")
 	case modeMultisig:

@@ -12,7 +12,7 @@ import (
 const testFee = uint64(1_000_000)
 
 // mineOn builds and mines a valid block (coinbase to minerAddr + txs) on the tip.
-func mineOn(t *testing.T, bc *Blockchain, minerAddr string, txs []Transaction) Block {
+func mineOn(t testing.TB, bc *Blockchain, minerAddr string, txs []Transaction) Block {
 	t.Helper()
 	tip := bc.Tip()
 	baseFee := bc.NextBaseFee()
@@ -35,14 +35,14 @@ func mineOn(t *testing.T, bc *Blockchain, minerAddr string, txs []Transaction) B
 
 // mustAdd appends a block the test expects to be valid, failing loudly rather
 // than letting a rejected block quietly shorten the chain under an assertion.
-func mustAdd(t *testing.T, bc *Blockchain, b Block) {
+func mustAdd(t testing.TB, bc *Blockchain, b Block) {
 	t.Helper()
 	if err := bc.AddBlock(b); err != nil {
 		t.Fatalf("add block %d: %v", b.Index, err)
 	}
 }
 
-func signedTx(t *testing.T, from *wallet.Wallet, to string, amount, fee, nonce uint64) Transaction {
+func signedTx(t testing.TB, from *wallet.Wallet, to string, amount, fee, nonce uint64) Transaction {
 	t.Helper()
 	tx := Transaction{From: from.Address(), To: to, Amount: amount, Fee: fee, Nonce: nonce}
 	if err := tx.Sign(from); err != nil {
@@ -53,7 +53,7 @@ func signedTx(t *testing.T, from *wallet.Wallet, to string, amount, fee, nonce u
 
 // matureCoinbase mines CoinbaseMaturity empty blocks to a throwaway miner so a
 // just-mined coinbase becomes spendable, without touching any asserted balances.
-func matureCoinbase(t *testing.T, bc *Blockchain) {
+func matureCoinbase(t testing.TB, bc *Blockchain) {
 	t.Helper()
 	sink, _ := wallet.New()
 	for i := 0; i < CoinbaseMaturity; i++ {

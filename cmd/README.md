@@ -115,7 +115,12 @@ and later proves it: PoW-verified headers, a merkle path, and then *reading the
 transaction* to see what the proven txid commits to. `dnas invoice`
 (`invoice.go`) states what is wanted, prints a `dnas:` URI, and verifies
 settlement with confirmations — a payment in the tip block alone can still be
-reorganized away. `dnas assets` (`assets.go`) reads the chain's asset registry,
+reorganized away. That URI is now read back as well as printed: `invoice pay
+-uri` and `spv wallet send <uri>` both accept one, expanding it into the
+address, amount and memo via `uri.go` (`expandPaymentURI`, over
+`core.ParsePaymentURI`). An amount typed alongside a URI that asks for a
+different one is refused, because the payee matches on (address, amount) and
+paying a different amount is the same as not paying. `dnas assets` (`assets.go`) reads the chain's asset registry,
 since an asset id is a hash and says nothing on its own.
 
 `dnas tx inspect|verify` (`tx.go`) decodes a transaction file (or one the node

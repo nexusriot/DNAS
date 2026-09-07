@@ -11,6 +11,30 @@ cryptocurrency. It is a learning project, not money.
 
 ---
 
+## Contents
+
+The section numbers are stable: they are referenced as `§n` from the other
+documents and from comments in the code, so a new section is inserted with a
+suffix (§19b) rather than by renumbering everything after it.
+
+| | | | |
+|---|---|---|---|
+| [1. Goals and non-goals](#1-goals-and-non-goals) | [7. Proof of work and difficulty](#7-proof-of-work-and-difficulty) | [13. Wallet](#13-wallet) | [19. Testing](#19-testing) |
+| [2. Design principles](#2-design-principles) | [8. Fork choice, timestamps, reorgs, maturity](#8-fork-choice-timestamps-reorgs-and-maturity) | [14. Light clients (SPV)](#14-light-clients-spv) | [19b. Logging and operability](#19b-logging-and-operability) |
+| [3. Module layout](#3-module-layout) | [9. Issuance and monetary policy](#9-issuance-and-monetary-policy) | [15. HTTP API and explorer](#15-http-api-and-explorer) | [20. Build and release](#20-build-and-release) |
+| [4. Ledger and state model](#4-ledger-and-state-model) | [10. Mempool](#10-mempool) | [16. Clients](#16-clients) | [21. Known limitations](#21-known-limitations) |
+| [5. Transactions](#5-transactions) | [11. Networking](#11-networking) | [17. Consensus parameters](#17-consensus-parameters) | |
+| [6. Blocks, headers, Merkle proofs](#6-blocks-headers-and-merkle-proofs) | [12. Persistence](#12-persistence) | [18. Key decisions and trade-offs](#18-key-decisions-and-trade-offs) | |
+
+Section 5 has the transaction sub-forms:
+[5.1 Networks](#51-networks-and-what-binds-a-chain-to-one) ·
+[5.2 Time-delayed vaults](#52-time-delayed-vaults) ·
+[5.3 Fee sponsorship](#53-fee-sponsorship) ·
+[5.4 Spending from a multisig account](#54-spending-from-a-multisig-account-and-escrow-on-top-of-it) ·
+[5.5 The memo](#55-the-memo-and-what-it-made-possible)
+
+---
+
 ## 1. Goals and non-goals
 
 **Goals**
@@ -435,6 +459,26 @@ them (§14) turned two other things from ideas into commands:
   bodies authenticated against their headers, and confirmations required before
   the answer is yes. A payment in the tip block alone can still be reorganized
   away, and a merchant shipping on one confirmation has been paid reversibly.
+- **Payment URIs** (`core/uri.go`) are the format that invoice hands over:
+  `dnas:ADDRESS?amount=DECIMAL&memo=TEXT&ref=TOKEN`. It was write-only for a long
+  time — printed by `invoice new`, parsed by nothing — which meant the payer still
+  read the address off it and retyped it, and retyping the address is precisely
+  the step the URI exists to remove: consensus does not validate recipients (§21),
+  so a typo that keeps the length is a burn. Parsing now checksum-validates the
+  address, so a URI that survives cannot direct a payment at a mistyped one, and
+  every surface that would be handed one reads it: `invoice pay -uri`, `spv wallet
+  send`, the TUI prompt, the explorer form and the PyQt client.
+
+  Two decisions are worth naming. The amount is **decimal DNAS, not base units** —
+  a human reads this string, and a factor of 10⁸ is the most expensive mistake the
+  format could invite — and building and parsing live in one file so a round trip
+  is a test rather than a hope. And an amount given both in the URI and on the
+  command line must **agree**: silently preferring either one means a payer who
+  mistyped pays a different amount and believes they paid the right one, which for
+  an invoice is the same as not paying, since (address, amount) is what the payee
+  matches on. The clients that import no DNAS package (TUI, GUI, explorer) keep
+  their own small parsers by necessity; a shared, checksum-guarded fixture keeps
+  them agreeing with the canonical one.
 
 Consensus gained one rule from this: an **inverted height window** is rejected
 outright. Below `LockUntil` a transaction is not yet valid and above `Expiry` it
@@ -748,6 +792,21 @@ trustworthy as the balances themselves.
   `checkTxAtHeight` for the height being built, so a rule that activates *after*
   admission (the dust limit, §8) cannot make the miner select a transaction its
   own consensus rules would then reject.
+- **Selection is indexed, and deterministic.** The obvious way to write the above
+  is to rescan the pool once per chosen transaction, and that is what it used to
+  do — re-deriving every candidate's hash and canonical size on every pass, which
+  is O(pool × block) sha256 work and made *building* a block cost far more than
+  mining one should. Two observations fix it. Everything static — hash, size,
+  verification cost, the base-fee floor, standalone validity — is fixed for the
+  duration of one `Select`, so it is computed once up front. And only ONE
+  transaction per sender can ever be ready, because readiness requires an exact
+  nonce match and the pool holds at most one transaction per `(sender, nonce)`
+  (§the `bySender` index); so each round examines one head per *sender*, with a
+  cursor that advances past anything already confirmed, rather than the whole
+  pool. On a 2000-transaction pool building a full block that is 5.7 s → 30 ms.
+  A side effect worth having: fee-rate ties now break on the transaction hash
+  rather than on Go's map iteration order, so two nodes holding the same mempool
+  build the *same* block template instead of merely equally good ones.
 - **Expiry pruning** drops transactions that can no longer be mined.
 - **A doomed candidate is never hashed.** `buildBlockFor` computes the candidate's
   state root before mining; if a selected transaction is refused, the
@@ -959,6 +1018,23 @@ a foreign-file guard). `Blockchain.Open(path)` backs a chain with it so:
 
 `Save`/`Load` remain as a JSON import/export snapshot. On restart a node loads its
 store and re-syncs anything missing from peers.
+
+**The poisoned store.** Those two writes are not equally recoverable. `AddBlock`
+appends one record, and if it fails the block is simply undone in memory — disk
+and RAM still agree. A reorg cannot do that: it truncates to the fork point
+*before* appending the winning suffix, so the moment the truncate lands the log no
+longer holds the losing branch, and a failure partway through the appends leaves
+disk holding a prefix of a chain the node is not running. There is nothing left to
+roll back to.
+
+So instead of returning an error and carrying on — which would let the next
+`AddBlock` stack the old chain's continuation on top of the new suffix, producing
+a log that silently will not replay on the *next* restart, possibly days later —
+the store is marked **poisoned** and refuses every subsequent write, naming the
+original cause and `dnas db verify`. The node stays up and readable; it just stops
+pretending its disk is authoritative. This bounds the damage rather than
+preventing it: making the sequence genuinely atomic (a side region and a single
+switch) is the open half, and is in the ROADMAP.
 
 **Pruning.** A `Blockchain` keeps its blocks in a slice, so a long chain costs
 its whole size in RAM. `-prune N` (`core/prune.go`) keeps the state and every
@@ -1204,7 +1280,12 @@ with `httptest`). Highlights:
   confirmation instead of guessing which to ask), `/supply` (minted, burned,
   circulating and the conservation check, §9), `/peers`, `/address`,
   `/estimatefee?blocks=N` (recommended fee = base fee + estimated tip),
-  `/metrics` (Prometheus text), and `/shares` (the share ledger, below).
+  `/metrics` (Prometheus text — 36 series: chain, mempool count *and bytes*, peers
+  and their ban scores, reorg totals and depth, orphan count, hashrate and block
+  intervals, supply, tip age, blocks-behind, shares, and webhook delivery. Most of
+  those numbers existed already but only as JSON on five different endpoints,
+  which is the wrong shape for the one consumer that wants them continuously),
+  and `/shares` (the share ledger, below).
 - **Paged bulk reads.** `/chain`, `/headers`, `/cfilters` and `/cfheaders` take
   `?from=HEIGHT&limit=N` and answer at most `defaultPageLimit` (2000) entries.
   They used to serialize the WHOLE chain into one response, which is a
@@ -1289,6 +1370,19 @@ with `httptest`). Highlights:
   `GET /webhooks` reports sent/failed/dropped/queued — a silently failing webhook
   is otherwise invisible from outside, since "nothing" is also what a quiet chain
   looks like.
+- **Bounded request bodies.** Every write endpoint decodes through `decodeBody`,
+  which wraps the body in an `http.MaxBytesReader` and answers **413** *before*
+  parsing: 64 KiB for the small control payloads (an address, a peer, a bool),
+  4× `MaxRelayTxBytes` for a transaction and 4× `MaxBlockBytes` for a block —
+  the multiplier because JSON with hex-encoded signatures runs several times
+  larger than the canonical encoding those constants bound. The read side was
+  paged long before this and the P2P side caps a frame, but a POST body used to be
+  read with no bound at all: the only thing between a request and an arbitrarily
+  large allocation was the size check that ran *after* the whole body had been
+  decoded into memory. The cap sits on the reader rather than on
+  `Content-Length`, so a request that understates its length is still stopped
+  mid-stream. Endpoints gated on node configuration (`/generate`, `/faucet`)
+  refuse with **403** before reading anything at all.
 - **Rate limiting:** a token bucket per client IP in front of everything
   ([api/ratelimit.go](api/ratelimit.go)), `-apirate`/`-apiburst`, answering
   **429** with `Retry-After`. The peer protocol has had a per-peer bucket from
@@ -1438,9 +1532,11 @@ Mostly in [`core/params.go`](core/params.go); the rest live next to the code the
 govern — the proof-of-work targets and `lwmaWindow` in
 [core/target.go](core/target.go), `MaxTickerLen`/`MaxAssetSupply` in
 [core/asset.go](core/asset.go), `MaxPerSender` in [core/mempool.go](core/mempool.go),
-`DefaultShareFactor` in [core/share.go](core/share.go), `MaxMultisigKeys` in
+`DefaultShareFactor` in [core/share.go](core/share.go), `MinPruneKeep` in
+[core/prune.go](core/prune.go), `MaxMultisigKeys` in
 [wallet/wallet.go](wallet/wallet.go), `ProtocolVersion` in
-[node/protocol.go](node/protocol.go), and the network ids in
+[node/protocol.go](node/protocol.go), the rate-limit defaults in
+[api/ratelimit.go](api/ratelimit.go), and the network ids in
 [core/network.go](core/network.go). Every node must agree on the consensus ones.
 
 | Parameter             | Value            | Meaning                                   |
@@ -1471,6 +1567,9 @@ govern — the proof-of-work targets and `lwmaWindow` in
 | `DefaultMinRelayFee`  | 10 /byte         | base of the dynamic fee floor (policy, per byte) |
 | `MaxRelayTxBytes`     | 100 000          | largest tx a node will queue/gossip (policy, not consensus) |
 | `MaxPerSender`        | 64               | queued txs one address may hold (policy)  |
+| `DefaultMempoolSize`  | 5000             | pending txs kept before eviction (policy, `-mempool`) |
+| `DefaultMempoolBytes` | 32 MiB           | the pool's **byte** bound; the count alone does not bound memory (policy, §10) |
+| `MinPruneKeep`        | `MaxReorgDepth` + 32 = 132 | floor on `-prune`: a node may not drop a body a legal reorg could still need |
 | `InitialBaseFee`      | 10 /byte         | EIP-1559 base fee at genesis (consensus, per byte) |
 | `MinBaseFee`          | 1 /byte          | base-fee floor (per byte)                 |
 | `BaseFeeTargetTxs`    | MaxBlockTxs / 2  | per-block tx count the base fee targets    |
@@ -1479,6 +1578,8 @@ govern — the proof-of-work targets and `lwmaWindow` in
 | `DefaultShareFactor`  | 256              | how many times easier a mining share is than a block (pool accounting, not consensus) |
 | `DefaultAddressHistoryLimit` / `MaxAddressHistoryLimit` | 100 / 1000 | paging bounds for the optional address index (policy) |
 | `defaultPageLimit` / `maxPageLimit` | 2000 | entries one bulk read returns (policy, [api/api.go](api/api.go)) |
+| `DefaultAPIRate` / `DefaultAPIBurst` | 20 /s / 60 | per-client HTTP token bucket (policy, `-apirate`/`-apiburst`, [api/ratelimit.go](api/ratelimit.go)) |
+| `maxControlBody` / `maxTxBody` / `maxBlockBody` | 64 KiB / 4× `MaxRelayTxBytes` / 4× `MaxBlockBytes` | HTTP request-body ceilings by endpoint class (policy, 413, [api/api.go](api/api.go)) |
 | `DefaultStatsWindow`  | 144              | blocks `/chainstats` covers by default (reporting) |
 | `reorgHistoryCapacity` | 64              | reorgs kept in the in-memory ring ([node/reorghist.go](node/reorghist.go)) |
 | `banThreshold`        | 100              | ban score at which a peer is cut off ([node/ban.go](node/ban.go)) |
@@ -1670,14 +1771,24 @@ it drivable by a script and testable at all.
   `-trimpath`) for `linux/amd64` + `linux/arm64` and tarballs them.
 - **`scripts/build-deb.sh`** builds lintian-clean `.deb` packages (amd64/arm64)
   with `dpkg-deb --root-owner-group`.
-- The build **version is stamped** via `-ldflags "-X main.version=…"` (default
-  from `git describe`) and reported by `dnas version`.
+- The build **version is stamped** via `-ldflags "-X main.version=…"` and
+  reported by `dnas version`. The release number lives in the
+  [VERSION](VERSION) file and `scripts/version.sh` turns it into what a build
+  stamps. It used to come from `git describe`, which cannot answer in the two
+  places it most needs to: the e2e container has no `.git` (`.dockerignore`
+  drops it) and neither does a source tarball, so both silently fell back to a
+  hard-coded `0.1.0` or reported `dev`. Now the file is the source of truth and
+  git only adds the detail it alone knows — which commit, and whether the tree
+  is dirty: `0.3.0`, `0.3.0+g1a2b3c4`, `0.3.0+g1a2b3c4.dirty`. `VERSION=1.2.3`
+  in the environment overrides the lot, and [CHANGELOG.md](CHANGELOG.md) records
+  what each release contains (a test fails if the two disagree).
 - **CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs two jobs on
   every push and pull request: a gofmt check plus `make vet`, `make build` and
   `make test-race`, and — in parallel — the containerized black-box suite via
   `make e2e-docker` (§19). On a version tag (`v*`), and only if both pass, a
   release job runs `make dist` + `make deb` and uploads the tarballs and `.deb`s
-  as build artifacts.
+  as build artifacts. Note the trigger is `v*`: the existing `0.2` tag has no
+  `v` prefix and therefore never produced one.
 
 See [scripts/README.md](scripts/README.md) for the script details.
 
@@ -1749,7 +1860,10 @@ See [scripts/README.md](scripts/README.md) for the script details.
 - The API rate limit keys on the client IP and ignores `X-Forwarded-For` on
   purpose (a client-set header would hand out a fresh bucket per request), so a
   node behind a real proxy needs the limit at the proxy. It is also per-process:
-  nothing is shared between two nodes behind one address.
+  nothing is shared between two nodes behind one address. Request *bodies* are
+  bounded (413 past 64 KiB / 400 KB / 4 MB by endpoint class, §15), but the P2P
+  side still has only the coarse 64 MiB `maxFrame` cap with no per-message-type
+  limits.
 - An invoice is matched by (address, amount, height ≥ its own), so two invoices
   for the same amount at the same address cannot be told apart. The file says so;
   a fresh address per invoice is the fix, and needs standard HD derivation to be
@@ -1796,6 +1910,11 @@ See [scripts/README.md](scripts/README.md) for the script details.
   which is why the network parameters, not a flag, decide whether one may exist.
 - Reorg history is a bounded (64-entry) in-memory ring, lost on restart: operator
   telemetry rather than chain state.
+- A reorg whose persistence fails **poisons** the block store (§12): the node
+  stops writing and says so, rather than continuing onto a log that has diverged
+  from memory. That contains the damage; it does not undo it. Recovery is manual
+  — `dnas db verify`, then re-sync — because making the truncate-and-append
+  sequence atomic is still open work.
 - `/chainstats` reports estimates. Hashrate is window work ÷ elapsed time, and
   proof-of-work variance means a short window describes luck as much as
   hashpower; a window whose blocks share a timestamp reports no rate at all

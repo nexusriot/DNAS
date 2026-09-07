@@ -8,7 +8,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -27,6 +26,7 @@ import (
 //
 //	dnas invoice new   -amount 2.5 -memo "two coffees"   → invoice.json + a dnas: URI
 //	dnas invoice pay   -in invoice.json -key mine.json   → pays it, checking the total
+//	dnas invoice pay   -uri 'dnas:ADDR?amount=2.5'       → pays a pasted URI
 //	dnas invoice watch -in invoice.json                  → waits, then exits 0 when paid
 //
 // `watch` is the part worth being careful about, because it is the step where
@@ -70,7 +70,9 @@ func runInvoice(args []string) {
   show  -in FILE                       what it asks for, and its URI
   watch -in FILE [-confirmations N] [-wait]
         verify against a PoW chain whether it has been paid; exit 0 when it has
-  pay   -in FILE -key W.json           pay it from a light wallet`)
+  pay   -in FILE -key W.json           pay it from a light wallet
+  pay   -uri 'dnas:ADDR?amount=2.5' -key W.json
+        pay a pasted URI directly, with no invoice file`)
 		return
 	}
 	switch args[0] {
@@ -91,21 +93,7 @@ func runInvoice(args []string) {
 // one string instead of retyping an address and an amount. It is deliberately
 // the same shape as every other coin's: scheme, address, query parameters.
 func invoiceURI(inv invoiceFile) string {
-	q := url.Values{}
-	if inv.Amount > 0 {
-		q.Set("amount", strings.TrimSuffix(core.FormatAmount(inv.Amount), " "+core.Ticker))
-	}
-	if inv.Memo != "" {
-		q.Set("memo", inv.Memo)
-	}
-	if inv.Reference != "" {
-		q.Set("ref", inv.Reference)
-	}
-	uri := "dnas:" + inv.Address
-	if len(q) > 0 {
-		uri += "?" + q.Encode()
-	}
-	return uri
+	return core.BuildPaymentURI(inv.Address, inv.Amount, inv.Memo, inv.Reference)
 }
 
 // newReference is a short random id for the merchant's own records. It is NOT a
@@ -406,18 +394,47 @@ func invoicePay(args []string) {
 	fs := flag.NewFlagSet("invoice pay", flag.ExitOnError)
 	apiAddr := fs.String("api", "localhost:8080", "node HTTP API address")
 	in := fs.String("in", "invoice.json", "invoice file")
+	uriArg := fs.String("uri", "", "pay a pasted dnas: payment URI instead of an invoice file")
 	keyFile := fs.String("key", "wallet.json", "key file to pay from")
 	stateFile := fs.String("f", "spvwallet.json", "light wallet state file")
 	yes := fs.Bool("y", false, "do not ask for confirmation")
 	_ = fs.Parse(args)
 
-	inv, err := readInvoice(*in)
-	if err != nil {
-		log.Fatalf("read %s: %v", *in, err)
+	// A URI may be given with -uri or as a bare argument, because a payer who
+	// pastes one will try both. It is the same request an invoice file carries,
+	// minus the payee's own bookkeeping, so it takes the same path from here.
+	uriText := strings.TrimSpace(*uriArg)
+	if uriText == "" && fs.NArg() > 0 && core.IsPaymentURI(fs.Arg(0)) {
+		uriText = fs.Arg(0)
+	}
+
+	var inv invoiceFile
+	if uriText != "" {
+		uri, err := core.ParsePaymentURI(uriText)
+		if err != nil {
+			log.Fatalf("payment URI: %v", err)
+		}
+		if uri.Amount == 0 {
+			log.Fatal("this URI names no amount, so there is nothing to pay; " +
+				"use `dnas spv wallet send <address> <amount>` instead")
+		}
+		// A pasted URI says nothing about which network it is for, unlike an
+		// invoice file. The node's network is adopted below and the address
+		// checksum has already been checked, which is as far as the URI lets us go.
+		inv = invoiceFile{Address: uri.Address, Amount: uri.Amount, Memo: uri.Memo, Reference: uri.Reference}
+	} else {
+		var err error
+		if inv, err = readInvoice(*in); err != nil {
+			log.Fatalf("read %s: %v", *in, err)
+		}
 	}
 	base := ensureHTTP(*apiAddr)
 	adoptNetwork(base)
-	if inv.Network != core.NetworkName() {
+	// A URI carries no network (the format has no field for one), so there is
+	// nothing to compare and the node's network stands. An invoice FILE does
+	// carry one, and a mismatch there is a real error: the payment would be
+	// signed for a chain the payee is not watching.
+	if inv.Network != "" && inv.Network != core.NetworkName() {
 		log.Fatalf("this invoice is for %s and the node is on %s", inv.Network, core.NetworkName())
 	}
 	// An expired invoice is not a payment request any more, and paying one sends

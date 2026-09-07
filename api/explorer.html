@@ -87,9 +87,10 @@
         <div style="margin-top:6px"><span class="muted">balance</span> <span id="mybal" class="idx">…</span></div>
       </div>
       <div class="card">
-        <div class="field"><label>send to (address)</label><input id="sendTo" placeholder="dnas…"></div>
+        <div class="field"><label>send to (address or dnas: URI)</label><input id="sendTo" placeholder="dnas… or dnas:ADDR?amount=2.5" oninput="applyPaymentURI()"></div>
         <div class="field"><label>amount (DNAS)</label><input id="sendAmt" value="1"></div>
         <div class="field"><label>fee (DNAS)</label><input id="sendFee" value="0.1"></div>
+        <div class="field"><label>memo (optional)</label><input id="sendMemo" placeholder=""></div>
         <button onclick="doSend()">Send</button>
         <div class="result" id="sendResult"></div>
       </div>
@@ -415,13 +416,48 @@ async function refreshWallet() {
   }
 }
 
+// A `dnas:` payment URI is what a payee hands over, and this form is where
+// somebody would paste it. Pasting one fills in the amount and memo it carries,
+// so neither has to be retyped -- retyping the address in particular is what a
+// URI exists to prevent, since consensus does not check recipient checksums.
+//
+// Format: dnas:ADDRESS?amount=DECIMAL&memo=TEXT&ref=TOKEN
+function parsePaymentURI(s) {
+  s = (s || "").trim();
+  if (!/^dnas:/i.test(s)) return null;
+  let rest = s.slice("dnas:".length).replace(/^\/\//, "");
+  const q = rest.indexOf("?");
+  let addr = q < 0 ? rest : rest.slice(0, q);
+  const query = q < 0 ? "" : rest.slice(q + 1);
+  try { addr = decodeURIComponent(addr); } catch (e) { return null; }
+  addr = addr.trim();
+  if (!addr) return null;
+  const p = new URLSearchParams(query);
+  return { address: addr, amount: (p.get("amount") || "").trim(), memo: p.get("memo") || "" };
+}
+
+// applyPaymentURI expands a URI pasted into the recipient field, in place.
+function applyPaymentURI() {
+  const el = document.getElementById("sendTo");
+  const uri = parsePaymentURI(el.value);
+  if (!uri) return;
+  el.value = uri.address;
+  if (uri.amount) document.getElementById("sendAmt").value = uri.amount;
+  if (uri.memo) document.getElementById("sendMemo").value = uri.memo;
+  document.getElementById("sendResult").innerHTML =
+    '<span class="ok">read payment URI</span> — check the amount before sending';
+}
+
 async function doSend() {
   const out = document.getElementById("sendResult");
   try {
+    // Paste-then-click-Send without leaving the field still works: expand first.
+    applyPaymentURI();
     const body = JSON.stringify({
       to: document.getElementById("sendTo").value.trim(),
       amount: Math.round(parseFloat(document.getElementById("sendAmt").value) * COIN),
       fee: Math.round(parseFloat(document.getElementById("sendFee").value || "0") * COIN),
+      memo: document.getElementById("sendMemo").value,
     });
     const res = await j("/send", { method: "POST", body });
     out.innerHTML = `<span class="ok">submitted</span> ${short(res.hash, 20)} (nonce ${res.nonce})`;

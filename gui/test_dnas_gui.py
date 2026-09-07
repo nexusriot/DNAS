@@ -350,3 +350,83 @@ class SelfCustodyTest(unittest.TestCase):
         self.assertEqual(own.wallet.address, "dnasaaaabbbbccccddddeeeeffff00001111222233334444")
         for win in (custodial, own):
             win._stop_poller()
+
+
+class PaymentURITest(unittest.TestCase):
+    """A `dnas:` URI is what a payee hands over, and the send form is where it
+    gets pasted. Until it was parsed, the payer still retyped the address — the
+    field a typo silently burns coin into, since consensus does not check
+    recipient checksums.
+    """
+
+    ADDR = "dnas906a1032a67ad2230b32f6d57c76d677c55cf9fd54d3fc31"
+
+    @classmethod
+    def setUpClass(cls):
+        # Constructing a window needs a QApplication, and unittest gives no
+        # ordering guarantee that another test class made one first.
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_parses_the_forms_people_paste(self):
+        for text in ("dnas:" + self.ADDR,
+                     "dnas://" + self.ADDR,
+                     "DNAS:" + self.ADDR,
+                     "  dnas:" + self.ADDR + "  "):
+            got = dnas_gui.parse_payment_uri(text)
+            self.assertIsNotNone(got, text)
+            self.assertEqual(got["address"], self.ADDR)
+
+    def test_reads_amount_and_memo(self):
+        got = dnas_gui.parse_payment_uri(
+            "dnas:" + self.ADDR + "?amount=2.5&memo=two+coffees&ref=r1")
+        self.assertEqual(got["address"], self.ADDR)
+        # The amount stays as WRITTEN: the CLI's parser is the only thing that
+        # turns it into base units, so the GUI cannot round it differently.
+        self.assertEqual(got["amount"], "2.5")
+        self.assertEqual(got["memo"], "two coffees")
+
+    def test_escaped_memo(self):
+        got = dnas_gui.parse_payment_uri("dnas:" + self.ADDR + "?memo=a+%26+b")
+        self.assertEqual(got["memo"], "a & b")
+
+    def test_unknown_parameters_are_ignored(self):
+        got = dnas_gui.parse_payment_uri("dnas:" + self.ADDR + "?amount=1&future=x")
+        self.assertEqual(got["amount"], "1")
+
+    def test_non_uris_return_none(self):
+        for text in (self.ADDR, "", None, "bitcoin:" + self.ADDR, "dnas:", "dnas:?amount=1"):
+            self.assertIsNone(dnas_gui.parse_payment_uri(text), repr(text))
+
+    def test_send_form_expands_a_pasted_uri(self):
+        win = dnas_gui.Main("localhost:1", "dnas")
+        try:
+            win.to_edit.setText("dnas:" + self.ADDR + "?amount=2.5&memo=two+coffees")
+            win._apply_payment_uri()
+            self.assertEqual(win.to_edit.text(), self.ADDR)
+            self.assertEqual(win.amt_edit.text(), "2.5")
+            self.assertEqual(win.memo_edit.text(), "two coffees")
+        finally:
+            win._stop_poller()
+
+    def test_a_plain_address_is_left_alone(self):
+        win = dnas_gui.Main("localhost:1", "dnas")
+        try:
+            win.to_edit.setText(self.ADDR)
+            win.amt_edit.setText("7")
+            win._apply_payment_uri()
+            self.assertEqual(win.to_edit.text(), self.ADDR)
+            self.assertEqual(win.amt_edit.text(), "7")
+        finally:
+            win._stop_poller()
+
+    def test_a_uri_without_an_amount_keeps_the_typed_one(self):
+        win = dnas_gui.Main("localhost:1", "dnas")
+        try:
+            win.amt_edit.setText("3")
+            win.to_edit.setText("dnas:" + self.ADDR)
+            win._apply_payment_uri()
+            self.assertEqual(win.to_edit.text(), self.ADDR)
+            self.assertEqual(win.amt_edit.text(), "3")
+        finally:
+            win._stop_poller()

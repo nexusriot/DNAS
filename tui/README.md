@@ -24,6 +24,11 @@ Keys: `s` send · `v` verify a transaction (SPV) · `w` watch a transaction to
 confirmation · `c` stop watching · `m` toggle mining · `x` derive a multisig
 address · `h` generate/restore an HD (BIP39) wallet · `r` refresh · `q` quit.
 
+The send prompt accepts a pasted `dnas:` payment URI in place of
+`<to> <amount>`: it carries the amount and the memo, so neither is retyped — and
+neither, more importantly, is the address. An amount typed alongside a URI that
+asks for a different one is refused rather than silently overridden.
+
 The dashboard shows live chain status (including the current dynamic `minfee`),
 recent blocks, the mempool, and the node wallet's balance. `v` performs a full
 light-client check (header proof-of-work + merkle proof fold) in the client, and

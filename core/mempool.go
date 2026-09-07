@@ -747,6 +747,20 @@ func (m *Mempool) Stats() MempoolStats {
 	return st
 }
 
+// selCandidate is one pool transaction prepared for selection. Hash, size, fee
+// rate and verification cost are all derived from the canonical encoding, so
+// computing them means serializing the transaction; doing that inside the
+// selection loop meant re-serializing (and re-hashing) every queued transaction
+// once per chosen transaction. They are fixed for the life of one Select call,
+// so they are computed once here instead.
+type selCandidate struct {
+	tx   Transaction
+	hash string
+	size int
+	ops  int
+	rate float64
+}
+
 // Select greedily chooses transactions that form a valid sequence on top of the
 // current chain state: each must have the sender's next nonce, be affordable, and
 // pay at least its per-byte base fee. It is bounded by both max transactions and
@@ -754,10 +768,60 @@ func (m *Mempool) Stats() MempoolStats {
 // rate (fee per byte), so scarce block space goes to the best-paying bytes.
 // Recipients are credited in the simulation so chained spends within one block
 // are possible.
+//
+// Two things keep it from costing more to build a block than to mine one:
+//
+//   - Everything static is computed once. A transaction's hash, canonical size,
+//     verification cost, base-fee floor and standalone validity do not change
+//     while we choose, so they are evaluated in a single pass up front rather
+//     than on every pass (which was O(pool × block) sha256 work).
+//   - Only one transaction per sender can ever be ready. Readiness requires
+//     tx.Nonce == the sender's simulated nonce, and the pool holds at most one
+//     transaction per (sender, nonce), so each round examines one head per
+//     SENDER rather than the whole pool. Heads are kept in nonce order and the
+//     cursor advances past anything already confirmed.
+//
+// What it chooses is unchanged, with one deliberate exception: ties on fee rate
+// now break on the transaction hash instead of on Go's map iteration order, so
+// two nodes with the same mempool build the same block template.
 func (m *Mempool) Select(bc *Blockchain, max int) []Transaction {
-	all := m.All()
 	mineHeight := bc.Height() + 1 // the block we're selecting for
 	baseFee := bc.NextBaseFee()   // the next block's base fee (per byte); txs must cover it
+
+	// One pass over the pool: drop anything that can never go into this block,
+	// and cache what the loop below would otherwise recompute.
+	bySender := map[string][]selCandidate{}
+	for _, tx := range m.All() {
+		size := tx.Size()
+		// Every consensus rule the block we are building will apply is checked
+		// here too. Selecting a transaction the chain then rejects does not just
+		// waste a slot: it invalidates the whole candidate, so the miner would
+		// hash and lose block after block while the transaction sat in the queue.
+		// None of these depend on what else we pick, so once is enough.
+		if tx.Fee < baseFee*uint64(size) {
+			continue
+		}
+		if CheckTxSanity(tx) != nil || checkTxAtHeight(tx, mineHeight) != nil {
+			continue
+		}
+		bySender[tx.From] = append(bySender[tx.From], selCandidate{
+			tx: tx, hash: tx.Hash(), size: size, ops: VerifyOps(tx), rate: txRate(tx),
+		})
+	}
+	if len(bySender) == 0 {
+		return nil
+	}
+	// Nonce order per sender, so the head is always the only one that can match
+	// the sender's next nonce.
+	for _, cs := range bySender {
+		sort.Slice(cs, func(i, j int) bool { return cs[i].tx.Nonce < cs[j].tx.Nonce })
+	}
+	senders := make([]string, 0, len(bySender))
+	for from := range bySender {
+		senders = append(senders, from)
+	}
+	sort.Strings(senders) // deterministic scan order; ties break on hash below
+	cursor := make(map[string]int, len(bySender))
 
 	type sim struct {
 		balance uint64 // spendable coin
@@ -780,13 +844,10 @@ func (m *Mempool) Select(bc *Blockchain, max int) []Transaction {
 		cache[addr] = s
 		return s
 	}
-	// ready reports whether tx can be applied on the simulated state (correct
-	// nonce, coin fee affordable, and — for asset moves — enough of the asset).
-	ready := func(tx Transaction) bool {
+	// affordable reports whether tx can be paid for on the simulated state. The
+	// nonce is already known to match by the time this is called.
+	affordable := func(tx Transaction) bool {
 		s := get(tx.From)
-		if tx.Nonce != s.nonce {
-			return false
-		}
 		// A sponsored fee comes out of the payer's simulated balance, so several
 		// transactions sharing one sponsor cannot each be selected on the strength of
 		// the same coin.
@@ -817,35 +878,40 @@ func (m *Mempool) Select(bc *Blockchain, max int) []Transaction {
 	var selected []Transaction
 	weight := 0 // running total of selected transaction bytes (<= MaxBlockBytes)
 	ops := 0    // running total of verification cost (<= MaxBlockVerifyOps)
-	used := make(map[string]bool)
 	for len(selected) < max {
-		var candidates []Transaction
-		for _, tx := range all {
-			if used[tx.Hash()] || tx.Fee < BaseFeeFor(tx, baseFee) {
+		var best *selCandidate
+		for _, from := range senders {
+			cs := bySender[from]
+			i := cursor[from]
+			// Skip anything the simulation has moved past: a nonce below the
+			// sender's current one is already confirmed (or already selected) and
+			// can never become ready again.
+			want := get(from).nonce
+			for i < len(cs) && cs[i].tx.Nonce < want {
+				i++
+			}
+			cursor[from] = i
+			if i >= len(cs) || cs[i].tx.Nonce != want {
+				continue // this sender has a gap at its next nonce
+			}
+			c := &cs[i]
+			if weight+c.size > MaxBlockBytes { // wouldn't fit the block's byte budget
 				continue
 			}
-			// Every consensus rule the block we are building will apply is checked
-			// here too. Selecting a transaction the chain then rejects does not just
-			// waste a slot: it invalidates the whole candidate, so the miner would
-			// hash and lose block after block while the transaction sat in the queue.
-			if CheckTxSanity(tx) != nil || checkTxAtHeight(tx, mineHeight) != nil {
+			if ops+c.ops > MaxBlockVerifyOps { // nor its verification budget
 				continue
 			}
-			if weight+tx.Size() > MaxBlockBytes { // wouldn't fit the block's byte budget
+			if !affordable(c.tx) {
 				continue
 			}
-			if ops+VerifyOps(tx) > MaxBlockVerifyOps { // nor its verification budget
-				continue
-			}
-			if ready(tx) {
-				candidates = append(candidates, tx)
+			if best == nil || c.rate > best.rate || (c.rate == best.rate && c.hash < best.hash) {
+				best = c
 			}
 		}
-		if len(candidates) == 0 {
+		if best == nil {
 			break
 		}
-		sort.Slice(candidates, func(i, j int) bool { return txRate(candidates[i]) > txRate(candidates[j]) })
-		pick := candidates[0]
+		pick := best.tx
 
 		s := get(pick.From)
 		s.nonce++
@@ -877,9 +943,8 @@ func (m *Mempool) Select(bc *Blockchain, max int) []Transaction {
 		}
 
 		selected = append(selected, pick)
-		used[pick.Hash()] = true
-		weight += pick.Size()
-		ops += VerifyOps(pick)
+		weight += best.size
+		ops += best.ops
 	}
 	return selected
 }

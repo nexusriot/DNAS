@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"sync"
@@ -23,6 +24,38 @@ type blockStore struct {
 	f       *os.File
 	offsets []int64 // offsets[i] = byte offset of block i (len == blocks stored)
 	size    int64   // total bytes of intact records
+
+	// poisoned is set when a write failed partway through a sequence that cannot
+	// be rolled back — specifically a reorg, which truncates to the fork point
+	// before appending the winning suffix (see Blockchain.reorgLocked). Once the
+	// truncate has happened the log can no longer represent the old chain, so a
+	// failed append leaves disk holding a prefix of a chain that memory is not
+	// running. Continuing to write would append the old chain's continuation on
+	// top of the new suffix and produce a log that will not replay on restart.
+	// Refusing every subsequent write keeps the damage bounded and legible: the
+	// operator gets a loud error naming `dnas db verify` instead of a store that
+	// silently stops loading days later.
+	poisoned error
+}
+
+// poison marks the store unusable for further writes. It is idempotent: the
+// first cause is the interesting one, so a later failure does not overwrite it.
+func (s *blockStore) poison(cause error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.poisoned == nil {
+		s.poisoned = cause
+	}
+}
+
+// errPoisoned reports why the store is refusing writes, or nil if it is healthy.
+// The caller must hold s.mu.
+func (s *blockStore) errPoisonedLocked() error {
+	if s.poisoned == nil {
+		return nil
+	}
+	return fmt.Errorf("block store is poisoned by an earlier failed write (%w); "+
+		"the on-disk chain may diverge from memory - stop this node and run `dnas db verify`", s.poisoned)
 }
 
 // readStore reads every intact block from the log at path WITHOUT opening it for
@@ -142,6 +175,9 @@ func (s *blockStore) append(b Block) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.errPoisonedLocked(); err != nil {
+		return err
+	}
 	var lenBuf [4]byte
 	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(data)))
 	if _, err := s.f.WriteAt(lenBuf[:], s.size); err != nil {
@@ -159,6 +195,9 @@ func (s *blockStore) append(b Block) error {
 func (s *blockStore) truncateAfter(height uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.errPoisonedLocked(); err != nil {
+		return err
+	}
 	keep := int(height) + 1
 	if keep >= len(s.offsets) {
 		return nil

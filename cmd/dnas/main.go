@@ -97,8 +97,12 @@ func main() {
 	}
 }
 
-func usage() {
-	fmt.Println(`dnas - a small proof-of-work cryptocurrency
+func usage() { usageTo(os.Stdout) }
+
+// usageTo writes the help text to w, so a test can check it against what the
+// binary actually accepts rather than trusting it to have been kept up to date.
+func usageTo(w io.Writer) {
+	fmt.Fprintln(w, `dnas - a small proof-of-work cryptocurrency
 
 Usage:
   dnas node [flags]              run a node (default)
@@ -139,6 +143,10 @@ Usage:
   dnas health                         is this node ready to be relied on?
   dnas version                        print the build version
 
+A node started in a terminal also drops into an interactive console (type "help"
+at its prompt); -console forces it on when stdin is a pipe, so a script can drive
+it. It reads the running node directly, so it works with no HTTP API reachable.
+
 Node flags:
   -listen ADDR    p2p listen address (default ":3000")
   -advertise ADDR address peers should dial us at (default: -listen)
@@ -150,11 +158,18 @@ Node flags:
   -maxpeers N     maximum outbound peer connections (default 8)
   -mempool N      max pending transactions (default 5000)
   -minrelayfee N  base min relay fee, base units per byte; rises with load (default 10)
+  -prune N        keep only the N most recent block bodies in memory (0 = keep all)
+  -webhook LIST   comma-separated URLs to POST every block/tx event to
+  -apirate N      sustained HTTP API requests per second per client (default 20; 0 = off)
+  -apiburst N     HTTP API requests allowed back to back per client (default 60)
+  -console        run the interactive console even when stdin is not a terminal
   -mine           enable mining
   -regtest        regtest mode: mine blocks on demand via POST /generate
   -network NAME   mainnet (default), testnet or regtest — separate chains
   -addrindex      index address -> transactions (serves /address/{a}/history)
   -faucet         give coin away via POST /faucet (testnet/regtest only)
+  -faucetamount A faucet payout in DNAS (default 10)
+  -faucetcooldown N  seconds between payouts to one address or requester (default 60)
   -sharefactor N  how many times easier a mining share is than a block
   -nodekey FILE   network identity key (default nodekey.json beside -db)
   -loglevel LVL   error | warn | info (default) | debug

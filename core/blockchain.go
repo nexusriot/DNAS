@@ -406,12 +406,23 @@ func (bc *Blockchain) reorgLocked(fork int, suffix []Block) (bool, []Block, erro
 
 	// Persist (truncate to the fork, append the new suffix) before committing in
 	// memory, so disk and memory stay consistent.
+	//
+	// This sequence is the one place a write cannot be rolled back: once the
+	// truncate lands, the log no longer holds the losing suffix, so a failure
+	// partway through leaves disk with a prefix of a chain this node is not yet
+	// running. There is nothing to undo to — so instead of returning an error and
+	// carrying on (which would append the old chain's continuation on top of the
+	// new suffix and leave a log that will not replay), the store is poisoned and
+	// refuses every later write. The node stays up and readable; it just cannot
+	// pretend its disk is still authoritative.
 	if bc.store != nil {
 		if err := bc.store.truncateAfter(uint64(fork)); err != nil {
+			bc.store.poison(err)
 			return false, nil, fmt.Errorf("persist reorg: %w", err)
 		}
 		for i := fork + 1; i < len(blocks); i++ {
 			if err := bc.store.append(blocks[i]); err != nil {
+				bc.store.poison(err)
 				return false, nil, fmt.Errorf("persist reorg: %w", err)
 			}
 		}

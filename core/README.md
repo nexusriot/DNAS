@@ -145,7 +145,10 @@ Module `github.com/nexusriot/DNAS/core` — the ledger and consensus rules.
   before it is mined.
 - `store.go` — an append-only, length-framed block log. `Open` backs a chain with
   it so `AddBlock` persists in O(1) and reorgs truncate+append (no whole-file
-  rewrite); `Save`/`Load` remain as a JSON import/export snapshot.
+  rewrite); `Save`/`Load` remain as a JSON import/export snapshot. A reorg whose
+  writes fail partway **poisons** the store: the truncate has already discarded
+  the losing branch, so there is nothing to roll back to, and every later write is
+  refused rather than deepening the divergence between disk and memory.
 - `target.go` — proof of work is a **256-bit compact target** (`Bits`, nBits-style
   `CompactToBig`/`BigToCompact`); a hash must be ≤ the target. `expectedBits`
   (in `blockchain.go`) retargets **every block** with an LWMA toward
@@ -193,6 +196,11 @@ Module `github.com/nexusriot/DNAS/core` — the ledger and consensus rules.
   the queue by fee rate (served at `/mempool/stats`) so a sender can see what the
   queue is actually paying rather than only how deep it is. A **fee sponsor** is
   held to every fee it has promised across the pool, not one at a time.
+- `uri.go` — `dnas:ADDRESS?amount=…&memo=…&ref=…` payment URIs:
+  `BuildPaymentURI` / `ParsePaymentURI` / `IsPaymentURI`. Parsing
+  checksum-validates the address, so a URI that survives cannot aim a payment at a
+  typo; the amount is decimal DNAS, not base units. Building and parsing live
+  together so a round trip is a test rather than a hope.
 - `params.go` — monetary and consensus constants (coin, reward/halving,
   difficulty bounds and retarget, `CoinbaseMaturity`, `MaxReorgDepth`,
   `MaxBlockBytes`, `MaxBlockVerifyOps`, `MaxTxOutputs`, `DefaultMinRelayFee`,

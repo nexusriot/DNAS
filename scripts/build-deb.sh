@@ -15,7 +15,7 @@ cd "$(dirname "$0")/.."
 
 command -v dpkg-deb >/dev/null 2>&1 || { echo "dpkg-deb not found (install the dpkg package)"; exit 1; }
 
-RAW_VERSION="${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo 0.1.0)}"
+RAW_VERSION="$(VERSION="${VERSION:-}" ./scripts/version.sh)"
 # Debian versions must start with a digit and use a restricted charset.
 DEB_VERSION="$(printf '%s' "$RAW_VERSION" | sed -e 's/^v//' -e 's/[^A-Za-z0-9.+~]/~/g')"
 case "$DEB_VERSION" in [0-9]*) ;; *) DEB_VERSION="0~${DEB_VERSION}" ;; esac

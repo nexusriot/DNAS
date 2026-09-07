@@ -46,7 +46,10 @@ COPY . .
 # A broken tree fails the build, not the run: the binary must compile and answer
 # `version`, the suite must vet clean (nothing else vets it — the Makefile's
 # GOMODS stops at the product modules) and must compile against the tag.
-RUN go build -trimpath -ldflags '-s -w' -o /out/dnas ./cmd/dnas \
+# The version is stamped from the VERSION file rather than from `git describe`:
+# .dockerignore drops .git, so git has nothing to say in here, and an unstamped
+# build reports "dev".
+RUN go build -trimpath -ldflags "-s -w -X main.version=$(tr -d ' \t\n\r' < VERSION)" -o /out/dnas ./cmd/dnas \
     && /out/dnas version \
     && go vet -tags e2e ./e2e/... \
     && go test -c -trimpath -tags e2e -o /out/dnas-e2e ./e2e

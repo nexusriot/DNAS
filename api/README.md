@@ -38,8 +38,20 @@ anyone may issue "GOLD"), `/asset/{id}` (one asset plus its holders and the held
 total, which must equal the issued supply), `/webhooks` (delivery counters),
 `/peers`, `/address`, `/estimatefee?blocks=N`
 (recommended per-byte fee = base fee + estimated tip, never below the relay
-floor), `/metrics` (Prometheus format, incl. `dnas_min_relay_fee` and
-`dnas_base_fee`).
+floor), `/metrics` (Prometheus format: 36 series covering the chain, the mempool
+by count *and* bytes, peers and their ban scores, reorg totals and depth, orphan
+count, hashrate and block intervals, supply, tip age, blocks-behind, the share
+ledger and webhook delivery — most of these were previously reachable only as
+JSON spread across `/reorgs`, `/chainstats`, `/bans`, `/supply` and `/health`).
+
+**Write bodies are bounded.** Every write endpoint decodes through `decodeBody`,
+which wraps the request in an `http.MaxBytesReader` and answers **413** before
+parsing: 64 KiB for the small control payloads, 4× `core.MaxRelayTxBytes` for a
+transaction, 4× `core.MaxBlockBytes` for a block (JSON with hex signatures runs
+larger than the canonical encoding those bound). The cap is on the reader, not on
+`Content-Length`, so a request that understates its length is still cut off
+mid-stream. Endpoints gated on node configuration (`/generate`, `/faucet`) refuse
+with **403** before reading the body at all.
 
 A node that has **pruned** a block body, or fast-synced above it, answers
 `/block/{i}`, `/cfilter/{i}` and `/cfheaders` with **410 Gone** rather than 404,

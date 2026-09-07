@@ -50,15 +50,19 @@ sections matter most for "toy → real".
   codec makes a spec *possible*; only a second client (or, cheaper first step, a
   golden-vector suite — serialized tx/block/state hex → expected hash/validity)
   actually *proves* it. One implementation is one implementation, however careful.
-- **`[S/M]` Make a failed reorg persist atomic.** `reorgLocked` truncates the block
-  store and appends the winning suffix *before* swapping the chain in memory
-  ([core/blockchain.go](core/blockchain.go)). If an append fails partway (a full or
-  failing disk), it returns an error and the node keeps running on the old
-  in-memory chain while the store already holds a prefix of the new one — the two
-  have diverged, and the next `AddBlock` appends the old chain's continuation on
-  top of the new suffix, leaving a log that will not replay on restart. Writing the
-  suffix to a side region and switching atomically, or marking the store poisoned
-  and refusing further writes, keeps a disk error recoverable.
+- **`[M]` Make a failed reorg persist atomic — *the divergence is now contained,
+  not yet prevented*.** `reorgLocked` truncates the block store and appends the
+  winning suffix *before* swapping the chain in memory
+  ([core/blockchain.go](core/blockchain.go)). Once the truncate lands there is no
+  old chain left on disk to roll back to, so a failure partway used to leave the
+  store holding a prefix of a chain the node was not running — and the next
+  `AddBlock` would stack the old chain's continuation on top of it, leaving a log
+  that would not replay on restart. The store is now **poisoned** on any such
+  failure ([core/store.go](core/store.go)): every later write is refused with an
+  error naming `dnas db verify`, so the damage stops at one bad reorg instead of
+  compounding silently. What remains is the *atomic* version — writing the suffix
+  to a side region and switching in one step — so a disk error is recoverable
+  rather than merely loud.
 - **`[M]` Consensus-checked addresses.** Nothing in consensus validates that `To`
   is a well-formed, checksummed address, so a buggy client can still burn coins to
   a typo, and `MaxAddressBytes` is only a length bound on how much junk can become
@@ -163,13 +167,18 @@ sections matter most for "toy → real".
 - **`[S/M]` Weight-based congestion signal.** The EIP-1559 base fee currently
   responds to transaction *count* (§9); switching the signal to block weight/bytes
   makes it track real demand.
-- **`[S]` Index the mempool for selection.** `Mempool.Select` rescans the whole
-  pool once per chosen transaction, recomputing each candidate's hash and canonical
-  size every pass — O(txs × block txs) sha256 work, which on a full pool makes
-  building one block far more expensive than mining it should be. The
-  `(From, Nonce)` index added for admission is half the answer; keeping candidates
-  in a fee-rate-ordered structure, with sizes and hashes cached on admission,
-  makes selection linear.
+- ~~**`[S]` Index the mempool for selection.**~~ **Done.** `Mempool.Select` used to
+  rescan the whole pool once per chosen transaction, recomputing each candidate's
+  hash and canonical size every pass — O(txs × block txs) sha256 work, which on a
+  full pool made building one block far more expensive than mining it should be.
+  It now derives hash/size/ops/rate once up front, and exploits the fact that only
+  ONE transaction per sender can be ready (readiness requires an exact nonce match
+  and the pool holds at most one transaction per (sender, nonce)), so each round
+  examines one head per *sender* rather than the whole pool. Measured on a
+  2000-transaction pool building a full block: **5.7 s → 30 ms**. Selection is also
+  deterministic now — fee-rate ties break on the transaction hash instead of on
+  Go's map iteration order, so two nodes with the same mempool build the same
+  template.
 
 ## 5. Wallet & UX
 
@@ -196,21 +205,28 @@ sections matter most for "toy → real".
   `dnas sponsor` pass a transaction between signers as a JSON envelope carrying
   the network it is for, which works and is not interoperable with anything: a
   documented, versioned partial-signature encoding would be.
-- **`[S]` `dnas:` URIs in the clients.** `dnas invoice new` prints a
-  `dnas:ADDRESS?amount=…&memo=…` URI and `dnas invoice pay` reads the invoice
-  file, but nothing PARSES a pasted URI — not the TUI, the GUI or the explorer,
-  which is where somebody would paste one.
+- ~~**`[S]` `dnas:` URIs in the clients.**~~ **Done.** The format now round-trips:
+  `core.BuildPaymentURI`/`core.ParsePaymentURI` ([core/uri.go](core/uri.go)) are
+  the canonical pair (the address is checksum-validated on parse, so a URI that
+  survives cannot direct a payment at a typo), and every surface that would be
+  handed one reads it — `dnas invoice pay -uri`, `dnas spv wallet send <uri>`, the
+  TUI send prompt, the web explorer's send form, and the PyQt client. Each fills
+  in the amount and memo the URI carries; an amount typed alongside one that
+  disagrees is refused rather than silently overridden. The TUI, explorer and GUI
+  keep their own small parsers because they import no DNAS package by design; a
+  checksum-guarded shared fixture keeps them honest.
 
 ## 6. Ops, tooling & observability
 
-- **`[S]` Finish the Prometheus metrics + a Grafana dashboard.** `GET /metrics`
-  already exports height, difficulty, mempool depth, peer count, the relay floor,
-  the base fee, the mining flag and the share ledger ([api/api.go](api/api.go)),
-  and the node now KEEPS the counters that were missing — reorg totals and depth
-  ([node/reorghist.go](node/reorghist.go)), orphan depth, ban scores, block
-  intervals and hashrate ([core/chainstats.go](core/chainstats.go)). What remains
-  is exporting them as Prometheus counters rather than only as JSON, plus a
-  dashboard to ship alongside.
+- **`[S]` A Grafana dashboard for the Prometheus metrics.** The metrics themselves
+  are now complete: `GET /metrics` ([api/api.go](api/api.go)) exports 36 series —
+  height, difficulty, mempool depth *and bytes*, peer count, relay floor, base
+  fee, mining flag and the share ledger as before, plus everything that used to be
+  JSON-only: reorg totals and depth ([node/reorghist.go](node/reorghist.go)),
+  orphan count, ban scores and the threshold, hashrate and block intervals
+  ([core/chainstats.go](core/chainstats.go)), supply (minted/burned/circulating),
+  tip age, blocks-behind, and webhook delivery counters. What remains is a
+  dashboard to ship alongside them.
 - **`[M]` JSON-RPC 2.0 interface.** The HTTP API is REST; a bitcoind-style JSON-RPC
   surface eases integration with existing tooling and block explorers.
 - **`[S]` systemd unit + RPM + wider release matrix.** A `.deb` and tagged CI
@@ -247,11 +263,16 @@ sections matter most for "toy → real".
   so a restart loses exactly the record you want after an incident, and a pool
   loses its accounting. They want the same treatment the peer/ban/mempool soft
   state already gets in [node/persist.go](node/persist.go).
-- **`[S]` Size-bound the HTTP write endpoints.** The API now has a per-client
-  token bucket (`-apirate`/`-apiburst`, 429 + `Retry-After`), but the write
-  endpoints still read a request body without `http.MaxBytesReader`, so a single
-  enormous POST is bounded only by the transaction size check that follows it.
-  The P2P side has both halves.
+- ~~**`[S]` Size-bound the HTTP write endpoints.**~~ **Done.** Every write endpoint
+  now decodes through `decodeBody` ([api/api.go](api/api.go)), which wraps the body
+  in an `http.MaxBytesReader` and answers **413** before parsing: 64 KiB for the
+  small control payloads, 4× `MaxRelayTxBytes` for a transaction and 4×
+  `MaxBlockBytes` for a block (JSON with hex signatures runs several times larger
+  than the canonical encoding those constants bound). The cap is on the *reader*,
+  not on `Content-Length`, so a request that understates its length is still
+  stopped mid-stream. What remains on this axis is the P2P half: an inbound frame
+  has only the coarse 64 MiB `maxFrame` cap, which is the per-message-type item
+  in §2.
 - **`[S]` Binary block bodies on disk.** The block store's framing is binary but
   each record is still the block's JSON ([core/store.go](core/store.go)).
   Switching records to the canonical codec shrinks the file and speeds startup;

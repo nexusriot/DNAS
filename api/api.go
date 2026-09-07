@@ -236,6 +236,48 @@ func writeErr(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]string{"error": msg})
 }
 
+// Request-body ceilings. The read side of the API is paged, and the P2P side
+// caps an inbound frame, but a POST body used to be read with no bound at all:
+// the only thing standing between a request and an arbitrarily large allocation
+// was the size check that ran *after* the whole thing had been decoded into
+// memory. These price it before anything is parsed.
+const (
+	// maxControlBody covers the small JSON control payloads — an address, a peer,
+	// a bool, a handful of public keys. Kilobytes, not megabytes.
+	maxControlBody = 64 << 10
+	// maxTxBody covers a submitted transaction. core.MaxRelayTxBytes bounds the
+	// canonical binary encoding; JSON with hex-encoded signatures and a memo runs
+	// several times larger, so this leaves generous headroom over that ceiling
+	// while still refusing anything absurd.
+	maxTxBody = 4 * core.MaxRelayTxBytes
+	// maxBlockBody covers a submitted block (/submitblock, /submitshare). Same
+	// reasoning against core.MaxBlockBytes, which bounds a block's canonical
+	// transaction bytes.
+	maxBlockBody = 4 * core.MaxBlockBytes
+)
+
+// decodeBody reads a JSON request body of at most limit bytes into v. A body
+// over the limit is refused with 413 before it is parsed, so an enormous POST
+// costs the sender the upload rather than costing the node the memory.
+//
+// Note it is the *decoder* that enforces the cap, not a pre-read of the body:
+// http.MaxBytesReader makes the read itself fail past the limit, so a request
+// claiming a small Content-Length and then sending gigabytes is caught too.
+func decodeBody(w http.ResponseWriter, r *http.Request, limit int64, v any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeErr(w, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("request body exceeds %d bytes", limit))
+			return err
+		}
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return err
+	}
+	return nil
+}
+
 func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 	tip := s.node.Chain().Tip()
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -376,9 +418,8 @@ func (s *Server) submitShare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var b core.Block
-	if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid block json")
-		return
+	if err := decodeBody(w, r, maxBlockBody, &b); err != nil {
+		return // decodeBody already answered 400 or 413
 	}
 	res, err := s.node.SubmitShare(b)
 	if err != nil {
@@ -412,9 +453,8 @@ func (s *Server) faucet(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Address string `json:"address"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
+	if err := decodeBody(w, r, maxControlBody, &req); err != nil {
+		return // decodeBody already answered 400 or 413
 	}
 	tx, err := s.node.FaucetFor(req.Address, clientIP(r))
 	if err != nil {
@@ -502,9 +542,8 @@ func (s *Server) addressHistory(w http.ResponseWriter, r *http.Request) {
 // authenticated write; a stale or invalid block returns 400 so the miner refetches.
 func (s *Server) submitBlock(w http.ResponseWriter, r *http.Request) {
 	var b core.Block
-	if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid block json")
-		return
+	if err := decodeBody(w, r, maxBlockBody, &b); err != nil {
+		return // decodeBody already answered 400 or 413
 	}
 	if err := s.node.SubmitMinedBlock(b); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -537,6 +576,72 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	gauge("dnas_shares_stale", "Mining shares rejected as stale.", shares.Stale)
 	gauge("dnas_shares_blocks", "Submitted shares that also met the block target.", shares.Blocks)
 	gauge("dnas_share_difficulty", "Difficulty of the current share target.", core.TargetDifficulty(shares.ShareBits))
+
+	// The node already keeps the numbers below; until now they were reachable
+	// only as JSON on /reorgs, /chainstats, /bans, /supply and /health, which is
+	// the wrong shape for the one consumer that wants them continuously. A
+	// monitoring system should not have to scrape three endpoints and parse
+	// nested objects to alert on "this node is reorging" or "the tip is stale".
+	counter := func(name, help string, v any) {
+		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n%s %v\n", name, help, name, name, v)
+	}
+
+	// Reorgs and orphans: the shape of the disagreement this node is seeing.
+	reorgs := s.node.Reorgs()
+	counter("dnas_reorgs_total", "Chain reorganizations since this node started.", reorgs.Total)
+	gauge("dnas_reorg_deepest", "Deepest reorg this node has seen, in blocks.", reorgs.Deepest)
+	gauge("dnas_orphan_blocks", "Blocks parked awaiting a parent.", reorgs.Orphans)
+
+	// Peer misbehaviour. The worst score matters more than the count: one peer at
+	// 95 is a different alert from twenty peers at 5.
+	bans := s.node.Bans()
+	banned, worst := 0, 0
+	for _, b := range bans {
+		if b.Banned {
+			banned++
+		}
+		if b.Score > worst {
+			worst = b.Score
+		}
+	}
+	gauge("dnas_peers_scored", "Peers carrying a non-zero ban score.", len(bans))
+	gauge("dnas_peers_banned", "Peers currently over the ban threshold.", banned)
+	gauge("dnas_peer_worst_ban_score", "Highest ban score any peer currently holds.", worst)
+	gauge("dnas_ban_threshold", "Ban score at which a peer is cut off.", s.node.BanThreshold())
+
+	// Block timing and hashrate over the default window. These are estimates
+	// (see /chainstats); exporting them is what makes "blocks stopped" visible.
+	st := s.node.Chain().Stats(0)
+	gauge("dnas_hashrate", "Estimated network hashrate over the recent window (hashes/s).", st.Hashrate)
+	gauge("dnas_block_interval_mean", "Mean seconds between blocks over the window.", st.MeanInterval)
+	gauge("dnas_block_interval_median", "Median seconds between blocks over the window.", st.MedianInterval)
+	gauge("dnas_block_interval_target", "Target seconds between blocks.", st.TargetInterval)
+	gauge("dnas_window_fees", "Total fees paid over the window, in base units.", st.Fees)
+	gauge("dnas_window_burned", "Fees destroyed by the base fee over the window, in base units.", st.Burned)
+
+	// Supply, so the conservation check is alertable rather than merely reported.
+	sup := s.node.Chain().Supply()
+	gauge("dnas_supply_minted", "Coin minted by all coinbases so far, in base units.", sup.Minted)
+	gauge("dnas_supply_burned", "Coin destroyed by the base fee so far, in base units.", sup.Burned)
+	gauge("dnas_supply_circulating", "Coin held across all accounts, in base units.", sup.Circulating)
+
+	// Readiness and freshness: the two things a supervisor polls /health for.
+	tipAge := time.Since(time.Unix(tip.Timestamp, 0)).Seconds()
+	gauge("dnas_tip_age_seconds", "Seconds since the tip block's timestamp.", int64(tipAge))
+	gauge("dnas_blocks_behind", "Blocks this node is behind the best height it knows of.", s.node.BlocksBehind())
+
+	// Mempool pressure in bytes as well as count: the byte budget is what a full
+	// pool actually exhausts first.
+	gauge("dnas_mempool_bytes", "Total serialized size of the pending queue.", s.node.Mempool().Bytes())
+	gauge("dnas_mempool_max_bytes", "The pending queue's byte budget.", s.node.Mempool().MaxBytes())
+
+	// Webhook delivery, which is otherwise invisible: a silently failing receiver
+	// looks exactly like a quiet chain.
+	wh := s.node.WebhookStats()
+	counter("dnas_webhook_sent", "Webhook deliveries that succeeded.", wh.Sent)
+	counter("dnas_webhook_failed", "Webhook deliveries that failed.", wh.Failed)
+	counter("dnas_webhook_dropped", "Webhook events dropped because the queue was full.", wh.Dropped)
+	gauge("dnas_webhook_queued", "Webhook events waiting to be delivered.", wh.Queued)
 }
 
 // events streams live node events (new blocks, reorgs, mempool transactions) as
@@ -596,9 +701,8 @@ func (s *Server) mine(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		On bool `json:"on"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
+	if err := decodeBody(w, r, maxControlBody, &req); err != nil {
+		return // decodeBody already answered 400 or 413
 	}
 	s.node.SetMining(req.On)
 	writeJSON(w, http.StatusOK, map[string]bool{"mining": s.node.Mining()})
@@ -619,9 +723,8 @@ func (s *Server) generate(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		N int `json:"n"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
+	if err := decodeBody(w, r, maxControlBody, &req); err != nil {
+		return // decodeBody already answered 400 or 413
 	}
 	if req.N <= 0 {
 		req.N = 1
@@ -856,9 +959,8 @@ func (s *Server) unban(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Key string `json:"key"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
+	if err := decodeBody(w, r, maxControlBody, &req); err != nil {
+		return // decodeBody already answered 400 or 413
 	}
 	if err := s.node.Unban(req.Key); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -877,9 +979,8 @@ func (s *Server) addPeer(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Addr string `json:"addr"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
+	if err := decodeBody(w, r, maxControlBody, &req); err != nil {
+		return // decodeBody already answered 400 or 413
 	}
 	if err := s.node.AddPeer(req.Addr); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -899,9 +1000,8 @@ func (s *Server) dropPeer(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Peer string `json:"peer"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
+	if err := decodeBody(w, r, maxControlBody, &req); err != nil {
+		return // decodeBody already answered 400 or 413
 	}
 	closed, err := s.node.DropPeer(req.Peer)
 	if err != nil {
@@ -998,9 +1098,8 @@ func (s *Server) submitTx(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var tx core.Transaction
-	if err := json.NewDecoder(r.Body).Decode(&tx); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
+	if err := decodeBody(w, r, maxTxBody, &tx); err != nil {
+		return // decodeBody already answered 400 or 413
 	}
 	if err := s.node.SubmitTx(tx); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -1033,9 +1132,8 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) {
 		Memo      string        `json:"memo"`
 		Nonce     *uint64       `json:"nonce"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
+	if err := decodeBody(w, r, maxTxBody, &req); err != nil {
+		return // decodeBody already answered 400 or 413
 	}
 	// Either one recipient (to/amount) or many (outputs), never both. Every
 	// recipient's checksum is validated here so a typo is refused before signing
@@ -1102,9 +1200,8 @@ func (s *Server) multisigAddress(w http.ResponseWriter, r *http.Request) {
 		Threshold int      `json:"threshold"`
 		PubKeys   []string `json:"pubkeys"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
+	if err := decodeBody(w, r, maxControlBody, &req); err != nil {
+		return // decodeBody already answered 400 or 413
 	}
 	addr, err := wallet.MultisigAddress(req.Threshold, req.PubKeys)
 	if err != nil {
@@ -1132,9 +1229,8 @@ func (s *Server) htlcAddress(w http.ResponseWriter, r *http.Request) {
 		Sender    string `json:"sender"`
 		Timeout   uint64 `json:"timeout"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
+	if err := decodeBody(w, r, maxControlBody, &req); err != nil {
+		return // decodeBody already answered 400 or 413
 	}
 	addr, err := wallet.HTLCAddress(req.Hash, req.Recipient, req.Sender, req.Timeout)
 	if err != nil {
@@ -1157,9 +1253,8 @@ func (s *Server) vaultAddress(w http.ResponseWriter, r *http.Request) {
 		Cold   string `json:"cold"`
 		Unlock uint64 `json:"unlock"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
+	if err := decodeBody(w, r, maxControlBody, &req); err != nil {
+		return // decodeBody already answered 400 or 413
 	}
 	addr, err := wallet.VaultAddress(req.Hot, req.Cold, req.Unlock)
 	if err != nil {
@@ -1183,9 +1278,8 @@ func (s *Server) walletHD(w http.ResponseWriter, r *http.Request) {
 		Passphrase string `json:"passphrase"`
 		Count      int    `json:"count"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
+	if err := decodeBody(w, r, maxControlBody, &req); err != nil {
+		return // decodeBody already answered 400 or 413
 	}
 	switch {
 	case req.Count <= 0:

@@ -10,7 +10,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-VERSION="${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo 0.1.0)}"
+VERSION="$(VERSION="${VERSION:-}" ./scripts/version.sh)"
 PLATFORMS="${PLATFORMS:-linux/amd64 linux/arm64}"
 OUT="${OUT:-dist}"
 GO="${GO:-go}"
