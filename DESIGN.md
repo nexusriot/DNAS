@@ -819,6 +819,43 @@ trustworthy as the balances themselves.
 
 ## 11. Networking
 
+**Outbound peer selection (`node/addrman.go`).** Inbound connections have had
+eclipse caps for a while — a total, plus a per-network-group limit — but outbound
+selection had none, and outbound is the half that matters: those are the peers a
+node *chose*, and therefore the ones it trusts to tell it the truth about the
+chain. Every gossiped address went into one flat set and the first `maxpeers` of
+them pulled out of a Go map got a dial loop, so nine addresses in one /16 stood a
+good chance of owning every slot.
+
+The address manager is the bitcoind shape, minus the parts that only pay at
+internet scale. Two tables: `new` for addresses merely heard about, `tried` for
+ones that completed a handshake, with selection biased toward `tried` because an
+address that worked once is evidence and an address someone mentioned is not.
+Both tables are bounded and bucketed by network group, and — the control that
+actually does the work — **live outbound connections are capped per group**
+(`maxOutboundPerGroup`, 2 of 8 slots), so an attacker needs addresses in four
+distinct ranges rather than eight anywhere. A dial loop holds its reservation for
+its whole life, so a peer that keeps reconnecting keeps its group's share rather
+than freeing it between attempts. The `tried` table persists (`addrs.json`),
+because it is the node's own hard-won evidence about who is real and starting
+cold means trusting gossip again on every restart.
+
+Two honest limits. The bucketing is a **/16 prefix, not an ASN** — two ranges can
+share an operator, so this raises the cost of an eclipse rather than settling it;
+real ASN diversity needs routing data this project has no business shipping. And
+loopback is exempt from the cap, or the demos and the containerized e2e suite
+(every node on 127.0.0.1) could hold two peers between them.
+
+**Bootstrapping (`node/dnsseed.go`).** Joining a network meant knowing somebody's
+address out of band, which is not a network anyone can join. `-dnsseeds` resolves
+A/AAAA records into the `new` table. A seed is the one thing a bootstrapping node
+believes before it can verify anything, so: seeds are consulted only when the node
+is genuinely short of addresses, their results get no special standing and are
+subject to the same diversity cap as gossip, one seed's contribution is bounded,
+and a dead seed does not block the others. A seed cannot forge a chain — every
+peer still handshakes and every block is still validated — but a *single* seed can
+eclipse, so configure more than one.
+
 `node/` implements an authenticated, encrypted, identified peer-to-peer network.
 
 **Secure transport (`secureConn`, `secureHandshake`) — permissionless by
@@ -1018,6 +1055,31 @@ a foreign-file guard). `Blockchain.Open(path)` backs a chain with it so:
 
 `Save`/`Load` remain as a JSON import/export snapshot. On restart a node loads its
 store and re-syncs anything missing from peers.
+
+**Compaction, and why it needs a snapshot.** `-prune` drops block bodies from
+memory; for a long time the file kept every original record, so a pruning node
+bounded its RAM and nothing else. Compaction rewrites the log to mirror the
+pruned chain — amortized over `storeCompactInterval` blocks, because it is a
+whole-file rewrite, and atomic via temp-file + rename.
+
+The subtlety is what a pruned store can no longer do. Dropping a body drops the
+transactions that produced the balances, so the header chain alone cannot rebuild
+state: a store that shrank and then failed to load would be strictly worse than
+one that never shrank. So compaction writes a **state snapshot** beside the log
+(`chain.db.state`) *before* shrinking it — that order matters, because a crash
+between the two then leaves a complete store and a harmless extra file, where the
+reverse leaves a pruned store with nothing to replay from. `Open` bootstraps from
+that snapshot exactly as a fast-synced node does, and verifies it the same way:
+the accounts must hash to the state root committed in a proof-of-work-covered
+header, so a stale or tampered snapshot is rejected rather than silently becoming
+this node's idea of everyone's balances.
+
+Pruned heights keep a header-only record rather than vanishing, because linkage,
+median-time-past and the difficulty retarget all read those headers. The saving
+is therefore the transaction bodies: large on a busy chain, near zero on a devnet
+of empty blocks. And a pruned store is no longer fully re-verifiable — `dnas db
+verify` replays what bodies remain and reports which heights it could not check
+instead of claiming a clean bill.
 
 **The poisoned store.** Those two writes are not equally recoverable. `AddBlock`
 appends one record, and if it fails the block is simply undone in memory — disk
@@ -1280,7 +1342,7 @@ with `httptest`). Highlights:
   confirmation instead of guessing which to ask), `/supply` (minted, burned,
   circulating and the conservation check, §9), `/peers`, `/address`,
   `/estimatefee?blocks=N` (recommended fee = base fee + estimated tip),
-  `/metrics` (Prometheus text — 36 series: chain, mempool count *and bytes*, peers
+  `/metrics` (Prometheus text — 45 series: chain, mempool count *and bytes*, peers
   and their ban scores, reorg totals and depth, orphan count, hashrate and block
   intervals, supply, tip age, blocks-behind, shares, and webhook delivery. Most of
   those numbers existed already but only as JSON on five different endpoints,
@@ -1533,7 +1595,9 @@ govern — the proof-of-work targets and `lwmaWindow` in
 [core/target.go](core/target.go), `MaxTickerLen`/`MaxAssetSupply` in
 [core/asset.go](core/asset.go), `MaxPerSender` in [core/mempool.go](core/mempool.go),
 `DefaultShareFactor` in [core/share.go](core/share.go), `MinPruneKeep` in
-[core/prune.go](core/prune.go), `MaxMultisigKeys` in
+[core/prune.go](core/prune.go), the address-manager and DNS-seed bounds in
+[node/addrman.go](node/addrman.go) and [node/dnsseed.go](node/dnsseed.go),
+`MaxMultisigKeys` in
 [wallet/wallet.go](wallet/wallet.go), `ProtocolVersion` in
 [node/protocol.go](node/protocol.go), the rate-limit defaults in
 [api/ratelimit.go](api/ratelimit.go), and the network ids in
@@ -1546,12 +1610,14 @@ govern — the proof-of-work targets and `lwmaWindow` in
 | `HalvingInterval`     | 210 000          | blocks between reward halvings            |
 | `GenesisBits`         | ~2^240 target    | compact PoW target at genesis (nBits)     |
 | `PowLimit`            | ~2^244 target    | easiest target (difficulty floor); no hard ceiling — difficulty is unbounded |
-| `TargetBlockTime`     | 5 s              | desired spacing (LWMA retarget target)    |
+| `TargetBlockTime`     | 60 s             | desired spacing (LWMA retarget target). Was 5 s; see `FinalityWindow` |
+| `FinalityWindow`       | `MaxReorgDepth` × `TargetBlockTime` = 1 h 40 m | wall-clock divergence the chain can heal from. At the old 5 s it was ~8 min, so any longer partition split the network permanently |
+| `MaxTimeOffset`        | 70 min           | bound on how far peers may move this node's clock for timestamp validation ([core/nettime.go](core/nettime.go)) |
 | `lwmaWindow`          | 20               | blocks the LWMA retarget averages over    |
 | `ProtocolVersion`     | 2                | P2P wire version (peers below `MinProtocolVersion` = 1 are dropped) |
 | network id            | "" / `dnas-testnet` / `dnas-regtest` | bound into genesis, the signing preimage and the handshake (§5.1) |
 | `CoinbaseMaturity`    | 3                | blocks before a reward is spendable       |
-| `MaxReorgDepth`       | 100              | deepest reorg allowed (finality guard)    |
+| `MaxReorgDepth`       | 100              | deepest reorg allowed (finality guard). Raising it drags `MinPruneKeep` with it, which is why the finality window was widened via the block time instead |
 | `MaxBlockTxs`         | 1000             | non-coinbase txs per block                |
 | `MaxBlockBytes`       | 1 000 000        | total non-coinbase tx bytes per block     |
 | `MaxBlockVerifyOps`   | 8000             | worst-case signature verifications per block |
@@ -1583,6 +1649,14 @@ govern — the proof-of-work targets and `lwmaWindow` in
 | `DefaultStatsWindow`  | 144              | blocks `/chainstats` covers by default (reporting) |
 | `reorgHistoryCapacity` | 64              | reorgs kept in the in-memory ring ([node/reorghist.go](node/reorghist.go)) |
 | `banThreshold`        | 100              | ban score at which a peer is cut off ([node/ban.go](node/ban.go)) |
+| `maxOutboundPerGroup` | 2                | live outbound peers allowed per network group — the outbound eclipse control ([node/addrman.go](node/addrman.go)) |
+| `maxNewEntries` / `maxTriedEntries` | 4096 / 1024 | address-table bounds; gossip is attacker-controlled, so both evict |
+| `maxEntriesPerGroup`  | 64               | addresses one network group may occupy in the tables |
+| `maxDialFailures` / `maxTriedDialFailures` | 5 / 12 | consecutive failures that retire an address (a `tried` one is kept longer — it worked once) |
+| `peerRefillInterval`  | 20 s             | how often the outbound set is topped back up |
+| `dnsSeedThreshold`    | 8                | known addresses below which DNS seeds are consulted ([node/dnsseed.go](node/dnsseed.go)) |
+| `maxAddrsPerSeed`     | 32               | addresses one DNS seed may contribute per round |
+| `dnsSeedTimeout`      | 10 s             | bound on one round of seed resolution |
 
 ---
 
@@ -1613,7 +1687,7 @@ govern — the proof-of-work targets and `lwmaWindow` in
 | Native assets in the account, committed in the state root | Tokens with light-client-provable balances; `omitempty` keeps coin-only state (and genesis) unchanged | Fees are always coin (no per-asset fee market); it's balances, not a scripting/contract system |
 | External miner protocol (`getblocktemplate`/`submitblock`) | Mining decoupled from the node — hashpower can live elsewhere | A stale template is rejected; the miner refetches |
 | Adversarial sim via an injected transport | Stress reorg/finality/sync/partitions in-process, deterministically | Test-only; a reliable stream transport models latency/partitions, not packet loss |
-| State root in the header (balance proofs) | Light clients prove balances, not just inclusion | Another header field; proves membership only, not account absence |
+| State root in the header, over a TRIE | Light clients prove balances AND that an address holds nothing | Another header field, and the trie root is a consensus change from the earlier Merkle fold |
 | Regtest = on-demand `/generate`, not fast continuous mining | Deterministic, controlled block production; no runaway chain | A separate mode; isolated by netkey rather than a distinct genesis |
 | Miner throttles empty blocks by one `TargetBlockTime`, overridable per node | An idle network doesn't fill with coinbase-only blocks | It caps how fast an idle chain advances regardless of hashpower, so devnets and tests must lower `EmptyBlockInterval` rather than wait it out |
 | Network id bound into genesis, the signing preimage and the handshake | A chain and its signatures belong to exactly one network; cross-network replay and accidental peering become impossible | A third thing every node must be configured with identically; mainnet keeps the empty id so nothing already stored changes |
@@ -1796,12 +1870,16 @@ See [scripts/README.md](scripts/README.md) for the script details.
 
 ## 21. Known limitations
 
-- The network is now open/permissionless with inbound caps (total + per-IP-group)
-  and per-peer rate limiting for eclipse/DoS resistance, but identities and IPs are
-  still cheap, so it is not fully sybil-resistant (no proof-of-work/stake peer
-  gating, no ASN-diversity addrman). The open handshake is anonymous — it has no
-  MITM authentication; safety rests on connecting to many peers. Bans persist
-  across a graceful restart but a hard kill can lose them (re-learned from peers).
+- The network is open/permissionless with eclipse caps on both directions now —
+  inbound (total + per-IP-group) and outbound (a tried/new address manager with a
+  per-group cap on live connections, §11) — plus per-peer rate limiting. But
+  identities and IPs are still cheap and the diversity signal is a **/16 prefix
+  rather than an ASN**, so an attacker with addresses across enough distinct
+  ranges still wins: this raises the cost of an eclipse, it does not settle it.
+  There is no proof-of-work/stake peer gating. The open handshake is anonymous —
+  it has no MITM authentication; safety rests on connecting to many peers. Bans
+  persist across a graceful restart but a hard kill can lose them (re-learned
+  from peers).
 - Consensus is defined by a canonical binary encoding (portable across
   implementations), but there is still only ONE implementation — no second client
   has verified the spec, and there are no cross-client consensus test vectors.
@@ -1828,8 +1906,14 @@ See [scripts/README.md](scripts/README.md) for the script details.
   it.
 - Merkle SPV proves inclusion trustlessly; compact filters add non-inclusion but
   under the honest-node/multi-peer assumption (they aren't header-committed).
-  State proofs prove account *membership* (a present balance/nonce) against the
-  header state root, not account *absence*.
+  State proofs prove account membership AND absence against the header's trie
+  state root, so "this address holds nothing" is now verifiable rather than
+  taken on a node's word. An authenticated trie that DOES prove
+  absence is implemented and tested ([core/trie.go](core/trie.go)) but is **not
+  yet wired into consensus**: the header still commits the sorted-leaf fold, so
+  the trie's proofs are not bound to proof of work and prove nothing about the
+  chain. Committing the trie root changes the genesis hash — a hard fork, and a
+  deliberate decision rather than a refactor (ROADMAP §1).
 - A coinbase transaction commits only its recipient and amount, so two blocks
   paying the same miner the same subsidy share a **txid** (Bitcoin's pre-BIP34
   problem). Lookups therefore resolve a duplicated coinbase to its first
@@ -1849,10 +1933,16 @@ See [scripts/README.md](scripts/README.md) for the script details.
   saw, so it reports `filter_base` above its snapshot and answers 410 below it:
   it can validate the chain it has, and it cannot serve a light client the old
   part of it.
-- `-prune` bounds a node's **resident** size, not its disk: the append-only store
-  still holds every block and a restart replays it. The bodies it drops take
-  their inclusion proofs and compact filters with them, which the node reports
-  (410, `body_height`) rather than answering "not found".
+- `-prune` now bounds a node's disk as well as its memory: the log is compacted
+  to match the pruned chain and a verified state snapshot is written beside it to
+  restart from (§12). Two honest limits remain. Pruned heights keep a header-only
+  record — the headers are load-bearing for linkage, MTP and the retarget — so
+  the saving is the transaction bodies, which on a chain of empty blocks is close
+  to nothing. And a pruned store is no longer fully re-verifiable: `dnas db
+  verify` replays the bodies it still has and takes everything below the cutoff
+  on the snapshot's authority, which it says rather than glosses. The bodies it
+  drops still take their inclusion proofs and compact filters with them (410,
+  `body_height`).
 - Webhook delivery is at-most-once behind a bounded queue: a receiver far enough
   behind loses events rather than the node growing a backlog for it. A service
   that must not miss a payment should reconcile against `/chain` or

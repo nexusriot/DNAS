@@ -94,8 +94,8 @@ func readStore(path string) (blocks []Block, intact, total int64, err error) {
 		if _, err := io.ReadFull(r, buf); err != nil {
 			break
 		}
-		var b Block
-		if err := json.Unmarshal(buf, &b); err != nil {
+		b, derr := decodeStoredBlock(buf)
+		if derr != nil {
 			break
 		}
 		blocks = append(blocks, b)
@@ -144,8 +144,8 @@ func openStore(path string) (*blockStore, []Block, error) {
 			corrupt = true
 			break
 		}
-		var b Block
-		if err := json.Unmarshal(buf, &b); err != nil {
+		b, derr := decodeStoredBlock(buf)
+		if derr != nil {
 			corrupt = true
 			break
 		}
@@ -167,9 +167,38 @@ func openStore(path string) (*blockStore, []Block, error) {
 	return s, blocks, nil
 }
 
+// encodeStoredBlock / decodeStoredBlock are the store's record format, kept
+// behind one pair of functions so it can change without touching the framing,
+// the offsets or the reorg logic. It is deliberately NOT the consensus codec:
+// records here are local, so the format may evolve freely as long as an older
+// file still loads.
+// Writing uses the compact binary form (see storecodec.go). Reading accepts
+// both, because a store written by an older build must still load: a JSON
+// record begins with '{', so the two are told apart by the leading byte rather
+// than by trial and error.
+func encodeStoredBlock(b Block) ([]byte, error) { return encodeBlockV2(b), nil }
+
+func decodeStoredBlock(data []byte) (Block, error) {
+	if len(data) == 0 {
+		return Block{}, errEmptyRecord
+	}
+	switch data[0] {
+	case storeRecordV2:
+		return decodeBlockV2(data)
+	case '{':
+		var b Block
+		if err := json.Unmarshal(data, &b); err != nil {
+			return Block{}, err
+		}
+		return b, nil
+	default:
+		return Block{}, fmt.Errorf("unrecognized store record (leading byte %#x)", data[0])
+	}
+}
+
 // append writes one block record and fsyncs.
 func (s *blockStore) append(b Block) error {
-	data, err := json.Marshal(b)
+	data, err := encodeStoredBlock(b)
 	if err != nil {
 		return err
 	}
@@ -212,3 +241,142 @@ func (s *blockStore) truncateAfter(height uint64) error {
 }
 
 func (s *blockStore) close() error { return s.f.Close() }
+
+// Compaction, in two phases.
+//
+// `-prune` bounds a node's resident size: bodies below the cutoff are replaced
+// in memory with header-only placeholders. The file kept every original record,
+// so a pruned node still paid full disk for the whole chain and still replayed
+// all of it on restart. Rewriting the log to match the pruned chain fixes that.
+//
+// The reason it is split in two is latency. The rewrite is O(whole store), and
+// the first version of this ran inside the chain's write lock — so on a pruning
+// node every 128th block froze the miner, every API read and every peer handler
+// for the length of a full file rewrite (measured: 49ms on a 198 KB store, and
+// it grows with the file). Now the expensive part runs with no lock held, and
+// only the swap — appending whatever blocks arrived meanwhile, then a rename —
+// happens under it.
+//
+// What compaction does NOT do is delete pruned heights. A pruned height keeps a
+// header-only record, because the header is not optional: linkage, median-time-
+// past and the difficulty retarget all read it, and a restart that could not
+// rebuild the header chain could not validate anything. So this shrinks the
+// store by the size of the transaction bodies — large on a busy chain, close to
+// nothing on a devnet mining empty blocks. Honest either way.
+
+// compactionTmp is the file the rewrite is staged in.
+func compactionTmp(path string) string { return path + ".compact" }
+
+// writeCompacted stages a rewritten log at the temp path. It holds NO lock and
+// touches nothing live: the caller passes an immutable snapshot of the chain.
+func writeCompacted(path string, blocks []Block) (offsets []int64, size int64, err error) {
+	tmp := compactionTmp(path)
+	f, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return nil, 0, fmt.Errorf("compact: create temp: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			f.Close()
+			os.Remove(tmp)
+		}
+	}()
+	offsets = make([]int64, 0, len(blocks))
+	for _, b := range blocks {
+		off, n, werr := writeRecordAt(f, size, b)
+		if werr != nil {
+			return nil, 0, werr
+		}
+		offsets = append(offsets, off)
+		size += n
+	}
+	if err = f.Sync(); err != nil {
+		return nil, 0, fmt.Errorf("compact: sync: %w", err)
+	}
+	if err = f.Close(); err != nil {
+		return nil, 0, fmt.Errorf("compact: close temp: %w", err)
+	}
+	return offsets, size, nil
+}
+
+// writeRecordAt appends one length-framed block record at `at`, returning the
+// offset it was written to and how many bytes it consumed.
+func writeRecordAt(f *os.File, at int64, b Block) (off int64, n int64, err error) {
+	data, err := encodeStoredBlock(b)
+	if err != nil {
+		return 0, 0, fmt.Errorf("compact: encode block %d: %w", b.Index, err)
+	}
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(data)))
+	if _, err := f.WriteAt(lenBuf[:], at); err != nil {
+		return 0, 0, fmt.Errorf("compact: write length: %w", err)
+	}
+	if _, err := f.WriteAt(data, at+4); err != nil {
+		return 0, 0, fmt.Errorf("compact: write block %d: %w", b.Index, err)
+	}
+	return at, 4 + int64(len(data)), nil
+}
+
+// adoptCompacted finishes a staged rewrite: it appends `tail` (blocks that were
+// committed while the rewrite ran), fsyncs, and renames the temp file over the
+// live one. Short, and the only part that needs the store locked.
+//
+// Past the rename the old file is gone, so a failure there is the unrecoverable
+// shape the poison flag exists for.
+func (s *blockStore) adoptCompacted(path string, offsets []int64, size int64, tail []Block) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.errPoisonedLocked(); err != nil {
+		return err
+	}
+	tmp := compactionTmp(path)
+	f, err := os.OpenFile(tmp, os.O_RDWR, 0o644)
+	if err != nil {
+		return fmt.Errorf("compact: reopen staged file: %w", err)
+	}
+	for _, b := range tail {
+		off, n, werr := writeRecordAt(f, size, b)
+		if werr != nil {
+			f.Close()
+			os.Remove(tmp)
+			return werr
+		}
+		offsets = append(offsets, off)
+		size += n
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return fmt.Errorf("compact: sync tail: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("compact: close staged file: %w", err)
+	}
+
+	if err := s.f.Close(); err != nil {
+		s.poisoned = fmt.Errorf("compact: closing the old store: %w", err)
+		return s.errPoisonedLocked()
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		s.poisoned = fmt.Errorf("compact: rename: %w", err)
+		return s.errPoisonedLocked()
+	}
+	reopened, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	if err != nil {
+		s.poisoned = fmt.Errorf("compact: reopening the compacted store: %w", err)
+		return s.errPoisonedLocked()
+	}
+	s.f, s.offsets, s.size = reopened, offsets, size
+	return nil
+}
+
+// discardCompaction removes a staged rewrite that will not be adopted.
+func discardCompaction(path string) { os.Remove(compactionTmp(path)) }
+
+// sizeBytes reports the store's current on-disk size.
+func (s *blockStore) sizeBytes() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.size
+}

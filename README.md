@@ -11,7 +11,8 @@ bounded mempool with fee estimation, an authenticated + encrypted peer-to-peer
 network with peer discovery and headers-first sync, append-only persistence
 (chain + peers/bans/mempool), and light clients that verify proof-of-work and —
 via merkle proofs, BIP158-style compact filters, and a header **state root** —
-prove transaction inclusion, *non*-inclusion, and account balances. It exposes an
+prove transaction inclusion, account balances, and — since the state root became
+a trie root — that an address holds *nothing at all*. It exposes an
 HTTP API with an optional bearer-token guard, a real-time event stream, an
 optional address index, a long-polling mining protocol with pool-style shares, a
 testnet faucet, and a regtest mode for on-demand mining, plus a built-in web
@@ -23,7 +24,9 @@ New here? See [QUICKSTART.md](QUICKSTART.md) to build, mine, run a wallet, send 
 payment, form a network, and verify transactions. For *how and why* it works —
 the ledger model, consensus, networking, and the trade-offs behind each choice —
 see [DESIGN.md](DESIGN.md). For what it deliberately does *not* do yet, and where
-it would go next, see [ROADMAP.md](ROADMAP.md).
+it would go next, see [ROADMAP.md](ROADMAP.md). For what it defends against, what
+each defence assumes, and what is explicitly out of scope, see
+[THREAT-MODEL.md](THREAT-MODEL.md) — which is a threat model, not an audit.
 
 ## What makes it a cryptocurrency (not just a hash-chain)
 
@@ -34,6 +37,14 @@ it would go next, see [ROADMAP.md](ROADMAP.md).
   rest (PBKDF2 + AES-256-GCM) via `DNAS_WALLET_PASSPHRASE`, and a wallet can be
   backed up as a **BIP39 mnemonic** that deterministically derives many **HD**
   addresses.
+- **Outbound peer selection that resists eclipse.** A node keeps tried/new
+  address tables ([node/addrman.go](node/addrman.go)): addresses that completed a
+  handshake are preferred over ones merely gossiped, and **live outbound
+  connections are capped per network group**, so filling a node's eight outbound
+  slots needs addresses in four distinct ranges rather than eight addresses
+  anywhere. The tried table survives a restart, and `-dnsseeds` bootstraps from
+  DNS when a node knows nobody. Bucketing is by /16, not ASN — that raises the
+  cost of an eclipse rather than settling it.
 - **A node identity that is not your wallet.** A node proves itself to peers with
   an Ed25519 key and sends the *public* key in the handshake — and a DNAS address
   is a hash of a public key. Using the wallet key for both therefore hands every
@@ -86,6 +97,14 @@ it would go next, see [ROADMAP.md](ROADMAP.md).
   `sha256(file)` on the chain and later proves the file existed before a block.
   `dnas invoice` states what is wanted, prints a `dnas:` URI, and verifies
   settlement with confirmations against a chain it proof-of-work-checked itself.
+- **Recipient addresses can be checked by consensus.** Scheduling the
+  `checkedaddresses` upgrade (`-upgrades checkedaddresses:HEIGHT`) makes every
+  address a transaction names — sender, each recipient, the fee payer — have to
+  be well-formed and checksummed to be valid at all. Until then consensus bounds
+  only their *length*, so client-side validation is the only thing between a
+  buggy client and coin burned to a typo. It is height-activated like the other
+  upgrades, so an existing chain replays unchanged; it cannot recover coin
+  already sent to a malformed address.
 - **Payment URIs that are actually read.** `dnas:ADDRESS?amount=2.5&memo=…` is
   what a payee hands over, and every surface that would be handed one parses it:
   `dnas invoice pay -uri`, `dnas spv wallet send <uri>`, the TUI send prompt, the
@@ -361,6 +380,7 @@ is not itself a module.
 ```
 VERSION             the release number (scripts/version.sh stamps builds from it)
 CHANGELOG.md        what each release contains
+THREAT-MODEL.md     assets, adversaries, what each defence assumes (not an audit)
 go.work             workspace tying the modules together
 wallet/             module .../wallet — Ed25519 keys, addresses, signing
 core/               module .../core   — transactions, blocks, chain state, work, mempool   (→ wallet)
@@ -468,6 +488,7 @@ free.
 | `-advertise` | = `-listen`    | address peers should dial us at                |
 | `-api`       | `:8080`        | HTTP API address                               |
 | `-peers`     | —              | comma-separated seed peer addresses            |
+| `-dnsseeds`  | —              | DNS seed hostnames (`host` or `host:port`) to bootstrap from when short of peers |
 | `-wallet`    | `wallet.json`  | wallet key file (created if missing)           |
 | `-db`        | `chain.db`     | append-only blockchain store file              |
 | `-netkey`    | — (open)       | pre-shared key for a **private** net; empty = open/permissionless |
@@ -493,7 +514,7 @@ free.
 | `-printconfig` | —            | print the effective configuration (flags over `-config`) and exit |
 | `-dandelion` | on             | relay new transactions via Dandelion++ stem/fluff (origin privacy) |
 | `-checkpoints` | —            | finality checkpoints, comma-separated `height:hash` pairs |
-| `-upgrades`  | —              | consensus upgrade activations, comma-separated `name:height` pairs (known: `dustlimit`, `multioutput`, `vault`, `feesponsor`) |
+| `-upgrades`  | —              | consensus upgrade activations, comma-separated `name:height` pairs (known: `dustlimit`, `multioutput`, `vault`, `feesponsor`, `checkedaddresses`) |
 | `-config`    | —              | JSON config file (flags override its values)   |
 
 A node shuts down cleanly on `SIGINT`/`SIGTERM` (stops mining, closes peers,
@@ -525,7 +546,7 @@ go run ./cmd/dnas node -listen :3001 -api :8081 -peers localhost:3000 -mine \
 
 | Method | Path              | Purpose                                                       |
 |--------|-------------------|---------------------------------------------------------------|
-| GET    | `/info`           | network, height, tip, next difficulty, work, mempool, min relay fee, base fee, peers, mining, address-index/faucet/webhook availability, and what this node can serve (`body_height`, `filter_base`, `pruned`) |
+| GET    | `/info`           | network, height, tip, next difficulty, work, mempool, min relay fee, base fee, peers, mining, address-index/faucet/webhook availability, the address manager's tables (`addrs`: new/tried counts and how many network groups the outbound peers occupy), the on-disk store's size and what compaction has reclaimed (`store`), and what this node can serve (`body_height`, `filter_base`, `pruned`) |
 | GET    | `/chain`          | block bodies, paged: `?from=HEIGHT&limit=N`, or `?last=N` for the newest N |
 | GET    | `/balance/{addr}` | balance (raw + formatted)                                     |
 | GET    | `/account/{addr}` | balance (raw + formatted), nonce, and any native-asset balances |
@@ -554,13 +575,13 @@ go run ./cmd/dnas node -listen :3001 -api :8081 -peers localhost:3000 -mine \
 | GET    | `/header/{index}` | one block header (SPV)                                        |
 | GET    | `/block/{index}`  | one full block body (light clients fetch only flagged blocks); **410** when this node has pruned it |
 | GET    | `/proof/{txhash}` | transaction-inclusion merkle proof (SPV)                      |
-| GET    | `/stateproof/{addr}` | proof of an address's balance/nonce vs the header state root |
+| GET    | `/stateproof/{addr}` | proof of an address's balance/nonce vs the header state root — or, for an address with no account, a proof that it holds **nothing** (`found:false`, still verifiable) |
 | GET    | `/snapshot/{height}` | full account state at a height (fast-sync; `/snapshot/latest`) |
 | GET    | `/cfilters`       | compact block filters, paged (light-client scan)              |
 | GET    | `/cfilter/{index}`| one block's compact filter; **410** when the body is pruned (an empty filter would falsely prove absence) |
 | GET    | `/cfheaders`      | the filter-header chain, paged (BIP157-style); **410** below a fast-synced node's snapshot |
 | GET    | `/events`         | Server-Sent Events stream of new blocks / reorgs / mempool txs |
-| GET    | `/metrics`        | Prometheus-format node metrics: height, difficulty, mempool depth/bytes, peers, fees, plus reorgs, orphans, ban scores, hashrate, block intervals, supply, tip age and webhook delivery (36 series) |
+| GET    | `/metrics`        | Prometheus-format node metrics: height, difficulty, mempool depth/bytes, peers, fees, plus reorgs, orphans, ban scores, hashrate, block intervals, supply, tip age, webhook delivery, and the address manager's eclipse-resistance signals (45 series) |
 | GET    | `/webhooks`       | webhook delivery counters (sent / failed / dropped / queued)  |
 | POST   | `/send` 🔒        | `{"to","amount","fee","expiry"?,"lock_until"?,"memo"?,"nonce"?}` — signed by the node wallet |
 | POST   | `/tx` 🔒          | submit a fully-signed transaction (plain / multisig / HTLC / vault / fee-sponsored) |

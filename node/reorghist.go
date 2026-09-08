@@ -46,6 +46,15 @@ type reorgLog struct {
 	entries []Reorg
 	total   uint64 // reorgs ever (the ring may have forgotten some)
 	deepest int
+	// Refusals: reorgs the finality guards declined. These matter more than the
+	// adopted ones and were previously recorded nowhere at all. An adopted reorg
+	// is the system working; a refused one may mean this node has stopped
+	// following the network's chain and — because the same guard will refuse the
+	// same switch every time it is offered — will not start again on its own.
+	refused        uint64
+	refusedDeepest int
+	lastRefused    time.Time
+	lastRefusedWhy string
 }
 
 func newReorgLog() *reorgLog { return &reorgLog{} }
@@ -63,6 +72,17 @@ func (l *reorgLog) record(r Reorg) {
 	}
 }
 
+// noteRefused records a reorg the finality guards declined.
+func (l *reorgLog) noteRefused(depth int, reason string, at time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.refused++
+	if depth > l.refusedDeepest {
+		l.refusedDeepest = depth
+	}
+	l.lastRefused, l.lastRefusedWhy = at, reason
+}
+
 // ReorgReport is the node's reorg history, most recent first, plus the counters
 // the ring cannot hold.
 type ReorgReport struct {
@@ -73,6 +93,14 @@ type ReorgReport struct {
 	Orphans  int     `json:"orphans"`   // blocks currently parked awaiting a parent
 	MaxDepth int     `json:"max_depth"` // the consensus limit a reorg may not exceed
 	Reorgs   []Reorg `json:"reorgs"`
+
+	// Refused reorgs. A non-zero Refused is the strongest signal a node has that
+	// it may be on the wrong side of a split: fork choice wanted to switch and
+	// the finality guard said no.
+	Refused        uint64 `json:"refused"`
+	RefusedDeepest int    `json:"refused_deepest"`
+	RefusedAt      string `json:"refused_at,omitempty"`  // RFC3339, most recent
+	RefusedWhy     string `json:"refused_why,omitempty"` // too_deep | below_checkpoint
 }
 
 // Reorgs returns the reorg history, newest first.
@@ -83,12 +111,18 @@ func (n *Node) Reorgs() ReorgReport {
 		out[len(n.reorgs.entries)-1-i] = r
 	}
 	rep := ReorgReport{
-		Total:    n.reorgs.total,
-		Deepest:  n.reorgs.deepest,
-		Kept:     len(out),
-		Capacity: reorgHistoryCapacity,
-		MaxDepth: core.MaxReorgDepth,
-		Reorgs:   out,
+		Total:          n.reorgs.total,
+		Deepest:        n.reorgs.deepest,
+		Kept:           len(out),
+		Capacity:       reorgHistoryCapacity,
+		MaxDepth:       core.MaxReorgDepth,
+		Reorgs:         out,
+		Refused:        n.reorgs.refused,
+		RefusedDeepest: n.reorgs.refusedDeepest,
+		RefusedWhy:     n.reorgs.lastRefusedWhy,
+	}
+	if !n.reorgs.lastRefused.IsZero() {
+		rep.RefusedAt = n.reorgs.lastRefused.UTC().Format(time.RFC3339)
 	}
 	n.reorgs.mu.Unlock()
 	rep.Orphans = n.orphans.len()
@@ -126,4 +160,19 @@ func (n *Node) noteReorg(disconnected []core.Block, requeued int) {
 		r.SeenSeconds = int64(age.Seconds())
 	}
 	n.reorgs.record(r)
+}
+
+// noteRefusedReorg records — and shouts about — a reorg the finality guards
+// declined. The log line is deliberately at WARN with an explicit `action`: a
+// node in this state looks completely healthy from the outside (it has peers, it
+// has a tip, it is not behind by its own reckoning) while quietly no longer
+// being on the same chain as everyone else.
+func (n *Node) noteRefusedReorg(e *core.ReorgRefusedError) {
+	n.reorgs.noteRefused(e.Depth, e.Reason(), time.Now())
+	Warnf("REFUSED a reorg the fork-choice rule preferred",
+		"reason", e.Reason(),
+		"depth", e.Depth,
+		"fork_height", e.ForkHeight,
+		"impact", "this node may now be on a different chain from its peers, permanently",
+		"action", "compare tips with another node; recovery is a resync from a trusted store")
 }

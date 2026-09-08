@@ -143,7 +143,8 @@ Module `github.com/nexusriot/DNAS/core` — the ledger and consensus rules.
   base-fee/coinbase shape) and `applyTxsAndCoinbase` (state changes), so
   `NextStateRoot(candidate)` can compute a candidate block's resulting state root
   before it is mined.
-- `store.go` — an append-only, length-framed block log. `Open` backs a chain with
+- `store.go` — an append-only, length-framed block log, with `compact` to rewrite
+  it so it matches a pruned chain (atomic: temp file + rename). `Open` backs a chain with
   it so `AddBlock` persists in O(1) and reorgs truncate+append (no whole-file
   rewrite); `Save`/`Load` remain as a JSON import/export snapshot. A reorg whose
   writes fail partway **poisons** the store: the truncate has already discarded
@@ -160,9 +161,13 @@ Module `github.com/nexusriot/DNAS/core` — the ledger and consensus rules.
   so those are reproducible by any implementation (not tied to `encoding/json`).
 - `upgrade.go` — height-activated consensus upgrades: `SetUpgradeHeight` /
   `IsUpgradeActive(name, height)` gate a rule change to a coordinated flag-day.
-  Two are defined: `UpgradeMultiOutput` (multi-recipient transfers) and
-  `UpgradeDustLimit` (the worked example); both are guarded in `checkTxAtHeight`,
-  so the mempool, `Select` and block application enforce them identically.
+  Five are defined: `UpgradeMultiOutput` (multi-recipient transfers),
+  `UpgradeVault` (time-delayed vault spends), `UpgradeFeeSponsor` (a third party
+  paying the fee), `UpgradeCheckedAddresses` (every address a transaction names
+  must be well-formed and checksummed — the only thing that stops a client bug
+  burning coin to a typo) and `UpgradeDustLimit` (the worked example). All are
+  guarded in `checkTxAtHeight`, so the mempool, `Select` and block application
+  enforce them identically.
   `KnownUpgrade`/`Upgrades` let the CLI reject a misspelled name at startup.
 - `work.go` — cumulative proof-of-work (`BlockWork = 2^256/(target+1)`,
   `ChainWork`). Fork choice is greatest cumulative work, with equal-work ties
@@ -196,6 +201,33 @@ Module `github.com/nexusriot/DNAS/core` — the ledger and consensus rules.
   the queue by fee rate (served at `/mempool/stats`) so a sender can see what the
   queue is actually paying rather than only how deep it is. A **fee sponsor** is
   held to every fee it has promised across the pool, not one at a time.
+- `state.go` — the header's **state root**, now the root of the trie below rather
+  than a Merkle fold over the sorted accounts. That is what makes **absence**
+  provable: `ProveAccount` answers for an address with no account, and
+  `VerifyAccountProof` returns `(valid, present)` so a light client can tell
+  "holds nothing" from "I am not showing you this". Still a resident
+  `map[string]Account`, so memory bounds the ledger and the root is rebuilt per
+  call — see ROADMAP §1.
+- `nettime.go` — network-adjusted time: the bounded median of peers' clock
+  offsets, applied to timestamp validation only. Stops one machine's wrong clock
+  isolating it from the chain.
+- `storecodec.go` — the block store's compact binary record format (local, not
+  consensus), with hex fields kept as raw bytes. Reads legacy JSON records too.
+- `trie.go` — a content-addressed, path-compressed **sparse Merkle trie** keyed
+  by the hash of an address: `Trie`, a pluggable `NodeStore`, and `Prove` /
+  `VerifyTrieProof` giving both **membership and absence** proofs. Absence is the
+  capability `state.go`'s sorted-leaf fold cannot offer — a prover who omits a
+  leaf produces a tree a client cannot distinguish from the truth. Updates are
+  O(depth) and every historical root stays readable. The header **does** commit
+  this trie's root (see `state.go`), so its proofs are bound to proof of work.
+  What is not yet done is reading state THROUGH it: `applyBlock` still works on a
+  resident map, so the memory bound and incremental root updates remain open
+  (ROADMAP §1).
+- `prune.go` — `-prune` drops old bodies from memory AND, via compaction, from
+  disk. Because a header-only store cannot rebuild balances, a verified state
+  snapshot is written beside it (`chain.db.state`) and `Open` bootstraps from it
+  like a fast-synced node; a snapshot that does not hash to the header's state
+  root is refused.
 - `uri.go` — `dnas:ADDRESS?amount=…&memo=…&ref=…` payment URIs:
   `BuildPaymentURI` / `ParsePaymentURI` / `IsPaymentURI`. Parsing
   checksum-validates the address, so a URI that survives cannot aim a payment at a
@@ -209,3 +241,10 @@ Module `github.com/nexusriot/DNAS/core` — the ledger and consensus rules.
   genesis) plus the `BaseFeeFor`, `Tips`, and `CoinbaseAmount` fee helpers.
 
 Depends on `wallet` for signature verification and address derivation.
+
+Golden consensus vectors live in `testdata/consensus_vectors.json`, generated and
+verified by `vectors_test.go` (`go test ./core -run TestConsensusVectors -update`
+to regenerate). They pin every consensus-visible value — txids, signing
+preimages, block hashes, state roots, address derivations, the difficulty
+encoding — in a language-neutral form, so a second implementation has something
+to check itself against. See `testdata/README.md`.

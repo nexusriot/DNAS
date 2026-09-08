@@ -28,28 +28,63 @@ sections matter most for "toy → real".
 
 ## 1. Production-grade consensus & state
 
-- **`[L]` On-disk authenticated state trie.** State is an in-RAM `map` hashed into
-  the header state root, so memory bounds the ledger and proofs can only show
-  account *membership*, never *absence* (§21). A Merkle-Patricia or Verkle trie on
-  disk gives O(1)-memory state, incremental root updates, and sorted-tree
-  *non-membership* proofs. This also unblocks the item below.
-- **`[M]` Persist the fast-synced (pruned) chain, and prune the STORE.** A node
-  can now drop old bodies from memory (`-prune`, `core/prune.go`) and reports
-  honestly what it can no longer serve, but the append-only file on disk still
-  holds every block and a restart replays all of it — so pruning bounds resident
-  size, not disk. Wire `SnapshotAt`/`NewFromSnapshot` through the index-based
-  block store with a base offset, so a fast-synced or pruned node restarts
-  without re-downloading and without keeping what it discarded.
+- **`[M]` Read state THROUGH the trie.** *The trie is now the state root; the
+  memory bound is what remains.* The header commits a trie root
+  ([core/trie.go](core/trie.go), [core/state.go](core/state.go)) instead of a
+  Merkle fold over the sorted accounts, which is what makes **absence provable**:
+  a key's position is fixed by the key, so arriving at an empty slot is itself
+  the proof that nothing is there. `/stateproof` therefore answers for an
+  address it has never seen — it used to 404 — and `dnas spv balance` prints
+  "holds NOTHING, proven absent". That closes the light-client hole where a
+  prover could omit a leaf and be indistinguishable from the truth.
+
+  Two of the three original benefits are still open, and both need the same
+  change: `applyBlock` reads and writes a resident `map[string]Account`, so
+  **memory still bounds the ledger**, and the root is rebuilt from the whole
+  account set per call rather than updated incrementally. Threading a state
+  accessor through the application path (~10 functions, ~44 sites) plus a
+  disk-backed `NodeStore` gets both. It is a big, careful refactor of the
+  consensus core and is deliberately not bundled into the fork that landed the
+  root change.
+- ~~**`[M]` Prune the STORE, not just memory.**~~ **Done.** `-prune` bounded a
+  node's resident size while the file kept every original record, so a pruning
+  node still paid full disk for history it had discarded and still replayed all
+  of it on restart. Compaction now rewrites the log to match the pruned chain
+  ([core/store.go](core/store.go)), amortized over `storeCompactInterval` blocks
+  and atomic (temp file + rename).
+
+  The half that makes it correct rather than merely smaller: dropping bodies
+  drops the transactions that produced the balances, so a header-only store
+  cannot rebuild state. A verified **state snapshot** is written beside it
+  (`chain.db.state`) and `Open` bootstraps from it exactly as a fast-synced node
+  does — the snapshot's accounts must hash to the state root in a
+  proof-of-work-covered header, so a corrupt or tampered one is rejected rather
+  than becoming the node's ledger. `dnas db compact -keep N` does it offline,
+  `dnas db verify` reports honestly which heights it could and could not
+  re-check, and `/info`, `/metrics` (`dnas_store_bytes`) expose the size.
+
+  Pruned heights keep a header-only record rather than disappearing: linkage,
+  median-time-past and the retarget all read those headers. So the saving is the
+  size of the transaction bodies — large on a busy chain, near zero on a devnet
+  mining empty blocks.
 - **`[M]` Fetch the filter-header chain during fast sync.** A fast-synced node
   never saw the bodies below its snapshot, so it cannot fold their filter
   commitments and reports `filter_base` above them (410 for anything lower).
   Fetching the chain from a peer during fast-sync — and checking it against a
   checkpoint — would close the one gap where such a node cannot serve a light
   client at all.
-- **`[L]` A second implementation + cross-client consensus vectors.** The canonical
-  codec makes a spec *possible*; only a second client (or, cheaper first step, a
-  golden-vector suite — serialized tx/block/state hex → expected hash/validity)
-  actually *proves* it. One implementation is one implementation, however careful.
+- **`[L]` A second implementation.** *The golden-vector half is done.*
+  [core/testdata/consensus_vectors.json](core/testdata/consensus_vectors.json) is a
+  language-neutral corpus — 24 transactions across all three networks with their
+  signing preimages, canonical encodings, txids, sizes and validity verdicts, plus
+  address and script derivations, the halving schedule, the compact-target
+  encoding, merkle and state roots, header preimages and the fee split. It is
+  generated and verified from [core/vectors_test.go](core/vectors_test.go)
+  (`-update` to regenerate) and documented for implementers in
+  [core/testdata/README.md](core/testdata/README.md). What it cannot do is prove
+  the spec is *right*, only that it has not silently moved: a corpus agrees with
+  whatever produced it. A second client remains the real item, and this is now
+  the first thing it should be run against.
 - **`[M]` Make a failed reorg persist atomic — *the divergence is now contained,
   not yet prevented*.** `reorgLocked` truncates the block store and appends the
   winning suffix *before* swapping the chain in memory
@@ -63,10 +98,20 @@ sections matter most for "toy → real".
   compounding silently. What remains is the *atomic* version — writing the suffix
   to a side region and switching in one step — so a disk error is recoverable
   rather than merely loud.
-- **`[M]` Consensus-checked addresses.** Nothing in consensus validates that `To`
-  is a well-formed, checksummed address, so a buggy client can still burn coins to
-  a typo, and `MaxAddressBytes` is only a length bound on how much junk can become
-  a permanent state key. See the bech32 item in §5.
+- ~~**`[M]` Consensus-checked addresses.**~~ **Done, as a scheduled upgrade.**
+  Consensus validated only that `To` was not absurdly long, so a buggy client
+  could burn coin to a typo and `MaxAddressBytes` merely bounded how much junk
+  became a permanent state key. The `checkedaddresses` upgrade
+  ([core/upgrade.go](core/upgrade.go)) requires every address a transaction names
+  — sender, each recipient, the fee payer — to be well-formed and checksummed.
+  Height-activated like the others, so an existing chain replays unchanged; it
+  cannot recover coin already sent to a malformed address.
+
+  Note what this is *not*: the address FORMAT is unchanged. The security hole was
+  that the existing checksum was never enforced, and that is now closed. Moving
+  to bech32 (§5) is a separate, cosmetic-plus-error-detection change that would
+  invalidate every address string in the project, and is deliberately not bundled
+  into this.
 - **`[M]` BIP9-style miner signaling for upgrades.** `core/upgrade.go` flips rules
   at fixed activation heights, like checkpoints. Version-bits in the block header
   would let hashpower signal readiness and activate on a threshold instead of a
@@ -88,6 +133,25 @@ sections matter most for "toy → real".
   stores would not replay), so it wants an activation height via
   [core/upgrade.go](core/upgrade.go).
 
+- ~~**`[?]` Pick a survivable finality window.**~~ **Done: block time 5s → 60s.**
+  `MaxReorgDepth` was a bare 100 blocks and `TargetBlockTime` was 5 seconds, so
+  the chain tolerated about **eight minutes** of divergence: any partition longer
+  than a coffee break left both halves needing a rollback consensus refuses, and
+  they never reconverged. The deep-reorg guard had turned an attack into a
+  permanent split.
+  
+  The window is now named (`FinalityWindow`, [core/params.go](core/params.go)) and
+  guarded by a test that fails if it drops below 30 minutes. Raising the block
+  time was the cheap lever: unlike raising `MaxReorgDepth` it does not drag
+  `MinPruneKeep` up with it, so pruning nodes are unaffected. At 60s the window
+  is **1h40m** and coinbase maturity becomes 3 minutes. A fast local chain now
+  comes from `-regtest` and `POST /generate`, which is what they are for.
+
+  Still open, and deliberately separate: **coinbase maturity is 3 blocks.** At 60s
+  that is 3 minutes, which passes the "not meaningless" bar but is far below
+  Bitcoin's 100 blocks. Raising it slows every test and demo that mines then
+  spends, so it wants its own decision rather than being folded in here.
+
 ## 2. Networking hardening & reach
 
 - **`[M]` Binary P2P wire format.** Consensus is binary, but the peer envelope
@@ -97,20 +161,40 @@ sections matter most for "toy → real".
 - **`[M]` Compact block relay (BIP152).** Relay short transaction ids plus the
   prefilled coinbase so a peer reconstructs a block from its own mempool. Large
   latency/bandwidth win over shipping full blocks, and it reduces orphan rates.
-- **`[M/L]` Outbound address manager with ASN/group diversity + DNS seeds.**
-  Inbound eclipse caps exist (total + per-/16 group), but outbound peer selection
-  and bootstrap are still manual (`-peers`). A tried/new addrman that buckets by
-  ASN/network group, plus DNS seeds, closes the outbound eclipse vector (§21) and
-  removes hand-configured bootstrapping.
+- ~~**`[M/L]` Outbound address manager + DNS seeds.**~~ **Done, with one caveat.**
+  [node/addrman.go](node/addrman.go) is a tried/new address manager: addresses
+  that completed a handshake are preferred over ones merely gossiped, tables are
+  bucketed and bounded per network group, and — the part that actually matters —
+  **live outbound connections are capped per group** (`maxOutboundPerGroup`, 2 of
+  8 slots). Filling a node's outbound set now needs addresses in four distinct
+  ranges rather than eight addresses anywhere. The tried table persists across
+  restarts (`addrs.json`), so a node does not re-trust gossip on every start, and
+  `/info` plus five `dnas_addr*`/`dnas_outbound*` metrics make the current
+  diversity observable. `-dnsseeds` bootstraps from A/AAAA records when the node
+  is short of peers ([node/dnsseed.go](node/dnsseed.go)); seed results get no
+  special standing and are subject to the same cap.
+
+  The caveat, restated because it is the honest limit: bucketing is by **/16, not
+  by ASN**. Two ranges can share an operator, so this raises the cost of an
+  eclipse rather than settling it. Real ASN diversity needs routing data this
+  project has no business shipping.
 - **`[M]` Authenticated / Tor-friendly transport.** The open handshake is anonymous
   and has no MITM authentication (§21). Optional peer-key pinning, an onion
   transport, and NAT traversal would harden and widen reach without giving up the
   permissionless default. Peer-key pinning now has something to pin: a node's
   identity is a stable key of its own ([node/identity.go](node/identity.go))
   rather than its wallet key.
-- **`[M]` Network-adjusted time.** Timestamp checks use the local clock; a
-  median-of-peers offset (bounded, bitcoind-style) resists a node with a skewed
-  clock being fooled on MTP/timestamp rules.
+- ~~**`[M]` Network-adjusted time.**~~ **Done.** Timestamp validation read the
+  local clock, which made one machine's wrong clock that machine's consensus
+  problem: an hour behind and it rejects every block the network produces; an
+  hour ahead and it mines on a tip its peers refuse. Peers now report their clock
+  at handshake, and the node applies the **median** of those offsets, **bounded**
+  to `MaxTimeOffset` (70 min), for validation only ([core/nettime.go](core/nettime.go),
+  [node/nettime.go](node/nettime.go)). The median resists a lying minority, the
+  bound resists a lying majority, a single peer is ignored outright, and the
+  system clock is never touched. A standing offset over a minute is logged at
+  WARN with the fix, because the adjustment keeps the node on the chain while the
+  machine still needs correcting.
 - **`[M]` Windowed, scored block download.** Ranged requests are now tracked,
   timed out and spread across a few peers, with out-of-order arrivals buffered
   ([node/sync.go](node/sync.go)) — but the window is fixed, peers are not scored on
@@ -218,8 +302,40 @@ sections matter most for "toy → real".
 
 ## 6. Ops, tooling & observability
 
+- ~~**`[S]` Surface refused reorgs.**~~ **Done.** A reorg the finality guards
+  declined was returned as a bare error, discarded at the call site and counted
+  nowhere — so the single most consequential thing a node can do quietly (stop
+  following what may be the network's chain, permanently, because the same guard
+  refuses the same switch every time) was invisible. It is now a typed
+  `core.ReorgRefusedError`, counted with a high-water depth and a reason, logged
+  at WARN with an explicit `action`, reported by `/reorgs`, exported as
+  `dnas_reorgs_refused_total`, and — the part that matters — made a `/health`
+  failure reason. Nothing else in that check would have noticed: a diverged node
+  has peers, a fresh tip, and by its own reckoning is not behind.
+- ~~**`[M]` Move store compaction off the hot path.**~~ **Done.** Compaction is
+  O(whole store), and the first version ran it inside the chain's write lock on
+  the block-application path — so on a pruning node every 128th block froze the
+  miner, every API read and every peer handler for the length of a full file
+  rewrite (measured: 49ms on a 198 KB store, growing with the file). It is now
+  three phases ([core/store.go](core/store.go), [core/prune.go](core/prune.go)):
+  snapshot under a read lock, stage the rewrite with **no lock held**, then swap
+  under the write lock after appending whatever blocks arrived meanwhile. A reorg
+  mid-rewrite discards the staged file and leaves the request pending. Measured
+  after: worst append 20.5ms against a 24.5ms no-pruning baseline — the spike is
+  gone, and what remains is the disk's own fsync cost.
+- ~~**`[S]` Binary block bodies on disk.**~~ **Done.** Records were the block's
+  JSON, which stores every hash, key and signature as hex TEXT — a 32-byte key
+  in 64 bytes, a 64-byte signature in 128. Records are now a compact binary
+  encoding ([core/storecodec.go](core/storecodec.go)) behind one
+  encode/decode pair, with hex fields kept as raw bytes. A JSON record begins
+  with `{` and a binary one with its version tag, so **an older store still
+  loads** without guessing. Measured on a 200-transaction block: **79% of the
+  JSON size, and decode 5.1x faster** (104µs vs 530µs) — which is what startup
+  actually pays, since every record is parsed on open. It is explicitly not the
+  consensus codec: these records are local, never hashed and never sent to a
+  peer.
 - **`[S]` A Grafana dashboard for the Prometheus metrics.** The metrics themselves
-  are now complete: `GET /metrics` ([api/api.go](api/api.go)) exports 36 series —
+  are now complete: `GET /metrics` ([api/api.go](api/api.go)) exports 45 series —
   height, difficulty, mempool depth *and bytes*, peer count, relay floor, base
   fee, mining flag and the share ledger as before, plus everything that used to be
   JSON-only: reorg totals and depth ([node/reorghist.go](node/reorghist.go)),

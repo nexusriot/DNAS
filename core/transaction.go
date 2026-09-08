@@ -655,3 +655,38 @@ func (t *Transaction) SignHTLCRefund(w *wallet.Wallet) {
 	t.Preimage = ""
 	t.Signature = w.Sign(t.signingBytes())
 }
+
+// checkTxAddresses validates every address a transaction names. Gated by
+// UpgradeCheckedAddresses (see checkTxAtHeight); before that height it is not
+// called at all, so an existing chain replays unchanged.
+//
+// The sender is checked as well as the recipients. A malformed sender cannot
+// actually spend — its signature would have to verify against an address derived
+// from the key, which it cannot — but leaving it unchecked means a transaction
+// that can never be valid still occupies a mempool slot and a relay round.
+func checkTxAddresses(tx Transaction) error {
+	// The coinbase names CoinbaseSender, which is deliberately not an address.
+	// CheckTxSanity rejects coinbases before this is reached; block application
+	// checks the coinbase recipient separately.
+	if !tx.IsCoinbase() {
+		if err := wallet.ValidateAddress(tx.From); err != nil {
+			return fmt.Errorf("sender address: %w", err)
+		}
+	}
+	for _, o := range tx.outputs() {
+		// An issuance has no recipient at all, so an empty To is legitimate there
+		// and only there.
+		if o.To == "" && tx.IsIssue() {
+			continue
+		}
+		if err := wallet.ValidateAddress(o.To); err != nil {
+			return fmt.Errorf("recipient address %q: %w", o.To, err)
+		}
+	}
+	if tx.FeePayer != "" {
+		if err := wallet.ValidateAddress(tx.FeePayer); err != nil {
+			return fmt.Errorf("fee payer address: %w", err)
+		}
+	}
+	return nil
+}

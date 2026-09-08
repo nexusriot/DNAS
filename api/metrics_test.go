@@ -90,6 +90,15 @@ func TestMetricsExposesNodeCounters(t *testing.T) {
 		"dnas_webhook_failed",
 		"dnas_webhook_dropped",
 		"dnas_webhook_queued",
+		"dnas_addrs_new",
+		"dnas_addrs_tried",
+		"dnas_addr_groups",
+		"dnas_outbound_groups",
+		"dnas_outbound_dialed",
+		"dnas_reorgs_refused_total",
+		"dnas_reorg_refused_deepest",
+		"dnas_store_bytes",
+		"dnas_store_bytes_saved",
 	} {
 		if _, ok := vals[name]; !ok {
 			t.Errorf("metric %s is missing from /metrics", name)
@@ -158,5 +167,25 @@ func TestMetricsReflectChainState(t *testing.T) {
 	}
 	if after["dnas_ban_threshold"] <= 0 {
 		t.Error("ban threshold should be exported as its real value, not zero")
+	}
+}
+
+// /reorgs must expose the refusal counters, not only the adopted ones. Whether a
+// refusal actually flips /health is asserted in the node package
+// (TestRefusedReorgIsCountedAndReported), which can drive a refusal directly;
+// from out here the interesting thing is that the fields exist and are wired to
+// the same report rather than defaulting silently.
+func TestReorgsEndpointExposesRefusalCounters(t *testing.T) {
+	srv, _, _ := testServer(t)
+	rep := getObj(t, srv.URL+"/reorgs")
+	for _, field := range []string{"refused", "refused_deepest", "total", "deepest", "max_depth"} {
+		if _, ok := rep[field]; !ok {
+			t.Errorf("/reorgs is missing %q", field)
+		}
+	}
+	// A fresh node has refused nothing, and must say so as a number rather than
+	// omitting the field — a missing counter reads as "no data", not "zero".
+	if got, ok := rep["refused"].(float64); !ok || got != 0 {
+		t.Errorf("refused = %v on a fresh node, want 0", rep["refused"])
 	}
 }

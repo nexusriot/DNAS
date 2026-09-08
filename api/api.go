@@ -291,16 +291,23 @@ func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 		"min_relay_fee":   s.node.Mempool().MinFee(),
 		"base_fee":        s.node.Chain().NextBaseFee(),
 		"peers":           s.node.PeerAddrs(),
-		"mining":          s.node.Mining(),
-		"address_index":   s.node.Chain().AddressIndexed(),
-		"faucet":          s.node.FaucetEnabled(),
-		"webhooks":        s.node.WebhooksEnabled(),
+		// The address manager's tables, so an operator can see how eclipse-
+		// resistant this node currently is rather than only how many peers it has.
+		"addrs":         s.node.AddrStats(),
+		"mining":        s.node.Mining(),
+		"address_index": s.node.Chain().AddressIndexed(),
+		"faucet":        s.node.FaucetEnabled(),
+		"webhooks":      s.node.WebhooksEnabled(),
 		// What this node can actually serve, so a client can tell "not in the
 		// chain" from "not visible from here": the lowest height whose body it
 		// holds, and where its filter-header chain starts.
-		"body_height":   s.node.Chain().BodyHeight(),
-		"filter_base":   s.node.Chain().FilterHeaderBase(),
-		"pruned":        s.node.Chain().PruneKeep() > 0,
+		"body_height": s.node.Chain().BodyHeight(),
+		"filter_base": s.node.Chain().FilterHeaderBase(),
+		"pruned":      s.node.Chain().PruneKeep() > 0,
+		// What the chain costs on disk, and how much pruning has reclaimed. A
+		// pruning node used to bound only its resident size while the file kept
+		// growing; this is how an operator sees whether that is still happening.
+		"store":         s.node.Chain().StoreStats(),
 		"prune_keep":    s.node.Chain().PruneKeep(),
 		"pruned_bodies": s.node.Chain().PrunedCount(),
 	})
@@ -569,6 +576,15 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	gauge("dnas_min_relay_fee", "Current dynamic minimum relay fee (base units per byte).", s.node.Mempool().MinFee())
 	gauge("dnas_base_fee", "Current EIP-1559 base fee for the next block (base units per byte).", s.node.Chain().NextBaseFee())
 	gauge("dnas_peers", "Connected peers.", len(s.node.PeerAddrs()))
+	// Eclipse-resistance signals. dnas_outbound_groups is the one to alert on: a
+	// node whose outbound peers all sit in one network group is cheap to eclipse
+	// however many peers it appears to have.
+	as := s.node.AddrStats()
+	gauge("dnas_addrs_new", "Addresses heard about but never connected to.", as.New)
+	gauge("dnas_addrs_tried", "Addresses that have completed a handshake.", as.Tried)
+	gauge("dnas_addr_groups", "Distinct network groups among known addresses.", as.Groups)
+	gauge("dnas_outbound_groups", "Distinct network groups among CURRENT outbound peers.", as.LiveGroups)
+	gauge("dnas_outbound_dialed", "Outbound dial loops currently held.", as.OutboundDialed)
 	gauge("dnas_mining", "1 if mining is active, else 0.", mining)
 	shares := s.node.Shares()
 	gauge("dnas_shares_submitted", "Mining shares submitted to this node.", shares.Submitted)
@@ -589,6 +605,10 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	// Reorgs and orphans: the shape of the disagreement this node is seeing.
 	reorgs := s.node.Reorgs()
 	counter("dnas_reorgs_total", "Chain reorganizations since this node started.", reorgs.Total)
+	// The alert-worthy one: fork choice preferred a chain and the finality guard
+	// refused it. Non-zero means this node may have stopped converging.
+	counter("dnas_reorgs_refused_total", "Reorgs refused by the finality guards (too deep, or below a checkpoint).", reorgs.Refused)
+	gauge("dnas_reorg_refused_deepest", "Deepest refused reorg, in blocks.", reorgs.RefusedDeepest)
 	gauge("dnas_reorg_deepest", "Deepest reorg this node has seen, in blocks.", reorgs.Deepest)
 	gauge("dnas_orphan_blocks", "Blocks parked awaiting a parent.", reorgs.Orphans)
 
@@ -634,6 +654,12 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	// pool actually exhausts first.
 	gauge("dnas_mempool_bytes", "Total serialized size of the pending queue.", s.node.Mempool().Bytes())
 	gauge("dnas_mempool_max_bytes", "The pending queue's byte budget.", s.node.Mempool().MaxBytes())
+
+	// On-disk chain size. A pruning node bounds its memory; without this there is
+	// no way to see whether it is bounding its disk too.
+	ss := s.node.Chain().StoreStats()
+	gauge("dnas_store_bytes", "Size of the on-disk block store.", ss.Bytes)
+	gauge("dnas_store_bytes_saved", "Bytes reclaimed by store compaction since start.", ss.BytesSaved)
 
 	// Webhook delivery, which is otherwise invisible: a silently failing receiver
 	// looks exactly like a quiet chain.
@@ -1055,6 +1081,15 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	if behind > 0 {
 		reasons = append(reasons, fmt.Sprintf("%d block(s) behind the best known height", behind))
 	}
+	// A refused reorg means fork choice wanted to switch chains and the finality
+	// guard declined. The node is running fine; it may simply no longer be on the
+	// network's chain, and nothing else in this check would notice — it has peers,
+	// it has a fresh tip, and by its own reckoning it is not behind.
+	if rr := s.node.Reorgs(); rr.Refused > 0 {
+		reasons = append(reasons, fmt.Sprintf(
+			"refused %d reorg(s) (deepest %d, last: %s) — this node may be on a diverged chain",
+			rr.Refused, rr.RefusedDeepest, rr.RefusedWhy))
+	}
 	if tip.Index == 0 {
 		reasons = append(reasons, "chain is at genesis")
 	} else if age > staleTipAfter {
@@ -1471,10 +1506,11 @@ func (s *Server) cfheaders(w http.ResponseWriter, r *http.Request) {
 // addresses return 404 (a plain merkle tree can't prove non-membership).
 func (s *Server) stateProof(w http.ResponseWriter, r *http.Request) {
 	addr := strings.TrimPrefix(r.URL.Path, "/stateproof/")
-	p, ok := s.node.Chain().ProveAccount(addr)
-	if !ok {
-		writeErr(w, http.StatusNotFound, "address has no account (cannot prove the balance of an absent address)")
-		return
-	}
+	// An address with no account used to be a 404: the old Merkle-fold state root
+	// could prove membership and nothing else, so there was nothing truthful to
+	// return. The state trie proves ABSENCE too, and that is the answer a client
+	// actually needs to reject a forged "you were never paid" — so it is served
+	// as a proof (found=false) rather than an error.
+	p, _ := s.node.Chain().ProveAccount(addr)
 	writeJSON(w, http.StatusOK, p)
 }

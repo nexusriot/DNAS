@@ -408,8 +408,8 @@ func spvHistory(base, addr string) error {
 		sign(net), core.FormatAmount(abs(net)))
 
 	// Cross-check the reconstructed net against a trustless state-root proof.
-	if p, err := fetchStateProof(base, addr); err == nil && p.Found && int(p.BlockIndex) < len(headers) {
-		if core.VerifyAccountProof(p, headers[p.BlockIndex].StateRoot) {
+	if p, err := fetchStateProof(base, addr); err == nil && int(p.BlockIndex) < len(headers) {
+		if valid, present := core.VerifyAccountProof(p, headers[p.BlockIndex].StateRoot); valid && present {
 			fmt.Printf("  state proof: balance %s (verified against the header state root)\n", core.FormatAmount(p.Account.Balance))
 		}
 	}
@@ -457,8 +457,17 @@ func spvBalance(base, addr string) error {
 	if p.StateRoot != hdr.StateRoot {
 		return fmt.Errorf("proof state root does not match the verified header")
 	}
-	if !core.VerifyAccountProof(p, hdr.StateRoot) {
+	valid, present := core.VerifyAccountProof(p, hdr.StateRoot)
+	if !valid {
 		return fmt.Errorf("state proof does not fold to the header's state root")
+	}
+	// An absence proof is a RESULT, not a failure. The trie's key position is
+	// fixed by the address, so "nothing is here" is provable — which is what
+	// lets a client reject a claim that a payment never happened.
+	if !present {
+		fmt.Printf("✓ proven against a %d-header PoW chain (state committed in block %d)\n", len(headers), p.BlockIndex)
+		fmt.Printf("  %s\n  holds NOTHING — proven absent from the account state\n", addr)
+		return nil
 	}
 	fmt.Printf("✓ proven against a %d-header PoW chain (state committed in block %d)\n", len(headers), p.BlockIndex)
 	fmt.Printf("  %s\n  balance %s  nonce %d\n", addr, core.FormatAmount(p.Account.Balance), p.Account.Nonce)

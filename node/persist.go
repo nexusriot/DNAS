@@ -8,6 +8,7 @@ import (
 	"sort"
 
 	"github.com/nexusriot/DNAS/core"
+	"time"
 )
 
 // Files holding a node's soft state alongside its block store. Unlike the chain
@@ -16,6 +17,7 @@ import (
 // across a restart instead of starting cold each time.
 const (
 	peersFile   = "peers.json"
+	addrsFile   = "addrs.json"
 	bansFile    = "bans.json"
 	mempoolFile = "mempool.json"
 )
@@ -32,7 +34,19 @@ func (n *Node) loadState() {
 	if readJSONFile(n.statePath(peersFile), &peers) == nil {
 		for _, a := range peers {
 			n.book.note(a)
+			n.addrs.Add(a, "peers.json")
 		}
+	}
+	// The address manager's own table, which peers.json cannot express: it says
+	// which addresses actually completed a handshake. That `tried` set is this
+	// node's hard-won evidence about who is real, and starting cold without it
+	// means trusting gossip again on every restart. peers.json is still read
+	// above so a store written by an older build still loads.
+	var addrs []addrEntry
+	if readJSONFile(n.statePath(addrsFile), &addrs) == nil && len(addrs) > 0 {
+		n.addrs.Restore(addrs)
+		newCount, triedCount := n.addrs.Size()
+		Infof("restored known addresses", "new", newCount, "tried", triedCount)
 	}
 	var bans map[string]int
 	if readJSONFile(n.statePath(bansFile), &bans) == nil && len(bans) > 0 {
@@ -70,6 +84,7 @@ func (n *Node) saveState() {
 		return
 	}
 	writeJSONFile(n.statePath(peersFile), n.book.all())
+	writeJSONFile(n.statePath(addrsFile), n.addrs.Snapshot())
 	writeJSONFile(n.statePath(bansFile), n.bans.snapshot())
 	writeJSONFile(n.statePath(mempoolFile), n.mempool.All())
 }
@@ -96,5 +111,42 @@ func writeJSONFile(path string, v any) {
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		log.Printf("persist %s: %v", filepath.Base(path), err)
+	}
+}
+
+// compactInterval is how often the node checks whether the block store wants
+// rewriting. Slow, because the answer is almost always no and the work is
+// I/O-heavy when it is yes.
+const compactInterval = 30 * time.Second
+
+// compactLoop rewrites the block store off the block-application path.
+//
+// Pruning marks the store as due (core.Blockchain.CompactionDue); the rewrite
+// itself is O(whole store), so doing it inline froze the node — the miner, every
+// API read and every peer handler — for its duration. Here it runs on its own
+// schedule, and core does the expensive phase with no chain lock held.
+func (n *Node) compactLoop() {
+	t := time.NewTicker(compactInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-n.quit:
+			return
+		case <-t.C:
+			if !n.chain.CompactionDue() {
+				continue
+			}
+			before := n.chain.StoreStats().Bytes
+			if err := n.chain.CompactStore(); err != nil {
+				// Not fatal: memory is authoritative and an oversized file is a
+				// disk problem. A reorg mid-rewrite lands here too, and simply
+				// leaves the request pending for the next tick.
+				Debugf("store compaction deferred", "err", err)
+				continue
+			}
+			st := n.chain.StoreStats()
+			Infof("block store compacted",
+				"bytes", st.Bytes, "reclaimed", before-st.Bytes, "bodies_from", n.chain.BodyHeight())
+		}
 	}
 }

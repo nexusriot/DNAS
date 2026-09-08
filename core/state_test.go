@@ -56,22 +56,39 @@ func TestAccountProofVerifies(t *testing.T) {
 	if p.Account.Balance != 5*Coin {
 		t.Fatalf("proven balance = %d, want %d", p.Account.Balance, 5*Coin)
 	}
-	if !VerifyAccountProof(p, tip.StateRoot) {
-		t.Fatal("valid proof should verify against the tip's state root")
+	if valid, present := VerifyAccountProof(p, tip.StateRoot); !valid || !present {
+		t.Fatalf("valid proof should verify: valid=%v present=%v", valid, present)
 	}
 	// A wrong root must not verify.
-	if VerifyAccountProof(p, "deadbeef") {
+	if valid, _ := VerifyAccountProof(p, "deadbeef"); valid {
 		t.Fatal("proof must not verify against a wrong root")
 	}
 	// A tampered balance must not verify (the leaf no longer matches).
 	bad := p
 	bad.Account.Balance = 999 * Coin
-	if VerifyAccountProof(bad, tip.StateRoot) {
+	if valid, _ := VerifyAccountProof(bad, tip.StateRoot); valid {
 		t.Fatal("a tampered balance must not verify")
 	}
-	// An absent address is not provable (membership tree, no non-membership proof).
+	// An absent address is now PROVABLY absent. This is the capability the old
+	// sorted-leaf state root could not offer: a prover who omitted a leaf produced
+	// a tree indistinguishable from the truth, so "holds nothing" and "I am not
+	// showing you this" looked the same. A light client needs to tell them apart
+	// to reject a forged "you were never paid".
 	stranger, _ := wallet.New()
-	if _, ok := bc.ProveAccount(stranger.Address()); ok {
-		t.Fatal("an address with no account must be unprovable (found=false)")
+	absent, present := bc.ProveAccount(stranger.Address())
+	if present {
+		t.Fatal("a stranger should not be reported as present")
+	}
+	valid, gotPresent := VerifyAccountProof(absent, tip.StateRoot)
+	if !valid {
+		t.Fatal("an absence proof must verify against the tip's state root")
+	}
+	if gotPresent {
+		t.Fatal("the verifier reported an absent address as present")
+	}
+	// And it must not verify against a different root, or it proves nothing about
+	// the chain the client actually followed.
+	if valid, _ := VerifyAccountProof(absent, "deadbeef"); valid {
+		t.Fatal("an absence proof verified against a wrong root")
 	}
 }

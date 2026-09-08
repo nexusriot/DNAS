@@ -87,6 +87,14 @@ func (pb *peerbook) shouldDial(addr string) bool {
 	return true
 }
 
+// dialCount reports how many outbound dial loops are currently held, so the
+// address manager knows how many slots are still free to fill.
+func (pb *peerbook) dialCount() int {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+	return len(pb.dialing)
+}
+
 // all returns a snapshot of every known peer address.
 func (pb *peerbook) all() []string {
 	pb.mu.Lock()

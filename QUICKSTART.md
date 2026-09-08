@@ -93,7 +93,9 @@ dnas node -listen :3000 -api :8080 -mine
 On first run it creates `wallet.json` (your keys) and `chain.db` (the append-only
 chain) in the current directory. `-mine` starts mining; the block reward
 (50 DNAS, halving every 210 000 blocks) is paid to this node's wallet. A block
-is produced roughly every few seconds, so your balance climbs by 50 DNAS/block.
+is targeted every 60 seconds, so a mainnet node climbs by 50 DNAS a minute. For
+a chain that moves as fast as you can type, use `-regtest` and `POST /generate`
+(§8d) rather than waiting on the real interval.
 
 Each reward is **immature** until 3 more blocks are mined on top of it (coinbase
 maturity), so it can't be spent immediately — `/balance` shows the full balance
@@ -232,14 +234,35 @@ headers-first, and gossip blocks and transactions. Peer **discovery** means a
 node seeded with just one peer learns the rest of the network automatically.
 Coins mined or received on one node appear on all of them once they sync.
 
+**Who a node connects OUT to** is chosen by an address manager, not first-come.
+Addresses that have completed a handshake are preferred over ones merely
+gossiped, and no more than two live outbound peers may share a network group
+(a /16) — so filling a node's eight outbound slots takes addresses in four
+distinct ranges rather than eight addresses from one. That is the outbound
+eclipse defence; `curl -s localhost:8080/info | jq .addrs` shows how diverse
+this node's connections currently are.
+
+**Bootstrapping without knowing anyone** uses `-dnsseeds`: hostnames whose
+A/AAAA records list nodes to try. They are consulted only when the node is
+short of addresses of its own, and their results get no special standing — a
+single seed that returned only its own nodes would be an eclipse, so give more
+than one:
+
+```sh
+dnas node -dnsseeds seed1.example.org,seed2.example.org
+```
+
+There are no hosted DNAS seeds; run your own (any DNS zone will do) or keep
+using `-peers`.
+
 Useful node flags: `-network` (`mainnet`, `testnet` or `regtest` — separate
 chains, see §8c2), `-advertise` (address peers should dial you at, for
 multi-host), `-maxpeers`, `-mempool`, `-minrelayfee` (base relay fee in base units
 **per byte**; 0 disables the floor), `-checkpoints height:hash,…` (pin finality
 checkpoints), `-upgrades name:height,…` (schedule consensus upgrades — set the
 same values on every node), `-addrindex` (serve address history),
-`-faucet` (hand out coin on a throwaway network), `-wallet FILE`, `-db FILE`,
-`-netkey KEY`.
+`-faucet` (hand out coin on a throwaway network), `-dnsseeds host,host` (bootstrap
+from DNS when short of peers), `-wallet FILE`, `-db FILE`, `-netkey KEY`.
 
 Peers must be on the **same network**: the network's id is part of the handshake,
 so nodes on different ones disconnect immediately instead of trying (and failing)
@@ -379,12 +402,18 @@ dnas node -upgrades multioutput:1000     # accepted from block 1000 onwards
 ```
 
 The same applies to every upgrade this build knows: `dustlimit`, `multioutput`,
-`vault` (§8d6) and `feesponsor` (§8d5). Pass them together, and identically, on
-every node:
+`vault` (§8d6), `feesponsor` (§8d5) and `checkedaddresses`. Pass them together,
+and identically, on every node:
 
 ```sh
-dnas node -upgrades multioutput:1000,vault:1000,feesponsor:1000
+dnas node -upgrades multioutput:1000,vault:1000,feesponsor:1000,checkedaddresses:1000
 ```
+
+`checkedaddresses` is the one worth scheduling on any chain you care about: until
+it activates, consensus checks only that an address is not absurdly long, so a
+buggy client can burn coin to a typo that happens to be the right length. Once
+active, every address a transaction names must carry a valid checksum. It cannot
+recover coin already sent to a malformed address — only stop the next one.
 
 A misspelled name is refused at startup rather than silently never activating —
 which, on a network where the others did activate, would mean being forked off
@@ -419,7 +448,7 @@ appeared or vanished some other way.
 
 `node.json` keys mirror the flags, e.g. `{"listen":":3000","api":":8080","mine":true,"maxpeers":8}`.
 
-`/metrics` is a plain Prometheus scrape target — 36 gauges and counters covering
+`/metrics` is a plain Prometheus scrape target — 45 gauges and counters covering
 the chain (height, difficulty, hashrate, block intervals), the mempool (count and
 bytes), peers (count, ban scores, the threshold), the reorgs and orphans this node
 has seen, supply, tip age and blocks-behind, the share ledger, and webhook
@@ -685,8 +714,30 @@ and the last few bodies:
 
 ```sh
 dnas node -prune 1000 -api :8080 &      # keep 1000 recent bodies
-curl -s localhost:8080/info | jq '{pruned, prune_keep, body_height, pruned_bodies}'
+curl -s localhost:8080/info | jq '{pruned, body_height, store}'
 ```
+
+Pruning bounds **disk** as well as memory: the on-disk log is rewritten in the
+background to match the pruned chain, and `store.bytes` / `store.bytes_saved` in
+`/info` (or `dnas_store_bytes` in `/metrics`) show it happening. To reclaim space
+on a store that has already grown, do it offline with the node stopped:
+
+```sh
+dnas db compact -db chain.db -keep 1000
+```
+
+Two things are worth knowing about what that leaves behind. Pruned heights keep a
+**header-only** record rather than disappearing — linkage, median-time-past and
+the difficulty retarget all read those headers — so the space reclaimed is the
+size of the transaction bodies, which on a chain of empty blocks is close to
+nothing. And because the bodies are gone, the balances cannot be recomputed from
+headers, so a verified **state snapshot** is written beside the store
+(`chain.db.state`). Keep the two together: the snapshot is checked against the
+state root committed in a proof-of-work header when the node restarts, and
+without it a pruned store will refuse to open rather than guess.
+
+`dnas db verify` on a pruned store says which heights it could actually re-check
+rather than claiming a clean bill on blocks it cannot read.
 
 The floor is 132 — above `MaxReorgDepth`, because a reorg replays the bodies it
 disconnects, and a node that cannot reorg is not a node. A smaller `-prune` is

@@ -27,6 +27,7 @@ type effectiveConfig struct {
 	Advertise   string
 	API         string
 	Peers       []string
+	DNSSeeds    []string
 	NetKey      string
 	MaxPeers    int
 	Wallet      string
@@ -80,6 +81,7 @@ func printEffectiveConfig(c effectiveConfig) {
 	row("advertise", advertise)
 	row("api", c.API)
 	row("peers", list(c.Peers))
+	row("dnsseeds", list(c.DNSSeeds))
 	row("netkey", netkey)
 	row("maxpeers", c.MaxPeers)
 	fmt.Println()

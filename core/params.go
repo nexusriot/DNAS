@@ -26,12 +26,33 @@ const (
 	// 256-bit target in compact form (see target.go), retargeted every block by an
 	// LWMA toward this spacing. Only the easy side is clamped (to PowLimit), so
 	// difficulty rises without bound to match whatever hashpower shows up.
-	TargetBlockTime int64 = 5
+	// It is 60 rather than the 5 it was for most of this project's life. Five
+	// seconds is a devnet setting: with MaxReorgDepth at 100 it made the
+	// FinalityWindow below about eight minutes, so any partition longer than a
+	// coffee break split the network permanently (see FinalityWindow). Raising
+	// the block time was the cheap lever — unlike raising MaxReorgDepth it does
+	// not drag MinPruneKeep up with it, so pruning nodes are unaffected. A fast
+	// local chain now comes from -regtest and POST /generate, which is what they
+	// are for.
+	TargetBlockTime int64 = 60
 
 	// CoinbaseMaturity is how many blocks a coinbase reward must age before the
 	// miner can spend it. This protects against spending a reward that a reorg
 	// later removes. (Bitcoin uses 100; kept small here for a lively devnet.)
 	CoinbaseMaturity = 3
+
+	// FinalityWindow is how much WALL-CLOCK divergence the chain tolerates before
+	// two halves of a partition can no longer reconverge. It is the number that
+	// actually matters, and for a long time it was implicit: MaxReorgDepth was a
+	// bare 100 blocks, and at a 5-second block time that is about eight minutes.
+	// A partition lasting longer than that leaves both sides needing a rollback
+	// consensus refuses — so they never reconverge, and the deep-reorg guard has
+	// converted an attack into a permanent split.
+	//
+	// Naming the window makes the trade-off explicit and checkable (see
+	// TestFinalityWindowIsSurvivable): raise it and partitions heal but finality
+	// weakens and pruning must retain more bodies; lower it and the reverse.
+	FinalityWindow int64 = int64(MaxReorgDepth) * TargetBlockTime
 
 	// MaxReorgDepth bounds how many already-committed blocks a reorg may discard.
 	// A competing chain that forks deeper than this is refused — those blocks are

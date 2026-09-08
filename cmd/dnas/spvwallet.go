@@ -246,12 +246,18 @@ func provenAccount(base, addr string) (core.Account, error) {
 	if err != nil {
 		return core.Account{}, err
 	}
-	if !p.Found {
-		return core.Account{}, nil
+	if p.BlockIndex >= uint64(len(headers)) || p.StateRoot != headers[p.BlockIndex].StateRoot {
+		return core.Account{}, fmt.Errorf("state proof does not reference a verified header")
 	}
-	if p.BlockIndex >= uint64(len(headers)) || p.StateRoot != headers[p.BlockIndex].StateRoot ||
-		!core.VerifyAccountProof(p, headers[p.BlockIndex].StateRoot) {
+	valid, present := core.VerifyAccountProof(p, headers[p.BlockIndex].StateRoot)
+	if !valid {
 		return core.Account{}, fmt.Errorf("state proof does not fold to a verified header")
+	}
+	// A proven-absent address is an empty account, and now it is PROVEN empty
+	// rather than assumed: before, an unfound address was taken on the node's
+	// word because the old proof could not speak about absence at all.
+	if !present {
+		return core.Account{}, nil
 	}
 	return p.Account, nil
 }

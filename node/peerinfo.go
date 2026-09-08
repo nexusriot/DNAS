@@ -146,12 +146,51 @@ func (n *Node) AddPeer(addr string) error {
 		return fmt.Errorf("already connected to %s", addr)
 	}
 	n.book.note(addr)
+	// An operator asking for this peer by hand is a stronger signal than gossip,
+	// so it goes straight into the addrman — but it still takes a reservation,
+	// because the per-group cap is a safety property and not a suggestion.
+	n.addrs.Add(addr, "api")
+	if !n.addrs.Reserve(addr) {
+		return fmt.Errorf("not dialing %s: its network group already holds %d outbound peers",
+			addr, maxOutboundPerGroup)
+	}
 	if !n.book.shouldDial(addr) {
+		n.addrs.Release(addr)
 		return fmt.Errorf("not dialing %s: already dialing it, or the outbound cap of %d is reached",
 			addr, n.cfg.MaxPeers)
 	}
 	go n.dialLoop(addr)
 	return nil
+}
+
+// AddrStats reports the address manager's tables, so the eclipse defence is
+// observable rather than merely present: a node whose `tried` set is tiny, or
+// whose addresses all sit in one group, is a node that is cheap to eclipse.
+type AddrStats struct {
+	New    int `json:"new"`    // addresses heard about but never connected to
+	Tried  int `json:"tried"`  // addresses that completed a handshake
+	Groups int `json:"groups"` // distinct network groups known
+	// LiveGroups is how many distinct groups the CURRENT outbound peers occupy.
+	// This is the number that matters: outbound peers in one group is the
+	// eclipse, however many addresses the tables hold.
+	LiveGroups     int `json:"live_groups"`
+	MaxPerGroup    int `json:"max_outbound_per_group"`
+	OutboundDialed int `json:"outbound_dialed"`
+}
+
+// AddrStats returns a snapshot of the address manager.
+func (n *Node) AddrStats() AddrStats {
+	newN, tried := n.addrs.Size()
+	groups := map[string]bool{}
+	for _, e := range n.addrs.Snapshot() {
+		groups[e.Group] = true
+	}
+	return AddrStats{
+		New: newN, Tried: tried, Groups: len(groups),
+		LiveGroups:     n.addrs.LiveGroupCount(),
+		MaxPerGroup:    maxOutboundPerGroup,
+		OutboundDialed: n.book.dialCount(),
+	}
 }
 
 // DropPeer closes the connection to a peer, matched by advertised address or by

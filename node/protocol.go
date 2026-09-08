@@ -94,6 +94,11 @@ type Message struct {
 	// signatures, so they disconnect here rather than failing to converge later.
 	// An empty value comes from a pre-network peer and is read as mainnet.
 	Network string `json:"network,omitempty"`
+	// Time is the peer's own Unix clock at handshake. Nodes take the MEDIAN of
+	// their peers' offsets and apply it (bounded) when validating timestamps, so
+	// one machine's wrong clock does not isolate it from the chain. Zero means a
+	// peer that predates the field, and contributes no sample.
+	Time int64 `json:"time,omitempty"`
 
 	// transactions / blocks
 	Tx    *core.Transaction `json:"tx,omitempty"`

@@ -79,6 +79,12 @@ type Config struct {
 	Regtest       bool     // regtest mode: enable on-demand block generation (POST /generate)
 	Dandelion     bool     // relay new transactions via Dandelion++ stem/fluff (origin privacy)
 
+	// DNSSeeds are hostnames whose A/AAAA records list nodes to bootstrap from,
+	// consulted only when this node is short of addresses of its own (see
+	// dnsseed.go). Each entry is "host" or "host:port". Empty means no
+	// bootstrapping help: the node then needs -peers, as it always did.
+	DNSSeeds []string
+
 	// ShareFactor is how many times easier a mining share is than a block (see
 	// shares.go). Zero means core.DefaultShareFactor.
 	ShareFactor uint32
@@ -122,6 +128,10 @@ type peer struct {
 	askedMempool bool            // we have requested this peer's pending transactions
 	inbound      bool            // they dialed us (rather than the other way round)
 	since        time.Time       // when the connection was established
+	// timeOffset is this peer's clock minus ours at handshake, in seconds. The
+	// median across peers drives network-adjusted time (see core/nettime.go).
+	timeOffset    int64
+	hasTimeOffset bool
 }
 
 // supports reports whether the peer advertised a capability.
@@ -149,17 +159,22 @@ type Node struct {
 	inboundTotal int            // current inbound connections (loopback exempt)
 	inboundGroup map[string]int // current inbound connections per IP group
 
-	seenBlk  *seenSet
-	seenTx   *seenSet
-	shares   *shareLedger
-	faucet   *faucet
-	reorgs   *reorgLog
-	book     *peerbook
-	bans     *banbook
-	events   *eventBus
-	webhooks *webhookSender
-	dand     *dandelion
-	orphans  *orphanPool
+	seenBlk *seenSet
+	seenTx  *seenSet
+	shares  *shareLedger
+	faucet  *faucet
+	reorgs  *reorgLog
+	book    *peerbook
+	addrs   *addrman // outbound address manager: tried/new tables + group diversity
+	bans    *banbook
+
+	// resolveSeed is the DNS lookup used for -dnsseeds, injectable so tests need
+	// no working resolver.
+	resolveSeed seedResolver
+	events      *eventBus
+	webhooks    *webhookSender
+	dand        *dandelion
+	orphans     *orphanPool
 
 	// Sync state (see sync.go): what ranged block requests are outstanding and to
 	// whom, and the highest height any peer has announced. Without this a peer that
@@ -230,6 +245,7 @@ func New(cfg Config, chain *core.Blockchain, mp *core.Mempool, w *wallet.Wallet)
 		faucet:       newFaucet(),
 		reorgs:       newReorgLog(),
 		book:         newPeerbook(cfg.AdvertiseAddr, cfg.MaxPeers),
+		addrs:        newAddrman(),
 		bans:         newBanbook(banThreshold),
 		events:       newEventBus(),
 		dand:         newDandelion(),
@@ -301,11 +317,22 @@ func (n *Node) Start() {
 	go n.listen()
 	for _, a := range n.cfg.Peers {
 		n.book.note(a)
+		// Configured peers are the operator's own choice, so they go in as
+		// `tried`: they should be preferred over anything gossip offers.
+		n.addrs.Add(a, "config")
+		n.addrs.Good(a)
 	}
-	for _, a := range n.book.all() { // seed peers + any restored from disk
-		n.maybeDial(a)
+	// Bootstrapping: if this node knows almost nobody, ask the DNS seeds. It is
+	// skipped entirely once the node has addresses of its own, so a running
+	// network never depends on a seed being up.
+	if added := n.bootstrapFromDNSSeeds(); added > 0 {
+		Infof("bootstrapped from DNS seeds", "addresses", added)
 	}
-	go n.syncLoop() // times out unanswered block requests and keeps ranges in flight
+	n.fillOutbound()
+	go n.peerLoop()     // keeps the outbound set full and diverse as peers come and go
+	go n.compactLoop()  // rewrites the pruned block store off the hot path
+	go n.timeSyncLoop() // keeps timestamp validation in step with peers' clocks
+	go n.syncLoop()     // times out unanswered block requests and keeps ranges in flight
 	if n.webhooks != nil {
 		go n.webhooks.run()
 		Infof("webhooks enabled", "urls", len(n.webhooks.urls))
@@ -553,18 +580,32 @@ func (n *Node) maybeDial(addr string) {
 	if addr == "" || addr == n.cfg.AdvertiseAddr || n.connectedTo(addr) {
 		return
 	}
-	if n.book.shouldDial(addr) {
-		go n.dialLoop(addr)
+	// Every address a peer gossips passes through here, so this is where the
+	// outbound eclipse defence has to live: the addrman refuses a reservation
+	// once this address's network group already holds its share of the outbound
+	// set (see addrman.go). The peerbook still owns the total cap.
+	if !n.addrs.Reserve(addr) {
+		return
 	}
+	if !n.book.shouldDial(addr) {
+		n.addrs.Release(addr)
+		return
+	}
+	go n.dialLoop(addr)
 }
 
 func (n *Node) dialLoop(addr string) {
+	// The slot is held for as long as this loop lives, so a peer that keeps
+	// reconnecting keeps its group's share rather than freeing it between
+	// attempts and letting another group take it.
+	defer n.addrs.Release(addr)
 	base := n.dialBase
 	if base <= 0 {
 		base = dialRetryInterval
 	}
 	delay := base
 	for !n.stopped() {
+		n.addrs.Attempt(addr)
 		if conn, err := n.dialFn(addr); err == nil {
 			// A connection that was ESTABLISHED resets the backoff: this peer is real
 			// and reachable, and a drop after an hour of good service should be
@@ -572,11 +613,15 @@ func (n *Node) dialLoop(addr string) {
 			delay = base
 			n.handleConn(conn, false, addr) // outbound; blocks until the connection drops
 		} else {
+			// A dial that never connected is evidence against the address; enough
+			// of them and the addrman retires it rather than retrying forever.
+			n.addrs.Failed(addr)
 			delay = nextDialDelay(delay, base)
 		}
 		// A dial that turned out to reach ourselves is not retried: the peerbook
 		// learned the address is us (see handleConn).
 		if n.book.isSelf(addr) {
+			n.addrs.Forget(addr)
 			return
 		}
 		if !n.wait(delay) {
@@ -665,7 +710,8 @@ func (n *Node) handleConn(rawConn net.Conn, inbound bool, dialed string) {
 	// Protocol version + capability negotiation: drop peers speaking an
 	// incompatible version, and record capabilities (e.g. Dandelion++) for feature
 	// gating.
-	p.send(Message{Type: MsgVersion, Version: ProtocolVersion, Caps: n.caps(), Network: core.NetworkName()})
+	p.send(Message{Type: MsgVersion, Version: ProtocolVersion, Caps: n.caps(),
+		Network: core.NetworkName(), Time: time.Now().Unix()})
 	_ = sc.SetReadDeadline(time.Now().Add(handshakeTimeout))
 	var vm Message
 	if err := dec.Decode(&vm); err != nil {
@@ -690,6 +736,14 @@ func (n *Node) handleConn(rawConn net.Conn, inbound bool, dialed string) {
 		_ = sc.Close()
 		return
 	}
+	// Record how far this peer's clock is from ours. The median across peers,
+	// bounded, becomes the offset timestamp validation uses — so one skewed
+	// local clock cannot isolate this node from the chain (see core/nettime.go).
+	// A peer that predates the field sends 0 and contributes no sample.
+	if vm.Time != 0 {
+		p.timeOffset = vm.Time - time.Now().Unix()
+		p.hasTimeOffset = true
+	}
 	p.version = vm.Version
 	p.caps = make(map[string]bool, len(vm.Caps))
 	for _, c := range vm.Caps {
@@ -698,6 +752,12 @@ func (n *Node) handleConn(rawConn net.Conn, inbound bool, dialed string) {
 
 	n.addPeer(p)
 	defer n.removePeer(p)
+	// A completed handshake is the only evidence that an address is a real node,
+	// so this is what promotes it from the `new` table to `tried` — and `tried`
+	// is what outbound selection prefers on the next start.
+	if dialed != "" {
+		n.addrs.Good(dialed)
+	}
 	Infof("peer connected", "ip", ip, "peer", short(p.id))
 
 	// Keep the connection alive: ping the peer periodically and drop it if it
@@ -750,6 +810,7 @@ func (n *Node) handleMessage(p *peer, m Message) {
 		p.addr = m.Addr
 		n.peersMu.Unlock()
 		n.book.note(m.Addr)
+		n.addrs.Add(m.Addr, "hello")
 
 	case MsgGetPeers:
 		p.send(Message{Type: MsgPeers, Peers: append(n.book.all(), n.cfg.AdvertiseAddr)})
@@ -760,6 +821,10 @@ func (n *Node) handleMessage(p *peer, m Message) {
 		}
 		for _, addr := range m.Peers {
 			n.book.note(addr)
+			// Gossip is attacker-controlled, so it only ever ADDS to the `new`
+			// table; whether any of it is dialed is the addrman's decision, under
+			// the per-group cap.
+			n.addrs.Add(addr, p.addr)
 			n.maybeDial(addr)
 		}
 
@@ -865,10 +930,24 @@ func (n *Node) handleMessage(p *peer, m Message) {
 		p.send(Message{Type: MsgChain, Chain: n.chain.Blocks()})
 
 	case MsgChain:
-		if replaced, disconnected, err := n.chain.ReplaceChain(m.Chain); err == nil && replaced {
+		replaced, disconnected, err := n.chain.ReplaceChain(m.Chain)
+		switch {
+		case err == nil && replaced:
 			Infof("adopted chain via fallback", "height", n.chain.Height())
 			n.noteReorg(disconnected, n.resurrectTxs(disconnected))
 			n.afterNewBlock(true)
+		case err != nil:
+			// A refused reorg is not a peer problem and must not be swallowed: the
+			// finality guard has just declined a chain that fork choice preferred,
+			// and it will decline the same one every time. If that chain is the
+			// network's, this node is now diverged and will stay diverged until an
+			// operator intervenes — so it is counted, logged loudly, and surfaced
+			// by /health, /reorgs and /metrics.
+			if ref, ok := core.AsReorgRefused(err); ok {
+				n.noteRefusedReorg(ref)
+			} else {
+				Debugf("fallback chain rejected", "err", err)
+			}
 		}
 
 	case MsgPing:

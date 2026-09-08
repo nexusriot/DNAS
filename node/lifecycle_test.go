@@ -41,8 +41,10 @@ func TestEmptyBlockIntervalPacesTheMiner(t *testing.T) {
 	n.Start()
 	t.Cleanup(n.Shutdown)
 
-	// Two blocks would cost 2×TargetBlockTime (10s) of pure waiting at the
-	// default throttle; here only proof of work stands in the way.
+	// Two blocks would cost 2×TargetBlockTime of pure waiting at the default
+	// throttle; here only proof of work stands in the way. The deadline is
+	// expressed in target block times so it tracks the parameter rather than
+	// hard-coding a duration that a block-time change would silently invalidate.
 	if !waitFor(time.Duration(core.TargetBlockTime)*time.Second, func() bool { return n.chain.Height() >= 2 }) {
 		t.Fatalf("miner produced only %d block(s); the empty-block interval is not being honored", n.chain.Height())
 	}

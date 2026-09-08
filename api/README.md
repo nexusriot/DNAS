@@ -38,7 +38,7 @@ anyone may issue "GOLD"), `/asset/{id}` (one asset plus its holders and the held
 total, which must equal the issued supply), `/webhooks` (delivery counters),
 `/peers`, `/address`, `/estimatefee?blocks=N`
 (recommended per-byte fee = base fee + estimated tip, never below the relay
-floor), `/metrics` (Prometheus format: 36 series covering the chain, the mempool
+floor), `/metrics` (Prometheus format: 45 series covering the chain, the mempool
 by count *and* bytes, peers and their ban scores, reorg totals and depth, orphan
 count, hashrate and block intervals, supply, tip age, blocks-behind, the share
 ledger and webhook delivery — most of these were previously reachable only as

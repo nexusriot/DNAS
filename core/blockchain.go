@@ -8,7 +8,6 @@ import (
 	"os"
 	"sort"
 	"sync"
-	"time"
 )
 
 // Account is the state tracked per address: a spendable coin balance, a nonce
@@ -25,13 +24,24 @@ type Account struct {
 // replaying every transaction. All exported methods take the lock, so it is
 // safe to share one *Blockchain across the miner, P2P handlers and API.
 type Blockchain struct {
-	mu      sync.RWMutex
-	blocks  []Block
-	state   map[string]Account
-	work    *big.Int         // cumulative proof-of-work of blocks
-	undos   [][]undoEntry    // undos[i] reverts blocks[i]'s state changes (undos[0] is nil)
-	store   *blockStore      // append-only persistence (nil = in-memory only)
-	txIndex map[string]TxLoc // txid -> where it is confirmed (see txindex.go)
+	mu        sync.RWMutex
+	blocks    []Block
+	state     map[string]Account
+	work      *big.Int      // cumulative proof-of-work of blocks
+	undos     [][]undoEntry // undos[i] reverts blocks[i]'s state changes (undos[0] is nil)
+	store     *blockStore   // append-only persistence (nil = in-memory only)
+	storePath string        // where that store lives, so it can be compacted in place
+	// storeCompactedTo is the highest height whose stored record is already
+	// header-only. Compaction rewrites the whole file, so it is amortized rather
+	// than run on every block (see maybeCompactStoreLocked).
+	storeCompactedTo uint64
+	// compactionDue is set when pruning has advanced far enough that the log is
+	// worth rewriting. It is a FLAG rather than the work itself: the rewrite is
+	// O(whole store) and must not run on the block-application path.
+	compactionDue   bool
+	storeCompactErr error            // last compaction failure, reported via PruneInfo
+	storeBytesSaved int64            // bytes reclaimed by compaction so far
+	txIndex         map[string]TxLoc // txid -> where it is confirmed (see txindex.go)
 	// addrIndex maps an address to every transaction that touched it. Optional
 	// (nil = disabled, the default) because its size is unbounded by the chain —
 	// see addrindex.go.
@@ -352,6 +362,49 @@ func (bc *Blockchain) ReorgFrom(forkHeight uint64, suffix []Block) (bool, []Bloc
 	return bc.reorgLocked(int(forkHeight), suffix)
 }
 
+// ReorgRefusedError is returned when the finality guards refuse a reorg that
+// fork choice would otherwise have adopted: it reaches below a checkpoint, or it
+// would discard more than MaxReorgDepth committed blocks.
+//
+// It is a distinct type rather than a string because the two failures mean
+// opposite things to an operator. An *invalid* chain means a peer sent garbage,
+// which is that peer's problem. A *refused* reorg means this node has just
+// declined to follow what may well be the network's real chain — the guard did
+// its job, and the node may now be permanently diverged, because the same guard
+// will refuse the same switch forever. That is the single most consequential
+// thing a node can do quietly, and until this type existed it did exactly that:
+// the error was discarded at the call site and counted nowhere.
+type ReorgRefusedError struct {
+	Depth      int    // blocks the reorg wanted to discard
+	ForkHeight uint64 // last block the two chains shared
+	Limit      int    // MaxReorgDepth, when the depth guard refused it
+	Checkpoint uint64 // checkpoint height, when the checkpoint guard refused it
+}
+
+func (e *ReorgRefusedError) Error() string {
+	if e.Limit > 0 {
+		return fmt.Sprintf("reorg too deep: would discard %d blocks (max %d)", e.Depth, e.Limit)
+	}
+	return fmt.Sprintf("reorg would discard the checkpointed block at height %d", e.Checkpoint)
+}
+
+// Reason is a short machine-ish label for reporting.
+func (e *ReorgRefusedError) Reason() string {
+	if e.Limit > 0 {
+		return "too_deep"
+	}
+	return "below_checkpoint"
+}
+
+// AsReorgRefused reports whether err is a finality refusal, and which one.
+func AsReorgRefused(err error) (*ReorgRefusedError, bool) {
+	var e *ReorgRefusedError
+	if errors.As(err, &e) {
+		return e, true
+	}
+	return nil, false
+}
+
 // reorgLocked replaces the blocks above `fork` with `suffix`, applying the
 // fork-choice rule (most work; ties broken by the smaller tip hash). It
 // validates the suffix on a rolled-back copy of state — so a bad suffix cannot
@@ -365,10 +418,14 @@ func (bc *Blockchain) reorgLocked(fork int, suffix []Block) (bool, []Block, erro
 	// Neither affects initial sync or forward extension (fork == our tip, so
 	// nothing is discarded).
 	if hc := highestCheckpoint(); uint64(fork) < hc {
-		return false, nil, fmt.Errorf("reorg would discard the checkpointed block at height %d", hc)
+		return false, nil, &ReorgRefusedError{
+			Depth: len(bc.blocks) - 1 - fork, ForkHeight: uint64(fork), Checkpoint: hc,
+		}
 	}
 	if removed := len(bc.blocks) - 1 - fork; removed > MaxReorgDepth {
-		return false, nil, fmt.Errorf("reorg too deep: would discard %d blocks (max %d)", removed, MaxReorgDepth)
+		return false, nil, &ReorgRefusedError{
+			Depth: removed, ForkHeight: uint64(fork), Limit: MaxReorgDepth,
+		}
 	}
 
 	// Candidate cumulative work = shared prefix + suffix.
@@ -557,14 +614,79 @@ func Open(path string) (*Blockchain, error) {
 			store.close()
 			return nil, errors.New("genesis mismatch (incompatible store)")
 		}
-		for i := 1; i < len(blocks); i++ {
-			if err := bc.AddBlock(blocks[i]); err != nil {
+		// A pruned store holds header-only records for the heights whose bodies
+		// were dropped. Those cannot be replayed — the transactions that produced
+		// the balances are gone — so state comes from the snapshot written beside
+		// the store, verified against the state root in a header the chain's own
+		// proof of work covers. This is the same bootstrap a fast-synced node
+		// does, from a local file rather than a peer.
+		if from, pruned := firstPlaceholder(blocks); pruned {
+			seeded, err := openPrunedStore(path, blocks, from)
+			if err != nil {
 				store.close()
-				return nil, fmt.Errorf("replay block %d: %w", i, err)
+				return nil, err
+			}
+			bc = seeded
+		} else {
+			for i := 1; i < len(blocks); i++ {
+				if err := bc.AddBlock(blocks[i]); err != nil {
+					store.close()
+					return nil, fmt.Errorf("replay block %d: %w", i, err)
+				}
 			}
 		}
 	}
 	bc.store = store // future writes now persist
+	bc.storePath = path
+	return bc, nil
+}
+
+// openPrunedStore rebuilds a chain whose early bodies were pruned from disk,
+// using the state snapshot written alongside it.
+func openPrunedStore(path string, blocks []Block, firstPruned int) (*Blockchain, error) {
+	snap, ok, err := readStateSnapshot(path)
+	if err != nil {
+		return nil, fmt.Errorf("pruned store at %s: %w", path, err)
+	}
+	if !ok {
+		return nil, fmt.Errorf(
+			"store %s is pruned (block %d has no body) but its state snapshot %s is missing; "+
+				"the balances cannot be rebuilt from headers alone — restore the snapshot, "+
+				"or re-sync from a peer",
+			path, firstPruned, statePath(path))
+	}
+	if snap.Height >= uint64(len(blocks)) {
+		return nil, fmt.Errorf("state snapshot claims height %d but the store holds %d blocks",
+			snap.Height, len(blocks))
+	}
+	// Every height at or below the snapshot must be covered by it: a body-less
+	// block above the snapshot could never be replayed.
+	for i := int(snap.Height) + 1; i < len(blocks); i++ {
+		if blocks[i].IsPlaceholder() {
+			return nil, fmt.Errorf(
+				"block %d has no body but sits above the state snapshot at height %d; "+
+					"this store cannot be replayed", i, snap.Height)
+		}
+	}
+	headers := make([]Header, snap.Height+1)
+	for i := range headers {
+		headers[i] = blocks[i].Header()
+	}
+	// NewFromSnapshot re-derives the state root from the accounts and checks it
+	// against the header, so a tampered or stale snapshot is caught here rather
+	// than becoming this node's idea of everyone's balances.
+	bc, err := NewFromSnapshot(snap, headers)
+	if err != nil {
+		return nil, fmt.Errorf("state snapshot for %s: %w", path, err)
+	}
+	for i := int(snap.Height) + 1; i < len(blocks); i++ {
+		if err := bc.AddBlock(blocks[i]); err != nil {
+			return nil, fmt.Errorf("replay block %d above the snapshot: %w", i, err)
+		}
+	}
+	// The reopened chain is pruned by construction; remember how far, so the next
+	// compaction does not redo work it has already done.
+	bc.storeCompactedTo = snap.Height + 1
 	return bc, nil
 }
 
@@ -793,7 +915,9 @@ func validateBlockStructure(blocks []Block, block Block) error {
 	if block.Timestamp <= medianTimePast(blocks) {
 		return errors.New("timestamp not after median-time-past")
 	}
-	if block.Timestamp > time.Now().Unix()+MaxFutureDrift {
+	// NetworkTime, not time.Now: a node whose own clock is skewed would
+	// otherwise reject every block its peers produce (see nettime.go).
+	if block.Timestamp > NetworkTime()+MaxFutureDrift {
 		return errors.New("timestamp too far in the future")
 	}
 	if cp, ok := checkpointAt(block.Index); ok && block.Hash != cp {
@@ -918,6 +1042,15 @@ func checkTxAtHeight(tx Transaction, height uint64) error {
 	// accepting them together rather than splitting over whether a block is valid.
 	if tx.IsMultiOutput() && !IsUpgradeActive(UpgradeMultiOutput, height) {
 		return errors.New("multi-output transfers are not active at this height")
+	}
+	// Height-activated rule (consensus upgrade): every address must be a
+	// well-formed, checksummed one. This is the only rule that stops a client bug
+	// from burning coin to a typo — client-side validation is a convention, and
+	// consensus has never enforced it (see UpgradeCheckedAddresses).
+	if IsUpgradeActive(UpgradeCheckedAddresses, height) {
+		if err := checkTxAddresses(tx); err != nil {
+			return err
+		}
 	}
 	// Height-activated rule (consensus upgrade): once UpgradeDustLimit is in
 	// force, coin transfers below DustThreshold are rejected. Off until an

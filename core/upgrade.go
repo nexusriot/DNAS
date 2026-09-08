@@ -39,6 +39,22 @@ const UpgradeVault = "vault"
 // to start applying it at the same block.
 const UpgradeFeeSponsor = "feesponsor"
 
+// UpgradeCheckedAddresses, once active, requires every address a transaction
+// names — sender, recipient, each multi-output recipient, and the fee payer — to
+// be a well-formed, checksummed DNAS address.
+//
+// Until this activates, consensus checks only that addresses are not absurdly
+// long. Every client validates recipients before signing, but that is a
+// convention, not a rule: a buggy or malicious client can put anything in `To`,
+// and the coin lands on a state key nobody holds the private key for. Burned,
+// permanently, with no way to tell it from a deliberate burn.
+//
+// It is height-activated like the others because it is a tightening: blocks
+// below the activation height keep the old rule, so an existing chain still
+// replays. What it CANNOT do is recover coin already sent to a malformed
+// address — those state entries stay where they are.
+const UpgradeCheckedAddresses = "checkedaddresses"
+
 var (
 	upgradesMu sync.RWMutex
 	upgrades   = map[string]uint64{}
@@ -48,7 +64,8 @@ var (
 // one by name is told immediately if it is misspelled, rather than running with a
 // rule that silently never activates — which on a network where the others did
 // activate means being forked off it.
-var knownUpgrades = []string{UpgradeDustLimit, UpgradeMultiOutput, UpgradeVault, UpgradeFeeSponsor}
+var knownUpgrades = []string{UpgradeDustLimit, UpgradeMultiOutput, UpgradeVault,
+	UpgradeFeeSponsor, UpgradeCheckedAddresses}
 
 // Upgrades lists the upgrade names this build understands.
 func Upgrades() []string { return append([]string(nil), knownUpgrades...) }

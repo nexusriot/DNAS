@@ -78,6 +78,13 @@ type VerifyReport struct {
 	OK      bool   `json:"ok"`
 	BadAt   int    `json:"bad_at"` // index of the first block that failed (-1 if none)
 	Problem string `json:"problem,omitempty"`
+	// Pruned reports that the store has header-only records, so full replay was
+	// impossible and verification started from the state snapshot instead.
+	// VerifiedFrom is the first height whose body was actually re-checked;
+	// everything below it was taken on the snapshot's authority (which is itself
+	// checked against a proof-of-work-covered state root).
+	Pruned       bool   `json:"pruned"`
+	VerifiedFrom uint64 `json:"verified_from,omitempty"`
 }
 
 // VerifyStore replays a chain store through full validation — every signature,
@@ -103,8 +110,47 @@ func VerifyStore(path string) (VerifyReport, error) {
 		rep.Problem = "genesis block is not this network's genesis"
 		return rep, nil
 	}
+	// A pruned store cannot be fully re-validated: the bodies below the cutoff
+	// are gone, and with them the transactions a replay would check. Reporting
+	// that as a failure would be wrong — the store is exactly what a pruning node
+	// is supposed to leave behind — so verification starts from the state
+	// snapshot instead, and says plainly how much it could not check.
+	start := 1
 	bc := NewBlockchain()
-	for i := 1; i < len(blocks); i++ {
+	if from, pruned := firstPlaceholder(blocks); pruned {
+		snap, ok, err := readStateSnapshot(path)
+		if err != nil {
+			rep.BadAt = from
+			rep.Problem = fmt.Sprintf("pruned store: %v", err)
+			return rep, nil
+		}
+		if !ok {
+			rep.BadAt = from
+			rep.Problem = fmt.Sprintf("block %d has no body and there is no state snapshot at %s; "+
+				"a pruned store cannot be replayed without one", from, statePath(path))
+			return rep, nil
+		}
+		headers := make([]Header, snap.Height+1)
+		for i := range headers {
+			if i >= len(blocks) {
+				rep.BadAt = from
+				rep.Problem = "state snapshot claims a height above the store"
+				return rep, nil
+			}
+			headers[i] = blocks[i].Header()
+		}
+		seeded, err := NewFromSnapshot(snap, headers)
+		if err != nil {
+			rep.BadAt = int(snap.Height)
+			rep.Problem = fmt.Sprintf("state snapshot: %v", err)
+			return rep, nil
+		}
+		bc = seeded
+		start = int(snap.Height) + 1
+		rep.Pruned = true
+		rep.VerifiedFrom = uint64(start)
+	}
+	for i := start; i < len(blocks); i++ {
 		if err := bc.AddBlock(blocks[i]); err != nil {
 			rep.BadAt = i
 			rep.Problem = err.Error()

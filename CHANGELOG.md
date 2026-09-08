@@ -26,8 +26,56 @@ It is still a learning project, not money. Do not point it at the internet.
   rather than preventing it; making the sequence atomic is still open work
   ([ROADMAP.md](ROADMAP.md) §1).
 
+- **A refused reorg is no longer silent.** When the finality guards decline a
+  reorg that fork choice preferred, the node may have stopped following the
+  network's chain — permanently, since the same guard refuses the same switch
+  every time. That was returned as a bare error, discarded at the call site and
+  counted nowhere, so a diverged node looked perfectly healthy: peers connected,
+  fresh tip, not behind by its own reckoning. It is now a typed
+  `core.ReorgRefusedError`, counted with a high-water depth and reason, logged at
+  WARN with an explicit recovery action, reported by `/reorgs`, exported as
+  `dnas_reorgs_refused_total`, and surfaced as a `/health` failure reason.
+
+- **The state root is a trie root, so absence is provable.** The header used to
+  commit a Merkle fold over the sorted account set, which proves membership and
+  nothing else: a prover who omitted a leaf produced a tree a client could not
+  distinguish from the truth, so "holds nothing" and "I am not showing you this"
+  looked identical. A light client had no way to reject a forged "you were never
+  paid". The header now commits a trie root ([core/state.go](core/state.go)) —
+  a key's position is fixed by the key, so landing on an empty slot IS the proof
+  — and `/stateproof` answers for an address it has never seen instead of
+  returning 404. **Consensus change**: genesis and every block hash after it
+  differ.
+- **Block time 5s → 60s, and the finality window is now named and guarded.**
+  `MaxReorgDepth` (100 blocks) at a 5-second block time tolerated about eight
+  minutes of divergence, so any partition longer than a coffee break left both
+  halves needing a rollback consensus refuses — the deep-reorg guard turned an
+  attack into a permanent split. `FinalityWindow` makes the trade-off explicit
+  and a test fails if it drops below 30 minutes. At 60s the window is **1h40m**;
+  raising the block time rather than the depth avoids dragging `MinPruneKeep`
+  with it, so pruning is unaffected. Fast local chains come from `-regtest` and
+  `POST /generate`. **Consensus change.**
+
 ### Performance
 
+- **Store compaction no longer freezes the node.** It is O(whole store) and ran
+  inside the chain's write lock on the block-application path, so on a pruning
+  node every 128th block stalled the miner, every API read and every peer handler
+  for a full file rewrite (49ms on a 198 KB store, growing with the file). It is
+  now snapshot-under-read-lock, stage-with-no-lock, swap-under-write-lock. Worst
+  append after: 20.5ms against a 24.5ms no-pruning baseline — the spike is gone.
+- **The block store is a compact binary format**, not JSON. Records stored every
+  hash, key and signature as hex text; they now store raw bytes behind one
+  encode/decode pair ([core/storecodec.go](core/storecodec.go)). **79% of the
+  JSON size and 5.1x faster to decode** on a 200-transaction block, which is what
+  startup pays. An older JSON store still loads — the leading byte distinguishes
+  them.
+- **Timestamp validation uses network-adjusted time.** It read the local clock,
+  so one machine's wrong clock was that machine's consensus problem. Peers report
+  their clock at handshake and the node applies the bounded median
+  ([core/nettime.go](core/nettime.go)); the median resists a lying minority, the
+  70-minute bound resists a lying majority, one peer is ignored, and the system
+  clock is untouched.
 - **Block assembly is ~188× faster on a full mempool.** `Mempool.Select` used to
   rescan the whole pool once per chosen transaction, re-deriving every
   candidate's hash and canonical size on each pass — O(pool × block) sha256
@@ -54,6 +102,63 @@ It is still a learning project, not money. Do not point it at the internet.
 
 ### Added
 
+- **Consensus can check recipient addresses** — the `checkedaddresses` upgrade
+  (`-upgrades checkedaddresses:HEIGHT`). Consensus validated only that an address
+  was not absurdly long, so a buggy client could burn coin to a typo; every
+  client checked before signing, but that is a convention, not a rule. Once
+  scheduled, every address a transaction names — sender, each recipient, the fee
+  payer — must be well-formed and checksummed. Height-activated, so an existing
+  chain replays unchanged. It cannot recover coin already sent to a malformed
+  address, and it does **not** change the address format: moving to bech32 is a
+  separate change and is deliberately not bundled in.
+- **Pruning now bounds disk, not just memory.** The append-only log is compacted
+  to match the pruned chain, amortized and atomic. Because dropping bodies drops
+  the transactions that produced the balances, a verified state snapshot is
+  written beside the store and `Open` bootstraps from it the way a fast-synced
+  node does — a snapshot that does not hash to the header's state root is
+  rejected rather than becoming the node's ledger. `dnas db compact -keep N` runs
+  it offline; `dnas db verify` reports which heights it could and could not
+  re-check; `/info` and `dnas_store_bytes` expose the size. Pruned heights keep a
+  header-only record (linkage, MTP and the retarget need them), so the saving is
+  the transaction bodies — large on a busy chain, near zero on empty blocks.
+- **Golden consensus vectors.**
+  [core/testdata/consensus_vectors.json](core/testdata/consensus_vectors.json) is
+  a language-neutral corpus of every consensus-visible value: 24 transactions
+  across all three networks with their signing preimages, canonical encodings,
+  txids, sizes and validity verdicts, plus address and script derivations, asset
+  ids, the halving schedule, the compact-target encoding, merkle and state roots,
+  header preimages and the fee split. Generated and verified from
+  [core/vectors_test.go](core/vectors_test.go); documented for implementers in
+  [core/testdata/README.md](core/testdata/README.md). It cannot prove the spec is
+  right — a corpus agrees with whatever produced it — but it does mean a
+  consensus-visible value can no longer move without a test failing that names
+  the field.
+- **An outbound address manager, closing the outbound eclipse vector.**
+  Inbound connections have had eclipse caps for a while; outbound selection had
+  none, so the first `maxpeers` addresses pulled out of a Go map got the slots
+  and an attacker who gossiped nine addresses in one /16 stood a good chance of
+  owning all of them. [node/addrman.go](node/addrman.go) adds tried/new tables —
+  addresses that completed a handshake are preferred over ones merely gossiped —
+  bounded and bucketed by network group, and **caps live outbound connections per
+  group** (2 of 8 slots), so filling a node's outbound set now needs addresses in
+  four distinct ranges. The tried table persists across restarts (`addrs.json`).
+  Bucketing is by /16 rather than by ASN, which raises the cost of an eclipse
+  rather than settling it; that limit is stated in the ROADMAP and the threat
+  model rather than glossed.
+- **DNS seed bootstrapping** (`-dnsseeds`, [node/dnsseed.go](node/dnsseed.go)).
+  Joining a network previously meant being told somebody's address out of band.
+  Seeds are consulted only when the node is short of addresses of its own, their
+  results enter the `new` table with no special standing and under the same
+  diversity cap, and one dead seed does not block the others.
+- **An authenticated state trie** ([core/trie.go](core/trie.go)): a
+  content-addressed, path-compressed sparse Merkle trie keyed by the hash of the
+  address, with membership **and absence** proofs, a pluggable `NodeStore`, and
+  O(depth) updates (~16µs at 10 000 accounts, flat as the ledger grows).
+  **Not yet wired into consensus** — see *Known gaps* below.
+- **A threat model** ([THREAT-MODEL.md](THREAT-MODEL.md)): assets, adversaries,
+  what each defence assumes, what is explicitly out of scope (majority hashpower,
+  side channels, supply chain), and where an outside reviewer should attack
+  first. It is not an audit and says so.
 - **Request bodies on the HTTP API are size-bounded.** Every write endpoint
   decodes through `decodeBody`, which wraps the body in an
   `http.MaxBytesReader` and answers **413** before parsing — 64 KiB for the
@@ -64,13 +169,16 @@ It is still a learning project, not money. Do not point it at the internet.
   ran *after* the whole body had been decoded into memory. The cap is on the
   reader rather than on `Content-Length`, so a request that understates its
   length is still cut off mid-stream.
-- **`/metrics` covers what the node actually knows** — 36 series, up from 12.
+- **`/metrics` covers what the node actually knows** — 45 series, up from 12.
   Added reorg totals and depth, orphan count, ban scores and the threshold,
   hashrate and block intervals, supply (minted / burned / circulating), tip age,
   blocks-behind, mempool bytes, and webhook delivery counters. All of these
   existed already but only as JSON spread across `/reorgs`, `/chainstats`,
   `/bans`, `/supply` and `/health`, which is the wrong shape for the one
-  consumer that wants them continuously.
+  consumer that wants them continuously. Five more cover the address manager,
+  of which `dnas_outbound_groups` is the one to alert on: a node whose outbound
+  peers all sit in one network group is cheap to eclipse however many peers it
+  appears to have.
 - **`dnas:` payment URIs are read, not just printed.** `dnas invoice new` has
   always emitted `dnas:ADDRESS?amount=…&memo=…&ref=…` and nothing ever parsed
   one back, so the payer still read the address off it and retyped it — which is
@@ -85,6 +193,17 @@ It is still a learning project, not money. Do not point it at the internet.
   silently overridden, because the payee matches on (address, amount) and paying
   a different amount is the same as not paying.
 - **This changelog**, and a regression test tying it to the VERSION file.
+
+### Known gaps
+
+- **The state trie is built but not integrated.** The header still commits the
+  old sorted-leaf fold, so the trie's absence proofs are not bound to proof of
+  work and prove nothing about the chain yet. Wiring it in changes the genesis
+  hash and every block hash after it — a hard fork, and a decision to take
+  deliberately rather than as a side effect. ROADMAP §1 records the remaining
+  work.
+- **No independent audit.** The threat model was written by the same hands that
+  wrote the code and inherits its blind spots. ROADMAP §7 still lists this open.
 
 ### Documentation
 

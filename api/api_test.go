@@ -690,14 +690,16 @@ func TestStateProofEndpoint(t *testing.T) {
 	}
 	hdr := getObj(t, fmt.Sprintf("%s/header/%d", srv.URL, uint64(pr["block_index"].(float64))))
 	root := hdr["state_root"].(string)
-	if !core.VerifyAccountProof(p, root) {
-		t.Fatal("state proof did not fold to the header's state root")
+	if valid, present := core.VerifyAccountProof(p, root); !valid || !present {
+		t.Fatalf("state proof did not fold to the header's state root: valid=%v present=%v", valid, present)
 	}
 
-	// An address with no account is a 404.
+	// An address with no account is a proof of ABSENCE, not a 404: the trie can
+	// prove "holds nothing", which is what a client needs to reject a forged
+	// claim that a payment never happened.
 	stranger, _ := wallet.New()
-	if r, _ := http.Get(srv.URL + "/stateproof/" + stranger.Address()); r.StatusCode != http.StatusNotFound {
-		t.Errorf("absent-address /stateproof = %d, want 404", r.StatusCode)
+	if r, _ := http.Get(srv.URL + "/stateproof/" + stranger.Address()); r.StatusCode != http.StatusOK {
+		t.Errorf("absent-address /stateproof = %d, want 200 with an absence proof", r.StatusCode)
 	}
 }
 

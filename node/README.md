@@ -90,6 +90,17 @@ Module `github.com/nexusriot/DNAS/node` — the peer-to-peer daemon.
   falls silent past an idle read deadline, so a dead peer doesn't leak a slot.
 - `peerbook.go` — known-peer bookkeeping for discovery: dedup, self-exclusion
   and an outbound-dial cap.
+- `addrman.go` — the outbound **address manager**: tried/new tables (a handshake
+  promotes an address to `tried`, which selection prefers), bounded and bucketed
+  by network group, and a cap on how many LIVE outbound connections may share one
+  group. That cap is the outbound eclipse defence — filling a node's slots needs
+  addresses in several distinct ranges, not several addresses in one. Grouping is
+  by /16, which is weaker than an ASN and is documented as such. `fillOutbound`
+  and `peerLoop` keep the outbound set topped up as peers come and go.
+- `dnsseed.go` — bootstrap from DNS A/AAAA records (`-dnsseeds`), consulted only
+  when the node is short of addresses of its own. Seed results are ordinary `new`
+  entries under the same diversity cap; a single seed could otherwise eclipse a
+  starting node, so configure more than one.
 - `seen.go` — bounded FIFO `seenSet` for gossip de-duplication.
 - Fork sync uses a **block locator**: `getheaders` carries locator hashes, the
   peer replies from the last common block, and only the divergent suffix is
@@ -128,8 +139,11 @@ Module `github.com/nexusriot/DNAS/node` — the peer-to-peer daemon.
   uptime: 1200 attempts an hour, per address, which at the far end looks exactly
   like being scanned.
 - `persist.go` — when `Config.StateDir` is set, the node persists `peers.json`,
-  `bans.json`, and `mempool.json` there, loading them on `Start` and rewriting
-  them on graceful `Shutdown` (via temp-file+rename). The chain stays
+  `addrs.json`, `bans.json`, and `mempool.json` there, loading them on `Start`
+  and rewriting them on graceful `Shutdown` (via temp-file+rename). `addrs.json`
+  is the address manager's table; its `tried` half is the node's own evidence
+  about which peers are real, and losing it means trusting gossip again on every
+  restart. The chain stays
   authoritative and re-syncs from peers regardless.
 
 Depends on `core` and `wallet`.

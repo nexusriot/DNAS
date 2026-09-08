@@ -65,15 +65,15 @@ func TestAssetIssueAndTransfer(t *testing.T) {
 		t.Fatal("ProveAccount failed")
 	}
 	tip := bc.Tip()
-	if !VerifyAccountProof(p, tip.StateRoot) {
-		t.Fatal("an account holding an asset should verify against the state root")
+	if valid, present := VerifyAccountProof(p, tip.StateRoot); !valid || !present {
+		t.Fatalf("an account holding an asset should verify: valid=%v present=%v", valid, present)
 	}
 	if p.Account.Assets[id] != 700 {
 		t.Fatalf("proof should carry the asset balance, got %d", p.Account.Assets[id])
 	}
 	bad := p
 	bad.Account.Assets = map[string]uint64{id: 999}
-	if VerifyAccountProof(bad, tip.StateRoot) {
+	if valid, _ := VerifyAccountProof(bad, tip.StateRoot); valid {
 		t.Fatal("a tampered asset balance must fail the state proof")
 	}
 }

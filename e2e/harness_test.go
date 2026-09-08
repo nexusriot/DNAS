@@ -225,13 +225,21 @@ func (n *node) stop() {
 	}
 }
 
-// forgetPeers deletes the persisted peer book, so a restarted node does not
-// re-dial everyone it used to know. Call it while the node is stopped; tests that
-// need two nodes to build competing branches rely on staying disconnected.
+// forgetPeers deletes every file that remembers a peer address, so a restarted
+// node does not re-dial everyone it used to know. Call it while the node is
+// stopped; tests that need two nodes to build competing branches rely on staying
+// disconnected.
+//
+// Both files matter. peers.json is the old flat list; addrs.json is the address
+// manager's tried/new table, which is the one that actually drives outbound
+// dialling — leaving it behind quietly reconnects the node and the test then
+// measures convergence instead of the divergence it set up.
 func (n *node) forgetPeers() {
 	n.t.Helper()
-	if err := os.Remove(filepath.Join(n.dir, "peers.json")); err != nil && !os.IsNotExist(err) {
-		n.t.Fatalf("forget peers: %v", err)
+	for _, f := range []string{"peers.json", "addrs.json"} {
+		if err := os.Remove(filepath.Join(n.dir, f)); err != nil && !os.IsNotExist(err) {
+			n.t.Fatalf("forget peers (%s): %v", f, err)
+		}
 	}
 }
 

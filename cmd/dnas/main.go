@@ -136,7 +136,7 @@ Usage:
   dnas tx inspect|verify              decode and check a transaction before submitting
   dnas assets [show ID]               what assets exist, and who holds them
   dnas invoice new|watch|pay          ask to be paid, and verify that you were
-  dnas db <info|verify|export|import> inspect, check and move a chain store
+  dnas db <info|verify|export|import|compact>  inspect, check, move and shrink a chain store
   dnas peers [list|bans|unban|add|drop]  inspect and manage peers and bans
   dnas stats [-window N]              hashrate, block timing, fee flow, miners
   dnas reorgs                         chain switches this node has lived through
@@ -152,6 +152,7 @@ Node flags:
   -advertise ADDR address peers should dial us at (default: -listen)
   -api ADDR       HTTP API address (default ":8080")
   -peers LIST     comma-separated seed peer addresses
+  -dnsseeds LIST  DNS seed hostnames to bootstrap from when short of peers
   -wallet FILE    wallet key file, created if missing (default "wallet.json")
   -db FILE        blockchain append-only store file (default "chain.db")
   -netkey KEY     pre-shared key for a PRIVATE net; empty (default) = open/permissionless
@@ -403,6 +404,7 @@ func runNode(args []string) {
 	advertise := fs.String("advertise", cfg.str("advertise", ""), "address peers should dial us at (default: -listen)")
 	apiAddr := fs.String("api", cfg.str("api", ":8080"), "HTTP API address")
 	peersStr := fs.String("peers", cfg.str("peers", ""), "comma-separated seed peer addresses")
+	dnsSeeds := fs.String("dnsseeds", cfg.str("dnsseeds", ""), "comma-separated DNS seed hostnames to bootstrap from when short of peers")
 	walletPath := fs.String("wallet", cfg.str("wallet", "wallet.json"), "wallet key file (created if missing)")
 	dbPath := fs.String("db", cfg.str("db", "chain.db"), "blockchain append-only store file")
 	netKey := fs.String("netkey", cfg.str("netkey", ""), "pre-shared network key for a PRIVATE net (peers must match); empty = open/permissionless")
@@ -532,7 +534,8 @@ func runNode(args []string) {
 	if *printConfig {
 		printEffectiveConfig(effectiveConfig{
 			Network: core.NetworkName(), Listen: *listen, Advertise: *advertise, API: *apiAddr,
-			Peers: parsePeers(*peersStr), NetKey: *netKey, MaxPeers: *maxPeers,
+			Peers: parsePeers(*peersStr), DNSSeeds: parsePeers(*dnsSeeds),
+			NetKey: *netKey, MaxPeers: *maxPeers,
 			Wallet: *walletPath, DB: *dbPath, NodeKey: identityPath,
 			Mine: *mine, Regtest: *regtest, Dandelion: *dandelion,
 			AddrIndex: *addrIndex, Faucet: *faucet, ShareFactor: *shareFactor,
@@ -573,6 +576,7 @@ func runNode(args []string) {
 		ListenAddr:     *listen,
 		AdvertiseAddr:  *advertise,
 		Peers:          parsePeers(*peersStr),
+		DNSSeeds:       parsePeers(*dnsSeeds),
 		NetKey:         *netKey,
 		MaxPeers:       *maxPeers,
 		Mine:           *mine,
