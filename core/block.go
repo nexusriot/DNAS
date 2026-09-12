@@ -1,10 +1,11 @@
 package core
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"fmt"
+	"strconv"
 )
 
 // Block is a batch of transactions committed by proof of work. The hash commits
@@ -76,13 +77,41 @@ func (b Block) Header() Header {
 // except Hash itself). Transactions are covered indirectly via MerkleRoot; the
 // post-block account state is committed via StateRoot, so a light client can
 // verify balances against a PoW-verified header.
-func (h Header) headerString() string {
-	return fmt.Sprintf("%d|%d|%d|%s|%s|%s|%d|%d|%d",
-		h.Version, h.Index, h.Timestamp, h.PrevHash, h.MerkleRoot, h.StateRoot, h.BaseFee, h.Bits, h.Nonce)
+func (h Header) headerString() string { return string(appendPreimage(nil, h)) }
+
+// appendPreimage appends the preimage headerString describes to dst. It is the
+// same bytes fmt.Sprintf("%d|%d|%d|%s|%s|%s|%d|%d|%d", ...) would produce — that
+// equivalence is consensus-critical and pinned by the test vectors — built by
+// hand because this runs once per hash attempt, and reflection-based formatting
+// dominated the mining loop.
+func appendPreimage(dst []byte, h Header) []byte {
+	return strconv.AppendUint(appendPreimagePrefix(dst, h), h.Nonce, 10)
+}
+
+// appendPreimagePrefix appends everything before the nonce, up to and including
+// the separator. Nonce is the last field, so a miner can build this once and
+// append only the nonce per attempt.
+func appendPreimagePrefix(dst []byte, h Header) []byte {
+	dst = strconv.AppendUint(dst, uint64(h.Version), 10)
+	dst = append(dst, '|')
+	dst = strconv.AppendUint(dst, h.Index, 10)
+	dst = append(dst, '|')
+	dst = strconv.AppendInt(dst, h.Timestamp, 10)
+	dst = append(dst, '|')
+	dst = append(dst, h.PrevHash...)
+	dst = append(dst, '|')
+	dst = append(dst, h.MerkleRoot...)
+	dst = append(dst, '|')
+	dst = append(dst, h.StateRoot...)
+	dst = append(dst, '|')
+	dst = strconv.AppendUint(dst, h.BaseFee, 10)
+	dst = append(dst, '|')
+	dst = strconv.AppendUint(dst, uint64(h.Bits), 10)
+	return append(dst, '|')
 }
 
 // ComputeHash returns the hash the header should have.
-func (h Header) ComputeHash() string { return hashBytes([]byte(h.headerString())) }
+func (h Header) ComputeHash() string { return hashBytes(appendPreimage(nil, h)) }
 
 // HasValidPoW reports whether the stored hash is correct and meets the target
 // the header commits to (Bits).
@@ -130,13 +159,20 @@ func (b Block) SelfValid() error {
 // true, Mine stops early and returns ok=false (e.g. a new tip arrived).
 func Mine(b Block, abort func() bool) (Block, bool) {
 	b.MerkleRoot = MerkleRoot(b.Transactions)
-	target := CompactToBig(b.Bits) // hoisted out of the hot loop
+	// Everything hoisted out of the hot loop: the target as raw bytes (so an
+	// attempt compares digests instead of allocating a big.Int), and the preimage
+	// up to the nonce (the only field that changes between attempts).
+	target := targetBytes(b.Bits)
+	prefix := appendPreimagePrefix(nil, b.Header())
+	buf := make([]byte, 0, len(prefix)+20) // 20 = digits in the largest uint64
 	for {
 		if abort != nil && abort() {
 			return b, false
 		}
-		b.Hash = b.ComputeHash()
-		if hashToBig(b.Hash).Cmp(target) <= 0 {
+		buf = strconv.AppendUint(append(buf[:0], prefix...), b.Nonce, 10)
+		sum := sha256.Sum256(buf)
+		if bytes.Compare(sum[:], target[:]) <= 0 {
+			b.Hash = hex.EncodeToString(sum[:])
 			return b, true
 		}
 		b.Nonce++

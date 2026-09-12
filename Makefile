@@ -59,8 +59,11 @@ test:
 
 ## test-race: run the Go tests under the race detector
 # The timeout is explicit because go's default is 10 minutes and the core suite
-# under -race is a real proof-of-work workload — it sat at roughly six minutes
+# under -race is a real proof-of-work workload — it sat at roughly two minutes
 # here, which is too little headroom for a slower CI runner to be trusted with.
+# It had grown past 20 minutes before the mining loop stopped rebuilding each
+# header preimage with fmt.Sprintf (see core.Mine); if it creeps back up, look
+# for a hash on a hot path before reaching for a bigger number here.
 test-race:
 	$(GO) test -race -timeout 20m $(GOMODS)
 	cd tui && $(GO) test -race -timeout 20m ./...

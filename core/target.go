@@ -66,6 +66,30 @@ func meetsTarget(hash string, bits uint32) bool {
 	return hashToBig(hash).Cmp(target) <= 0
 }
 
+// targetBytes renders the target encoded by bits as the 32 big-endian bytes a
+// block hash is compared against, so the mining loop can compare raw digests
+// instead of allocating a big.Int per attempt. It answers exactly what comparing
+// against CompactToBig(bits) would: a target wider than 256 bits saturates to
+// all-ones (every hash passes, as it does against the big.Int), and a
+// non-positive one stays all-zero (nothing passes). Like the big.Int comparison
+// in Mine, and unlike meetsTarget, it does not apply the PowLimit floor — a
+// miner is free to hash against a target consensus will later refuse.
+func targetBytes(bits uint32) [32]byte {
+	var out [32]byte
+	t := CompactToBig(bits)
+	switch {
+	case t.Sign() <= 0:
+		return out
+	case t.BitLen() > 256:
+		for i := range out {
+			out[i] = 0xff
+		}
+		return out
+	}
+	t.FillBytes(out[:])
+	return out
+}
+
 // CompactToBig decodes a compact "bits" value into the full 256-bit target it
 // represents — mantissa × 256^(exponent−3) — mirroring Bitcoin's nBits.
 func CompactToBig(bits uint32) *big.Int {
