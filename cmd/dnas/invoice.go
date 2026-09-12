@@ -70,6 +70,9 @@ func runInvoice(args []string) {
   show  -in FILE                       what it asks for, and its URI
   watch -in FILE [-confirmations N] [-wait]
         verify against a PoW chain whether it has been paid; exit 0 when it has
+  serve -dir DIR [-webhook URL] [-state FILE] [-every D] [-once]
+        watch a whole directory of invoices and call a webhook when one settles;
+        remembers what it has reported, so a restart does not lose or repeat it
   pay   -in FILE -key W.json           pay it from a light wallet
   pay   -uri 'dnas:ADDR?amount=2.5' -key W.json
         pay a pasted URI directly, with no invoice file`)
@@ -82,6 +85,8 @@ func runInvoice(args []string) {
 		invoiceShow(args[1:])
 	case "watch":
 		invoiceWatch(args[1:])
+	case "serve":
+		invoiceServe(args[1:])
 	case "pay":
 		invoicePay(args[1:])
 	default:

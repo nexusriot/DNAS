@@ -42,6 +42,10 @@ type Transaction struct {
 	// When Issue is set, the transaction mints a new asset to From (Fee in coin).
 	AssetID string      `json:"asset_id,omitempty"`
 	Issue   *AssetIssue `json:"issue,omitempty"`
+	// AssetOp manages an asset that already exists — minting more of it or
+	// destroying some. It travels with AssetID and is authorized by reproducing
+	// the issuance preimage, so only the issuer can use it (see asset.go).
+	AssetOp *AssetOp `json:"asset_op,omitempty"`
 
 	// Single-signature authorization.
 	PubKey    string `json:"pubkey,omitempty"`
@@ -215,6 +219,21 @@ func CheckTxSanity(tx Transaction) error {
 		}
 		if tx.Issue.Supply == 0 || tx.Issue.Supply > MaxAssetSupply {
 			return fmt.Errorf("asset supply must be in 1..%d", MaxAssetSupply)
+		}
+	case tx.IsAssetOp():
+		if tx.AssetID == "" {
+			return errors.New("an asset operation must name the asset it manages")
+		}
+		if tx.Issue != nil {
+			return errors.New("an asset operation cannot also be an issuance")
+		}
+		// The operation carries its own amount; the transfer fields must be unused,
+		// so the transaction has exactly one meaning.
+		if tx.To != "" || tx.Amount != 0 {
+			return errors.New("an asset operation must not also set to/amount")
+		}
+		if err := tx.AssetOp.Validate(); err != nil {
+			return err
 		}
 	case tx.IsAssetTransfer():
 		if tx.To == "" {
@@ -414,7 +433,9 @@ func (t Transaction) SigningMessage() []byte { return t.signingBytes() }
 
 // IsAssetTransfer reports whether this transaction moves a native asset (Amount
 // is in asset units) rather than coin.
-func (t Transaction) IsAssetTransfer() bool { return t.AssetID != "" && t.Issue == nil }
+func (t Transaction) IsAssetTransfer() bool {
+	return t.AssetID != "" && t.Issue == nil && t.AssetOp == nil
+}
 
 // IsIssue reports whether this transaction mints a new native asset.
 func (t Transaction) IsIssue() bool { return t.Issue != nil }
@@ -437,6 +458,18 @@ func (t Transaction) Size() int { return len(t.canonicalBytes()) }
 // NewCoinbase builds the issuance transaction paying `amount` to `to`.
 func NewCoinbase(to string, amount uint64) Transaction {
 	return Transaction{From: CoinbaseSender, To: to, Amount: amount}
+}
+
+// NewCoinbaseAt builds the coinbase for a block at `height`, binding the height
+// into it once UpgradeUniqueCoinbase is active so no two coinbases share a txid
+// (see the upgrade's comment). Below the activation it is NewCoinbase exactly,
+// so the transaction — and therefore the block hash — is unchanged.
+func NewCoinbaseAt(to string, amount, height uint64) Transaction {
+	cb := NewCoinbase(to, amount)
+	if IsUpgradeActive(UpgradeUniqueCoinbase, height) {
+		cb.Nonce = height
+	}
+	return cb
 }
 
 // Sign fills PubKey and Signature. The wallet must own the sender address.

@@ -176,13 +176,17 @@ func openStore(path string) (*blockStore, []Block, error) {
 // both, because a store written by an older build must still load: a JSON
 // record begins with '{', so the two are told apart by the leading byte rather
 // than by trial and error.
-func encodeStoredBlock(b Block) ([]byte, error) { return encodeBlockV2(b), nil }
+func encodeStoredBlock(b Block) ([]byte, error) { return encodeBlockV4(b), nil }
 
 func decodeStoredBlock(data []byte) (Block, error) {
 	if len(data) == 0 {
 		return Block{}, errEmptyRecord
 	}
 	switch data[0] {
+	case storeRecordV4:
+		return decodeBlockV4(data)
+	case storeRecordV3:
+		return decodeBlockV3(data)
 	case storeRecordV2:
 		return decodeBlockV2(data)
 	case '{':

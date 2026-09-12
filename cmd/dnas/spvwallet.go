@@ -518,10 +518,19 @@ func runSPVWallet(base string, args []string) {
 			return
 		}
 		sw.issue(base, *keyFile, rest[1:], func() { saveOr(sw) })
+	case "mint", "burn":
+		// Change the supply of an asset this wallet issued. The ticker and the
+		// issuing nonce are what prove that: they reproduce the asset id, and an id
+		// that derives can only have come from this issuer (see core/asset.go).
+		if *keyFile == "" || len(rest) < 4 {
+			fmt.Printf("usage: dnas spv -api URL wallet -key FILE %s <ticker> <issue-nonce> <amount> [fee]\n", cmd)
+			return
+		}
+		sw.assetOp(base, *keyFile, cmd, rest[1:], func() { saveOr(sw) })
 	default:
 		fmt.Println("unknown wallet command:", cmd,
 			"(new | add | update | status | list | forget | send | sendmany | issue |\n"+
-				" bump | cancel | label | note | export | import)")
+				" mint | burn | bump | cancel | label | note | export | import)")
 	}
 }
 
@@ -891,6 +900,68 @@ func (sw *SPVWallet) issue(base, keyFile string, args []string, save func()) {
 	sw.addAddress(w.Address())
 	save()
 	fmt.Printf("issued %d %s — asset id %s (nonce %d)\n", supply, args[0], core.AssetID(w.Address(), args[0], nonce), nonce)
+}
+
+// assetOp mints or burns units of an asset this wallet issued.
+//
+// It asks for the ticker and the issuing NONCE rather than the asset id, because
+// those are what consensus checks: the id is derived from them, so a wallet that
+// can state them is by construction the issuer, and one that gets them wrong is
+// told so rather than having an unauthorized transaction relayed for it.
+func (sw *SPVWallet) assetOp(base, keyFile, op string, args []string, save func()) {
+	w, _, err := wallet.LoadOrCreateEncrypted(keyFile, walletPassphrase())
+	if err != nil {
+		fmt.Println("key error:", err)
+		return
+	}
+	ticker := args[0]
+	issueNonce, err := strconv.ParseUint(args[1], 10, 64)
+	if err != nil {
+		fmt.Println("bad issue nonce:", err)
+		return
+	}
+	amount, err := strconv.ParseUint(args[2], 10, 64)
+	if err != nil {
+		fmt.Println("bad amount:", err)
+		return
+	}
+	id := core.AssetID(w.Address(), ticker, issueNonce)
+
+	acc, err := provenAccount(base, w.Address())
+	if err != nil {
+		fmt.Println("could not prove account state:", err)
+		return
+	}
+	if op == core.AssetOpBurn && acc.Assets[id] < amount {
+		fmt.Printf("this wallet holds %d of %s, cannot burn %d\n", acc.Assets[id], short(id), amount)
+		return
+	}
+	fee, err := resolveFee(base, args[2:])
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	if fee > acc.Balance {
+		fmt.Printf("insufficient coin for fee: have %s, need %s\n", core.FormatAmount(acc.Balance), core.FormatAmount(fee))
+		return
+	}
+
+	nonce := sw.nextNonce(w.Address(), acc.Nonce)
+	tx := core.Transaction{
+		From: w.Address(), AssetID: id, Fee: fee, Nonce: nonce,
+		AssetOp: &core.AssetOp{Op: op, Amount: amount, Ticker: ticker, IssueNonce: issueNonce},
+	}
+	if err := tx.Sign(w); err != nil {
+		fmt.Println("sign:", err)
+		return
+	}
+	if err := postJSON(base+"/tx", tx); err != nil {
+		fmt.Println("rejected:", err)
+		return
+	}
+	sw.recordSent(w.Address(), nonce)
+	save()
+	fmt.Printf("%sed %d of %s (%s), nonce %d\n", op, amount, ticker, short(id), nonce)
 }
 
 // watchEvents follows the node's SSE stream and re-syncs on every new block or

@@ -28,6 +28,18 @@ import (
 
 const storeRecordV2 byte = 0x02
 
+// storeRecordV3 is V2 plus the header's Version field, which arrived with BIP9
+// signaling (see versionbits.go). A V2 record predates the field and decodes with
+// Version 0, which is what those blocks were mined with, so an existing store
+// replays to the same hashes it always did.
+const storeRecordV3 byte = 0x03
+
+// storeRecordV4 is V3 plus a transaction's asset management operation (mint or
+// burn). Records are versioned rather than extended in place because the
+// transaction encoding is shared by every version: a V3 reader handed a V4
+// record would read the operation's bytes as the next field.
+const storeRecordV4 byte = 0x04
+
 // hexish marks a string that is expected to be lowercase hex. Storing it as raw
 // bytes halves it; anything that does not decode is kept verbatim so a
 // hand-edited or unusual value is never lost.
@@ -189,10 +201,39 @@ func (r *srdr) optional() bool { return r.byte() == 1 }
 
 // ---------------------------------------------------------------------------
 
-// encodeBlockV2 writes a block in the compact store format.
+// encodeBlockV2 writes a block in the pre-Version format. Nothing in the node
+// writes V2 any more — encodeStoredBlock emits the newest version — but the
+// decoder must keep reading it, and a compatibility test needs a way to produce
+// one.
 func encodeBlockV2(b Block) []byte {
 	s := &sbuf{}
 	s.byte(storeRecordV2)
+	encodeBlockBody(s, b, storeRecordV2)
+	return s.b
+}
+
+// encodeBlockV3 writes a block in the pre-AssetOp format, for the compatibility
+// tests. Nothing writes V3 any more.
+func encodeBlockV3(b Block) []byte {
+	s := &sbuf{}
+	s.byte(storeRecordV3)
+	s.u32(b.Version)
+	encodeBlockBody(s, b, storeRecordV3)
+	return s.b
+}
+
+// encodeBlockV4 writes a block in the current compact store format.
+func encodeBlockV4(b Block) []byte {
+	s := &sbuf{}
+	s.byte(storeRecordV4)
+	s.u32(b.Version)
+	encodeBlockBody(s, b, storeRecordV4)
+	return s.b
+}
+
+// encodeBlockBody writes everything a record holds except its tag and Version,
+// which is the part V2 and V3 share.
+func encodeBlockBody(s *sbuf, b Block, version byte) {
 	s.u64(b.Index)
 	s.i64(b.Timestamp)
 	s.str(b.PrevHash)
@@ -204,12 +245,11 @@ func encodeBlockV2(b Block) []byte {
 	s.str(b.Hash)
 	s.u32(uint32(len(b.Transactions)))
 	for _, tx := range b.Transactions {
-		encodeTxV2(s, tx)
+		encodeTxV2(s, tx, version)
 	}
-	return s.b
 }
 
-func encodeTxV2(s *sbuf, t Transaction) {
+func encodeTxV2(s *sbuf, t Transaction, version byte) {
 	s.str(t.From)
 	s.str(t.To)
 	s.u64(t.Amount)
@@ -230,6 +270,15 @@ func encodeTxV2(s *sbuf, t Transaction) {
 	if t.Issue != nil {
 		s.str(t.Issue.Ticker)
 		s.u64(t.Issue.Supply)
+	}
+	if version >= storeRecordV4 {
+		s.optional(t.AssetOp != nil)
+		if t.AssetOp != nil {
+			s.str(t.AssetOp.Op)
+			s.u64(t.AssetOp.Amount)
+			s.str(t.AssetOp.Ticker)
+			s.u64(t.AssetOp.IssueNonce)
+		}
 	}
 
 	s.str(t.PubKey)
@@ -263,12 +312,40 @@ func encodeTxV2(s *sbuf, t Transaction) {
 	s.str(t.FeePayerSig)
 }
 
-// decodeBlockV2 parses a compact store record.
+// decodeBlockV2 parses a pre-Version compact store record.
 func decodeBlockV2(data []byte) (Block, error) {
 	r := &srdr{b: data}
 	if tag := r.byte(); tag != storeRecordV2 {
 		return Block{}, fmt.Errorf("not a v2 store record (tag %#x)", tag)
 	}
+	return decodeBlockBody(r, storeRecordV2)
+}
+
+// decodeBlockV3 parses the current compact store record.
+func decodeBlockV3(data []byte) (Block, error) {
+	r := &srdr{b: data}
+	if tag := r.byte(); tag != storeRecordV3 {
+		return Block{}, fmt.Errorf("not a v3 store record (tag %#x)", tag)
+	}
+	version := r.u32()
+	b, err := decodeBlockBody(r, storeRecordV3)
+	b.Version = version
+	return b, err
+}
+
+// decodeBlockV4 parses the current compact store record.
+func decodeBlockV4(data []byte) (Block, error) {
+	r := &srdr{b: data}
+	if tag := r.byte(); tag != storeRecordV4 {
+		return Block{}, fmt.Errorf("not a v4 store record (tag %#x)", tag)
+	}
+	version := r.u32()
+	b, err := decodeBlockBody(r, storeRecordV4)
+	b.Version = version
+	return b, err
+}
+
+func decodeBlockBody(r *srdr, version byte) (Block, error) {
 	var b Block
 	b.Index = r.u64()
 	b.Timestamp = r.i64()
@@ -292,7 +369,7 @@ func decodeBlockV2(data []byte) (Block, error) {
 	if n > 0 {
 		b.Transactions = make([]Transaction, 0, n)
 		for i := 0; i < n; i++ {
-			tx := decodeTxV2(r)
+			tx := decodeTxV2(r, version)
 			if r.err != nil {
 				return Block{}, fmt.Errorf("transaction %d: %w", i, r.err)
 			}
@@ -308,7 +385,7 @@ func decodeBlockV2(data []byte) (Block, error) {
 	return b, nil
 }
 
-func decodeTxV2(r *srdr) Transaction {
+func decodeTxV2(r *srdr, version byte) Transaction {
 	var t Transaction
 	t.From = r.str()
 	t.To = r.str()
@@ -338,6 +415,9 @@ func decodeTxV2(r *srdr) Transaction {
 	t.AssetID = r.str()
 	if r.optional() {
 		t.Issue = &AssetIssue{Ticker: r.str(), Supply: r.u64()}
+	}
+	if version >= storeRecordV4 && r.optional() {
+		t.AssetOp = &AssetOp{Op: r.str(), Amount: r.u64(), Ticker: r.str(), IssueNonce: r.u64()}
 	}
 
 	t.PubKey = r.str()

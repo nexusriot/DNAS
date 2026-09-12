@@ -33,6 +33,32 @@ func mineOn(t testing.TB, bc *Blockchain, minerAddr string, txs []Transaction) B
 	return mined
 }
 
+// mineVersioned is mineOn with an explicit header version, for the BIP9 tests:
+// the version is the vote, so it has to be settable per block.
+func mineVersioned(t testing.TB, bc *Blockchain, minerAddr string, version uint32, txs []Transaction) Block {
+	t.Helper()
+	tip := bc.Tip()
+	height := tip.Index + 1
+	baseFee := bc.NextBaseFee()
+	cb := NewCoinbaseAt(minerAddr, CoinbaseAmount(height, txs, baseFee), height)
+	block := Block{
+		Version:      version,
+		Index:        height,
+		Timestamp:    tip.Timestamp + 1,
+		Transactions: append([]Transaction{cb}, txs...),
+		PrevHash:     tip.Hash,
+		BaseFee:      baseFee,
+		Bits:         bc.NextBits(),
+	}
+	block.MerkleRoot = MerkleRoot(block.Transactions)
+	block.StateRoot, _ = bc.NextStateRoot(block)
+	mined, ok := Mine(block, nil)
+	if !ok {
+		t.Fatal("mining aborted unexpectedly")
+	}
+	return mined
+}
+
 // mustAdd appends a block the test expects to be valid, failing loudly rather
 // than letting a rejected block quietly shorten the chain under an assertion.
 func mustAdd(t testing.TB, bc *Blockchain, b Block) {
@@ -391,4 +417,12 @@ func TestReplaceChainLongestWins(t *testing.T) {
 	if adopted {
 		t.Fatal("adopted a shorter chain")
 	}
+}
+
+// stateCopy returns a snapshot of the account state, for tests that compare a
+// chain's state against one rebuilt independently.
+func (bc *Blockchain) stateCopy() map[string]Account {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+	return cloneState(bc.state)
 }

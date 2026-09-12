@@ -11,6 +11,11 @@ import (
 // to the header fields plus the merkle root of the transactions, so tampering
 // with any transaction invalidates the root and therefore the hash.
 type Block struct {
+	// Version carries BIP9-style miner signaling (see versionbits.go). It is part
+	// of the proof-of-work preimage, so a bit a miner sets is committed by the work
+	// that block cost — a relay cannot flip it. Consensus places no constraint on
+	// the value itself; only a deployment reads it, and only through Signals.
+	Version      uint32        `json:"version"`
 	Index        uint64        `json:"index"`
 	Timestamp    int64         `json:"timestamp"`
 	Transactions []Transaction `json:"transactions"`
@@ -39,6 +44,7 @@ func MerkleRoot(txs []Transaction) string {
 // proof-of-work and the hash chain from headers alone, then use MerkleRoot to
 // check transaction-inclusion proofs — without ever downloading the bodies.
 type Header struct {
+	Version    uint32 `json:"version"`
 	Index      uint64 `json:"index"`
 	Timestamp  int64  `json:"timestamp"`
 	PrevHash   string `json:"prev_hash"`
@@ -53,6 +59,7 @@ type Header struct {
 // Header returns this block's header.
 func (b Block) Header() Header {
 	return Header{
+		Version:    b.Version,
 		Index:      b.Index,
 		Timestamp:  b.Timestamp,
 		PrevHash:   b.PrevHash,
@@ -70,8 +77,8 @@ func (b Block) Header() Header {
 // post-block account state is committed via StateRoot, so a light client can
 // verify balances against a PoW-verified header.
 func (h Header) headerString() string {
-	return fmt.Sprintf("%d|%d|%s|%s|%s|%d|%d|%d",
-		h.Index, h.Timestamp, h.PrevHash, h.MerkleRoot, h.StateRoot, h.BaseFee, h.Bits, h.Nonce)
+	return fmt.Sprintf("%d|%d|%d|%s|%s|%s|%d|%d|%d",
+		h.Version, h.Index, h.Timestamp, h.PrevHash, h.MerkleRoot, h.StateRoot, h.BaseFee, h.Bits, h.Nonce)
 }
 
 // ComputeHash returns the hash the header should have.

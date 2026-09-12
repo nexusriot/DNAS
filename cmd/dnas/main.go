@@ -69,6 +69,8 @@ func main() {
 		runMultisig(args[1:])
 	case "anchor":
 		runAnchor(args[1:])
+	case "channel":
+		runChannel(args[1:])
 	case "escrow":
 		runEscrow(args[1:])
 	case "backup":
@@ -85,6 +87,8 @@ func main() {
 		runStats(args[1:])
 	case "reorgs":
 		runReorgs(args[1:])
+	case "doctor":
+		runDoctor(args[1:])
 	case "health":
 		runHealth(args[1:])
 	case "help", "-h", "--help":
@@ -141,6 +145,8 @@ Usage:
   dnas stats [-window N]              hashrate, block timing, fee flow, miners
   dnas reorgs                         chain switches this node has lived through
   dnas health                         is this node ready to be relied on?
+  dnas doctor                         run every operational check, and say what to fix
+  dnas channel <cmd>                  unidirectional payment channels (off-chain payments)
   dnas version                        print the build version
 
 A node started in a terminal also drops into an interactive console (type "help"
@@ -179,6 +185,9 @@ Node flags:
   -dandelion      Dandelion++ stem/fluff relay for origin privacy (default true)
   -checkpoints L  finality checkpoints, comma-separated height:hash pairs
   -upgrades L     consensus upgrade activations, comma-separated name:height pairs
+  -deployments L  BIP9 miner votes, name:bit:start:timeout:window:threshold
+  -signalbits L   version bits this node's miner signals, comma-separated
+  -stratum A      serve pool miners on this address (e.g. :3333)
   -config FILE    JSON config file (flags override its values)`)
 }
 
@@ -225,7 +234,10 @@ func runWallet(args []string) {
 
 	fs := flag.NewFlagSet("wallet", flag.ExitOnError)
 	out := fs.String("o", "wallet.json", "wallet key file")
-	index := fs.Uint("index", 0, "HD account index")
+	index := fs.Uint("index", 0, "HD address index")
+	account := fs.Uint("account", 0, "HD account number (SLIP-0010 m/44'/coin'/ACCOUNT'/0'/index')")
+	legacy := fs.Bool("legacy", false, "derive with the pre-SLIP-0010 scheme, to reach coin held under an old mnemonic")
+	bech := fs.Bool("bech32", false, "print addresses in their bech32m spelling")
 	count := fs.Int("n", 5, "number of HD addresses to list")
 	threshold := fs.Int("threshold", 2, "multisig signature threshold (M)")
 	pubkeys := fs.String("pubkeys", "", "comma-separated member public keys (hex) for multisig")
@@ -275,7 +287,24 @@ func runWallet(args []string) {
 		fmt.Printf("wrote %s%s\naddress: %s\n", *out, suffix, w.Address())
 
 	case "address":
-		fmt.Println(loadFile().Address())
+		fmt.Println(showAddress(loadFile().Address(), *bech))
+
+	case "bech32":
+		// Convert an address between its two spellings, in whichever direction it
+		// is not already in. The checksum is verified on the way through, so this
+		// doubles as "is this address real".
+		if len(args) < 2 {
+			log.Fatal("usage: dnas wallet bech32 <address>")
+		}
+		canonical, err := wallet.NormalizeAddress(args[1])
+		if err != nil {
+			log.Fatal(err)
+		}
+		b32, err := wallet.ToBech32(canonical)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("canonical: %s\nbech32:    %s\n", canonical, b32)
 
 	case "pubkey":
 		// The public key is shared with counterparties to build multisig and HTLC
@@ -287,9 +316,10 @@ func runWallet(args []string) {
 		if err != nil {
 			log.Fatal(err)
 		}
-		w := hd.Derive(0)
+		w := hd.DeriveAccount(uint32(*account), 0)
 		save(w)
-		fmt.Printf("wrote %s%s\naddress (index 0): %s\n\n", *out, suffix, w.Address())
+		fmt.Printf("wrote %s%s\naddress (index 0): %s\npath: %s\n\n",
+			*out, suffix, showAddress(w.Address(), *bech), wallet.AccountPath(uint32(*account), 0))
 		fmt.Println("BIP39 backup phrase — write it down, it restores every derived address:")
 		fmt.Println("  " + m)
 
@@ -299,9 +329,10 @@ func runWallet(args []string) {
 		if err != nil {
 			log.Fatal(err)
 		}
-		w := hd.Derive(uint32(*index))
+		w := deriveAt(hd, uint32(*account), uint32(*index), *legacy)
 		save(w)
-		fmt.Printf("restored index %d to %s%s\naddress: %s\n", *index, *out, suffix, w.Address())
+		fmt.Printf("restored index %d to %s%s\naddress: %s\npath: %s\n",
+			*index, *out, suffix, showAddress(w.Address(), *bech), derivationLabel(uint32(*account), uint32(*index), *legacy))
 
 	case "addresses":
 		m := readMnemonic()
@@ -309,8 +340,10 @@ func runWallet(args []string) {
 		if err != nil {
 			log.Fatal(err)
 		}
+		fmt.Printf("%s\n", derivationLabel(uint32(*account), 0, *legacy))
 		for i := 0; i < *count; i++ {
-			fmt.Printf("  [%d] %s\n", i, hd.Derive(uint32(i)).Address())
+			w := deriveAt(hd, uint32(*account), uint32(i), *legacy)
+			fmt.Printf("  [%d] %s\n", i, showAddress(w.Address(), *bech))
 		}
 
 	case "multisig":
@@ -431,6 +464,9 @@ func runNode(args []string) {
 	dandelion := fs.Bool("dandelion", cfg.boolean("dandelion", true), "relay new transactions via Dandelion++ stem/fluff (origin privacy)")
 	checkpoints := fs.String("checkpoints", cfg.str("checkpoints", ""), "finality checkpoints as comma-separated height:hash pairs")
 	upgrades := fs.String("upgrades", cfg.str("upgrades", ""), "consensus upgrade activations as comma-separated name:height pairs (e.g. multioutput:1000)")
+	deployments := fs.String("deployments", cfg.str("deployments", ""), "BIP9 miner votes as comma-separated name:bit:start:timeout:window:threshold")
+	signalBits := fs.String("signalbits", cfg.str("signalbits", ""), "version bits this node's miner signals, comma-separated (e.g. 0,2)")
+	stratumAddr := fs.String("stratum", cfg.str("stratum", ""), "listen for pool miners on this address (e.g. :3333); empty disables it")
 	_ = fs.Parse(args)
 
 	// Pin any finality checkpoints before syncing, so a block at a checkpointed
@@ -460,6 +496,31 @@ func runNode(args []string) {
 		}
 		core.SetUpgradeHeight(name, h)
 		node.Infof("consensus upgrade scheduled", "name", name, "height", h)
+	}
+
+	// Put rule changes to a miner vote instead of a flag day. These terms are
+	// consensus exactly as an activation height is — a node given different
+	// numbers computes a different activation and forks — so they are configured
+	// here alongside the upgrades, before anything opens the chain.
+	for _, d := range parsePeers(*deployments) {
+		dep, err := parseDeployment(d)
+		if err != nil {
+			log.Fatalf("bad -deployments entry %q: %v", d, err)
+		}
+		if err := core.RegisterDeployment(dep); err != nil {
+			log.Fatalf("deployment %q: %v", d, err)
+		}
+		node.Infof("deployment registered", "name", dep.Name, "bit", dep.Bit,
+			"start", dep.Start, "timeout", dep.Timeout,
+			"threshold", fmt.Sprintf("%d/%d", dep.Threshold, dep.Window))
+	}
+
+	bits, err := parseSignalBits(*signalBits)
+	if err != nil {
+		log.Fatalf("bad -signalbits: %v", err)
+	}
+	if len(bits) > 0 {
+		node.Infof("miner will signal version bits", "bits", *signalBits)
 	}
 
 	// Logging first, so everything below is emitted at the requested verbosity and
@@ -544,6 +605,8 @@ func runNode(args []string) {
 			Prune:    *prune,
 			LogLevel: level.String(), LogJSON: *logJSON,
 			Checkpoints: parsePeers(*checkpoints), Upgrades: parsePeers(*upgrades),
+			Deployments: parsePeers(*deployments), SignalBits: *signalBits,
+			Stratum: *stratumAddr,
 			APIAuth: os.Getenv("DNAS_API_TOKEN") != "",
 		})
 		return
@@ -589,6 +652,7 @@ func runNode(args []string) {
 		FaucetAmount:   faucetPayout(*faucetAmount),
 		FaucetCooldown: time.Duration(*faucetCooldown) * time.Second,
 		Webhooks:       parsePeers(*webhooks),
+		SignalBits:     bits,
 	}, chain, mp, w)
 	if *faucet {
 		if n.FaucetEnabled() {
@@ -598,6 +662,13 @@ func runNode(args []string) {
 		}
 	}
 	n.Start()
+	// The pool server comes up after the node, because its first act is to build a
+	// job from the current tip.
+	if *stratumAddr != "" {
+		if err := n.StartStratum(*stratumAddr); err != nil {
+			log.Fatalf("stratum: %v", err)
+		}
+	}
 
 	srv := api.New(n)
 	srv.SetRateLimit(float64(*apiRate), float64(*apiBurst))

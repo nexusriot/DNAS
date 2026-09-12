@@ -90,7 +90,7 @@ func allShapesBlock(t *testing.T) Block {
 
 func TestStoreCodecRoundTripsEveryShape(t *testing.T) {
 	orig := allShapesBlock(t)
-	got, err := decodeStoredBlock(encodeBlockV2(orig))
+	got, err := decodeStoredBlock(encodeBlockV4(orig))
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -133,7 +133,7 @@ func TestStoreCodecHandlesNegativeAndExtremeValues(t *testing.T) {
 		{Index: ^uint64(0), Timestamp: -(1 << 62), BaseFee: ^uint64(0), Nonce: ^uint64(0), Bits: ^uint32(0)},
 		{Index: 7, Timestamp: 0},
 	} {
-		got, err := decodeStoredBlock(encodeBlockV2(b))
+		got, err := decodeStoredBlock(encodeBlockV4(b))
 		if err != nil {
 			t.Fatalf("decode %+v: %v", b, err)
 		}
@@ -183,7 +183,7 @@ func TestStoreCodecKeepsAddressesAndSignaturesExact(t *testing.T) {
 	tx := signedTx(t, w, w.Address(), Coin, testFee, 0)
 	blk := Block{Index: 1, Transactions: []Transaction{tx}}
 
-	got, err := decodeStoredBlock(encodeBlockV2(blk))
+	got, err := decodeStoredBlock(encodeBlockV4(blk))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +209,7 @@ func TestBinaryRecordsAreSmallerThanJSON(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	binBytes := encodeBlockV2(blk)
+	binBytes := encodeBlockV4(blk)
 	if len(binBytes) >= len(jsonBytes) {
 		t.Errorf("binary record is %d bytes, JSON is %d — no saving", len(binBytes), len(jsonBytes))
 	}
@@ -239,9 +239,9 @@ func TestStoreRejectsUnrecognizedRecords(t *testing.T) {
 	for _, data := range [][]byte{
 		{},
 		{0xff, 0x01, 0x02},
-		{storeRecordV2},             // tag only: truncated
-		{storeRecordV2, 0x00, 0x00}, // truncated mid-field
-		append([]byte{storeRecordV2}, make([]byte, 8)...),
+		{storeRecordV4},             // tag only: truncated
+		{storeRecordV4, 0x00, 0x00}, // truncated mid-field
+		append([]byte{storeRecordV4}, make([]byte, 8)...),
 	} {
 		if _, err := decodeStoredBlock(data); err == nil {
 			t.Errorf("decodeStoredBlock(%v) should have failed", data)
@@ -253,7 +253,7 @@ func TestStoreRejectsUnrecognizedRecords(t *testing.T) {
 // however plausible the prefix looked.
 func TestStoreRejectsTrailingBytes(t *testing.T) {
 	blk := Block{Index: 1, Timestamp: 5}
-	data := append(encodeBlockV2(blk), 0x00)
+	data := append(encodeBlockV4(blk), 0x00)
 	if _, err := decodeStoredBlock(data); err == nil {
 		t.Error("a record with trailing bytes should be refused")
 	}
@@ -305,7 +305,7 @@ func BenchmarkStoreEncodeBlock(b *testing.B) {
 	}
 	b.Run("binary", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {
-			_ = encodeBlockV2(blk)
+			_ = encodeBlockV4(blk)
 		}
 	})
 	b.Run("json", func(b *testing.B) {
@@ -329,7 +329,7 @@ func BenchmarkStoreDecodeBlock(b *testing.B) {
 		_ = tx.Sign(w)
 		blk.Transactions = append(blk.Transactions, tx)
 	}
-	binData := encodeBlockV2(blk)
+	binData := encodeBlockV4(blk)
 	jsonData, err := json.Marshal(blk)
 	if err != nil {
 		b.Fatal(err)
@@ -337,7 +337,7 @@ func BenchmarkStoreDecodeBlock(b *testing.B) {
 	b.Logf("record size: binary %d, json %d", len(binData), len(jsonData))
 	b.Run("binary", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {
-			if _, err := decodeBlockV2(binData); err != nil {
+			if _, err := decodeBlockV4(binData); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -350,4 +350,46 @@ func BenchmarkStoreDecodeBlock(b *testing.B) {
 			}
 		}
 	})
+}
+
+// A store written before the header carried a Version must still load: the tag
+// byte tells the two records apart, and a V2 block decodes with Version 0, which
+// is what those blocks were mined with — so the chain replays to the same hashes
+// it always did rather than failing to open.
+func TestStoreReadsPreVersionRecords(t *testing.T) {
+	blk := allShapesBlock(t)
+	blk.Version = 0
+	blk.Hash = blk.ComputeHash()
+
+	got, err := decodeStoredBlock(encodeBlockV2(blk))
+	if err != nil {
+		t.Fatalf("an old record failed to load: %v", err)
+	}
+	if got.Hash != blk.Hash || got.ComputeHash() != blk.Hash {
+		t.Fatalf("v2 record round-tripped to a different block (hash %s, want %s)", got.ComputeHash(), blk.Hash)
+	}
+	if got.Version != 0 {
+		t.Errorf("v2 record decoded with version %d, want 0", got.Version)
+	}
+
+	// And the current format carries the field through unchanged.
+	blk.Version = SignalVersion(3, 9)
+	blk.Hash = blk.ComputeHash()
+	got, err = decodeStoredBlock(encodeBlockV4(blk))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Version != blk.Version || got.ComputeHash() != blk.Hash {
+		t.Fatalf("the current record lost the version: got %#x, want %#x", got.Version, blk.Version)
+	}
+
+	// A V3 record — written after the header gained a version but before assets
+	// could be minted — must still load, with no operation on its transactions.
+	v3, err := decodeStoredBlock(encodeBlockV3(blk))
+	if err != nil {
+		t.Fatalf("a v3 record failed to load: %v", err)
+	}
+	if v3.ComputeHash() != blk.Hash {
+		t.Fatalf("v3 record round-tripped to a different block")
+	}
 }

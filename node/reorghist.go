@@ -176,3 +176,24 @@ func (n *Node) noteRefusedReorg(e *core.ReorgRefusedError) {
 		"impact", "this node may now be on a different chain from its peers, permanently",
 		"action", "compare tips with another node; recovery is a resync from a trusted store")
 }
+
+// snapshot and restore carry the reorg ring across a restart. The counters are
+// deliberately NOT restored: `total`, `deepest` and the refusal tallies are "what
+// this node has seen since it started", and a restart is a new start — an
+// operator reading `refused: 3` needs to know whether those happened in this run,
+// because a refused reorg means the node may have stopped following the network's
+// chain right now. The ENTRIES are history and are worth keeping, so they are.
+func (l *reorgLog) snapshot() []Reorg {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]Reorg(nil), l.entries...)
+}
+
+func (l *reorgLog) restore(entries []Reorg) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(entries) > reorgHistoryCapacity {
+		entries = entries[len(entries)-reorgHistoryCapacity:]
+	}
+	l.entries = append([]Reorg(nil), entries...)
+}

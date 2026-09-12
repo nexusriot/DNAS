@@ -62,55 +62,13 @@ func (s *Server) AuthEnabled() bool { return s.token != "" }
 // Start or driven directly in tests via httptest.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/info", s.info)
-	mux.HandleFunc("/chain", s.chain)
-	mux.HandleFunc("/balance/", s.balance)
-	mux.HandleFunc("/account/", s.account)
-	mux.HandleFunc("/mempool", s.mempool)
-	mux.HandleFunc("/mempool/stats", s.mempoolStats) // fee-rate distribution of the pending queue
-	mux.HandleFunc("/peers", s.peers)                // GET connected peers, in detail
-	mux.HandleFunc("/bans", s.bans)                  // GET scored/banned keys
-	mux.HandleFunc("/unban", s.guard(s.unban))       // POST {key}; clear a ban score
-	mux.HandleFunc("/addpeer", s.guard(s.addPeer))   // POST {addr}; dial a peer now
-	mux.HandleFunc("/droppeer", s.guard(s.dropPeer)) // POST {peer}; close a connection
-	mux.HandleFunc("/chainstats", s.chainStats)      // GET ?window=N; hashrate, intervals, fees
-	mux.HandleFunc("/reorgs", s.reorgs)              // GET the reorgs this node has lived through
-	mux.HandleFunc("/health", s.health)              // GET a supervisor-friendly readiness check
-	mux.HandleFunc("/address", s.address)
-	mux.HandleFunc("/address/", s.addressHistory)          // GET /address/{addr}/history (needs -addrindex)
-	mux.HandleFunc("/tx", s.guard(s.submitTx))             // POST a fully signed transaction
-	mux.HandleFunc("/tx/", s.txByHash)                     // GET /tx/HASH; confirmed or pending lookup
-	mux.HandleFunc("/supply", s.supply)                    // GET coin supply: minted, burned, circulating
-	mux.HandleFunc("/assets", s.assets)                    // GET every issued asset (?ticker=X to filter)
-	mux.HandleFunc("/asset/", s.asset)                     // GET /asset/{id}: one asset and who holds it
-	mux.HandleFunc("/send", s.guard(s.send))               // POST {to, amount, fee, expiry?, nonce?}; signed by node wallet
-	mux.HandleFunc("/mine", s.guard(s.mine))               // POST {on: bool}; toggle mining at runtime
-	mux.HandleFunc("/generate", s.guard(s.generate))       // POST {n}; regtest-only on-demand mining
-	mux.HandleFunc("/blocktemplate", s.blockTemplate)      // GET ?address=ADDR; candidate block for an external miner
-	mux.HandleFunc("/submitblock", s.guard(s.submitBlock)) // POST a mined block
-	mux.HandleFunc("/submitshare", s.guard(s.submitShare)) // POST a share (an easier-target candidate)
-	mux.HandleFunc("/shares", s.shares)                    // GET the share ledger
-	mux.HandleFunc("/faucet", s.guard(s.faucet))           // POST {address}; testnet/regtest only
-	mux.HandleFunc("/estimatefee", s.estimateFee)          // GET ?blocks=N; recommended fee
-	mux.HandleFunc("/metrics", s.metrics)                  // Prometheus-style metrics
-	mux.HandleFunc("/events", s.events)                    // Server-Sent Events: live block/tx stream
-	mux.HandleFunc("/webhooks", s.webhooks)                // GET delivery counters for the configured webhooks
-	// Stateless wallet helpers (no node state touched; localhost/toy use).
-	mux.HandleFunc("/multisig/address", s.multisigAddress) // POST {threshold, pubkeys[]}
-	mux.HandleFunc("/htlc/address", s.htlcAddress)         // POST {hash, recipient, sender, timeout}
-	mux.HandleFunc("/vault/address", s.vaultAddress)       // POST {hot, cold, unlock}
-	mux.HandleFunc("/wallet/hd", s.walletHD)               // POST {mnemonic?, passphrase?, count?}
-	// SPV / light-client endpoints.
-	mux.HandleFunc("/headers", s.headers)        // all block headers
-	mux.HandleFunc("/header/", s.header)         // one header by height
-	mux.HandleFunc("/block/", s.block)           // one full block body by height
-	mux.HandleFunc("/snapshot/", s.snapshot)     // full account state at a height (fast-sync)
-	mux.HandleFunc("/proof/", s.proof)           // inclusion proof for a tx hash
-	mux.HandleFunc("/cfilters", s.cfilters)      // compact block filters (all)
-	mux.HandleFunc("/cfilter/", s.cfilter)       // one compact filter by height
-	mux.HandleFunc("/cfheaders", s.cfheaders)    // filter-header chain
-	mux.HandleFunc("/stateproof/", s.stateProof) // account balance/nonce proof vs the state root
-	mux.HandleFunc("/", s.explorer)              // web block explorer (catch-all)
+	// Every endpoint comes from the route table (routes.go), which is also what
+	// the OpenAPI document is generated from. Registering from it is what makes
+	// the spec trustworthy: an endpoint cannot be served without being described,
+	// because the same entry does both.
+	for _, rt := range s.routes() {
+		mux.HandleFunc(rt.Pattern, rt.handler)
+	}
 
 	// The limit wraps everything, including the read endpoints: the expensive
 	// requests here are reads (a paged /chain, a /snapshot, a /stateproof).
@@ -150,13 +108,9 @@ func (s *Server) authorized(r *http.Request) bool {
 // nothing, and "nothing" is also what a quiet chain looks like.
 func (s *Server) webhooks(w http.ResponseWriter, r *http.Request) {
 	stats := s.node.WebhookStats()
-	writeJSON(w, http.StatusOK, map[string]any{
-		"enabled": s.node.WebhooksEnabled(),
-		"urls":    stats.URLs,
-		"sent":    stats.Sent,
-		"failed":  stats.Failed,
-		"dropped": stats.Dropped,
-		"queued":  stats.Queued,
+	writeJSON(w, http.StatusOK, WebhooksResponse{
+		Enabled: s.node.WebhooksEnabled(), URLs: stats.URLs, Sent: stats.Sent,
+		Failed: stats.Failed, Dropped: stats.Dropped, Queued: stats.Queued,
 	})
 }
 
@@ -201,11 +155,7 @@ func (s *Server) asset(w http.ResponseWriter, r *http.Request) {
 	for _, h := range holders {
 		held += h.Amount
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"asset":   info,
-		"holders": holders,
-		"held":    held,
-	})
+	writeJSON(w, http.StatusOK, AssetResponse{Asset: info, Holders: holders, Held: held})
 }
 
 // explorer serves the self-contained web block explorer at the root path.
@@ -233,7 +183,7 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 }
 
 func writeErr(w http.ResponseWriter, code int, msg string) {
-	writeJSON(w, code, map[string]string{"error": msg})
+	writeJSON(w, code, ErrorResponse{Error: msg})
 }
 
 // Request-body ceilings. The read side of the API is paged, and the P2P side
@@ -280,36 +230,29 @@ func decodeBody(w http.ResponseWriter, r *http.Request, limit int64, v any) erro
 
 func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 	tip := s.node.Chain().Tip()
-	writeJSON(w, http.StatusOK, map[string]any{
-		"network":         core.NetworkName(),
-		"height":          tip.Index,
-		"tip":             tip.Hash,
-		"next_bits":       s.node.Chain().NextBits(),
-		"next_difficulty": core.TargetDifficulty(s.node.Chain().NextBits()),
-		"work":            s.node.Chain().Work().String(),
-		"mempool":         s.node.Mempool().Size(),
-		"min_relay_fee":   s.node.Mempool().MinFee(),
-		"base_fee":        s.node.Chain().NextBaseFee(),
-		"peers":           s.node.PeerAddrs(),
-		// The address manager's tables, so an operator can see how eclipse-
-		// resistant this node currently is rather than only how many peers it has.
-		"addrs":         s.node.AddrStats(),
-		"mining":        s.node.Mining(),
-		"address_index": s.node.Chain().AddressIndexed(),
-		"faucet":        s.node.FaucetEnabled(),
-		"webhooks":      s.node.WebhooksEnabled(),
-		// What this node can actually serve, so a client can tell "not in the
-		// chain" from "not visible from here": the lowest height whose body it
-		// holds, and where its filter-header chain starts.
-		"body_height": s.node.Chain().BodyHeight(),
-		"filter_base": s.node.Chain().FilterHeaderBase(),
-		"pruned":      s.node.Chain().PruneKeep() > 0,
-		// What the chain costs on disk, and how much pruning has reclaimed. A
-		// pruning node used to bound only its resident size while the file kept
-		// growing; this is how an operator sees whether that is still happening.
-		"store":         s.node.Chain().StoreStats(),
-		"prune_keep":    s.node.Chain().PruneKeep(),
-		"pruned_bodies": s.node.Chain().PrunedCount(),
+	chain := s.node.Chain()
+	writeJSON(w, http.StatusOK, InfoResponse{
+		Network:        core.NetworkName(),
+		Height:         tip.Index,
+		Tip:            tip.Hash,
+		NextBits:       chain.NextBits(),
+		NextDifficulty: core.TargetDifficulty(chain.NextBits()),
+		Work:           chain.Work().String(),
+		Mempool:        s.node.Mempool().Size(),
+		MinRelayFee:    s.node.Mempool().MinFee(),
+		BaseFee:        chain.NextBaseFee(),
+		Peers:          s.node.PeerAddrs(),
+		Addrs:          s.node.AddrStats(),
+		Mining:         s.node.Mining(),
+		AddressIndex:   chain.AddressIndexed(),
+		Faucet:         s.node.FaucetEnabled(),
+		Webhooks:       s.node.WebhooksEnabled(),
+		BodyHeight:     chain.BodyHeight(),
+		FilterBase:     chain.FilterHeaderBase(),
+		Pruned:         chain.PruneKeep() > 0,
+		Store:          chain.StoreStats(),
+		PruneKeep:      chain.PruneKeep(),
+		PrunedBodies:   chain.PrunedCount(),
 	})
 }
 
@@ -340,14 +283,9 @@ func (s *Server) estimateFee(w http.ResponseWriter, r *http.Request) {
 	if fee < relayFloor { // must at least clear the relay floor to be admitted
 		fee = relayFloor
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"blocks":        blocks,
-		"per_byte":      true,
-		"base_fee":      baseFee,
-		"tip":           fee - baseFee,
-		"fee":           fee,
-		"fee_fmt":       core.FormatAmount(fee) + "/byte",
-		"min_relay_fee": relayFloor,
+	writeJSON(w, http.StatusOK, EstimateFeeResponse{
+		Blocks: blocks, PerByte: true, BaseFee: baseFee, Tip: fee - baseFee, Fee: fee,
+		FeeFmt: core.FormatAmount(fee) + "/byte", MinRelayFee: relayFloor,
 	})
 }
 
@@ -457,9 +395,7 @@ func (s *Server) faucet(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("no faucet on this node (network %s)", core.NetworkName()))
 		return
 	}
-	var req struct {
-		Address string `json:"address"`
-	}
+	var req faucetRequest
 	if err := decodeBody(w, r, maxControlBody, &req); err != nil {
 		return // decodeBody already answered 400 or 413
 	}
@@ -468,12 +404,9 @@ func (s *Server) faucet(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"hash":       tx.Hash(),
-		"to":         tx.To,
-		"amount":     tx.Amount,
-		"amount_fmt": core.FormatAmount(tx.Amount),
-		"cooldown":   s.node.FaucetCooldown().String(),
+	writeJSON(w, http.StatusOK, FaucetResponse{
+		Hash: tx.Hash(), To: tx.To, Amount: tx.Amount,
+		AmountFmt: core.FormatAmount(tx.Amount), Cooldown: s.node.FaucetCooldown().String(),
 	})
 }
 
@@ -526,22 +459,15 @@ func (s *Server) addressHistory(w http.ResponseWriter, r *http.Request) {
 	}
 	total, _ := s.node.Chain().AddressHistoryLen(addr)
 	tip := s.node.Chain().Tip().Index
-	out := make([]map[string]any, 0, len(entries))
+	out := make([]AddressHistoryEntry, 0, len(entries))
 	for _, e := range entries {
-		out = append(out, map[string]any{
-			"height":        e.Height,
-			"index":         e.Index,
-			"hash":          e.Hash,
-			"confirmations": tip - e.Height + 1,
-			"tx":            e.Tx,
+		out = append(out, AddressHistoryEntry{
+			Height: e.Height, Index: e.Index, Hash: e.Hash,
+			Confirmations: tip - e.Height + 1, Tx: e.Tx,
 		})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"address": addr,
-		"total":   total,
-		"from":    from,
-		"count":   len(out),
-		"entries": out,
+	writeJSON(w, http.StatusOK, AddressHistoryResponse{
+		Address: addr, Total: total, From: from, Count: len(out), Entries: out,
 	})
 }
 
@@ -556,7 +482,7 @@ func (s *Server) submitBlock(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"accepted": true, "height": b.Index, "hash": b.Hash})
+	writeJSON(w, http.StatusOK, SubmitBlockResponse{Accepted: true, Height: b.Index, Hash: b.Hash})
 }
 
 // metrics exposes node stats in the Prometheus text exposition format.
@@ -661,6 +587,34 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	gauge("dnas_store_bytes", "Size of the on-disk block store.", ss.Bytes)
 	gauge("dnas_store_bytes_saved", "Bytes reclaimed by store compaction since start.", ss.BytesSaved)
 
+	// Relay efficiency. Compact blocks and announcement-based transaction relay
+	// are both pure wins when they work and a silent extra round trip when they
+	// do not, so the miss rate is the number to watch rather than the hit count.
+	rs := s.node.RelayStats()
+	counter("dnas_compact_block_hit", "Blocks rebuilt from this node's own mempool.", rs.CompactHit)
+	counter("dnas_compact_block_miss", "Compact blocks that had to be fetched in full instead.", rs.CompactMiss)
+	gauge("dnas_compact_blocks_pending", "Compact blocks awaiting the transactions this node lacked.", rs.PendingBlocks)
+	gauge("dnas_tx_in_flight", "Announced transactions requested but not yet received.", rs.TxInFlight)
+
+	// Pool accounting, for an operator running one: how much work is in the
+	// payout window and how many miners are connected.
+	pool := s.node.Pool()
+	gauge("dnas_pool_window_shares", "Shares in the PPLNS payout window.", pool.Window)
+	gauge("dnas_pool_window_weight", "Total difficulty-weighted work in the payout window.", pool.Weight)
+	gauge("dnas_pool_miners", "Distinct addresses with a claim on the next block.", len(pool.Payouts))
+	gauge("dnas_pool_connections", "Live stratum sessions.", pool.Connections)
+
+	// Consensus deployments under a miner vote, so an operator can watch a rule
+	// change approach activation rather than discover it at the flag day.
+	for _, d := range s.node.Chain().DeploymentStatuses() {
+		fmt.Fprintf(w, "# HELP dnas_deployment_signals Blocks signalling for a deployment in the window in progress.\n")
+		fmt.Fprintf(w, "# TYPE dnas_deployment_signals gauge\n")
+		fmt.Fprintf(w, "dnas_deployment_signals{name=%q,state=%q} %d\n", d.Name, d.State, d.Signals)
+		fmt.Fprintf(w, "# HELP dnas_deployment_activation Height a locked-in deployment takes effect (0 until it locks in).\n")
+		fmt.Fprintf(w, "# TYPE dnas_deployment_activation gauge\n")
+		fmt.Fprintf(w, "dnas_deployment_activation{name=%q} %d\n", d.Name, d.Activation)
+	}
+
 	// Webhook delivery, which is otherwise invisible: a silently failing receiver
 	// looks exactly like a quiet chain.
 	wh := s.node.WebhookStats()
@@ -724,14 +678,12 @@ func (s *Server) mine(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "node has no wallet to mine to")
 		return
 	}
-	var req struct {
-		On bool `json:"on"`
-	}
+	var req mineRequest
 	if err := decodeBody(w, r, maxControlBody, &req); err != nil {
 		return // decodeBody already answered 400 or 413
 	}
 	s.node.SetMining(req.On)
-	writeJSON(w, http.StatusOK, map[string]bool{"mining": s.node.Mining()})
+	writeJSON(w, http.StatusOK, MineResponse{Mining: s.node.Mining()})
 }
 
 // generate mines N blocks immediately (regtest only): POST {"n": N}. It is the
@@ -746,9 +698,7 @@ func (s *Server) generate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, "generate is only available in regtest mode (-regtest)")
 		return
 	}
-	var req struct {
-		N int `json:"n"`
-	}
+	var req generateRequest
 	if err := decodeBody(w, r, maxControlBody, &req); err != nil {
 		return // decodeBody already answered 400 or 413
 	}
@@ -760,7 +710,7 @@ func (s *Server) generate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"mined": len(hashes), "hashes": hashes})
+	writeJSON(w, http.StatusOK, GenerateResponse{Mined: len(hashes), Hashes: hashes})
 }
 
 // Paging on the bulk read endpoints.
@@ -859,10 +809,8 @@ func (s *Server) chain(w http.ResponseWriter, r *http.Request) {
 func (s *Server) balance(w http.ResponseWriter, r *http.Request) {
 	addr := strings.TrimPrefix(r.URL.Path, "/balance/")
 	acc := s.node.Chain().Account(addr)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"address":     addr,
-		"balance":     acc.Balance,
-		"balance_fmt": core.FormatAmount(acc.Balance),
+	writeJSON(w, http.StatusOK, BalanceResponse{
+		Address: addr, Balance: acc.Balance, BalanceFmt: core.FormatAmount(acc.Balance),
 	})
 }
 
@@ -896,14 +844,10 @@ func (s *Server) mempool(w http.ResponseWriter, r *http.Request) {
 // canonical transaction size, which only the node has.
 func (s *Server) mempoolStats(w http.ResponseWriter, r *http.Request) {
 	st := s.node.Mempool().Stats()
-	writeJSON(w, http.StatusOK, map[string]any{
-		"count":       st.Count,
-		"bytes":       st.Bytes,
-		"min_rate":    st.MinRate,
-		"max_rate":    st.MaxRate,
-		"median_rate": st.MedianRate,
-		"base_fee":    s.node.Chain().NextBaseFee(),
-		"buckets":     st.Buckets,
+	writeJSON(w, http.StatusOK, MempoolStatsResponse{
+		Count: st.Count, Bytes: st.Bytes,
+		MinRate: st.MinRate, MaxRate: st.MaxRate, MedianRate: st.MedianRate,
+		BaseFee: s.node.Chain().NextBaseFee(), Buckets: st.Buckets,
 	})
 }
 
@@ -955,6 +899,54 @@ func (s *Server) supply(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.node.Chain().Supply())
 }
 
+// pool reports what the pool owes on the next block it finds: who has a claim on
+// it, how large, and how much work the payout window holds. /shares says how many
+// shares each miner submitted; this says what that is worth, which is the number
+// a miner actually cares about.
+func (s *Server) pool(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.node.Pool())
+}
+
+// series serves per-height chain metrics for plotting. It reuses the same paging
+// as /chain and /headers, so `?last=N` gives the most recent N points — which is
+// what a chart wants and what a plain page-one request would not give.
+func (s *Server) series(w http.ResponseWriter, r *http.Request) {
+	from, limit, ok := s.pageParams(w, r)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, s.node.Chain().Series(from, limit))
+}
+
+// richList ranks the largest coin holders. `limit` is clamped server-side, so a
+// client asking for everything gets the cap rather than an error.
+func (s *Server) richList(w http.ResponseWriter, r *http.Request) {
+	limit := core.DefaultRichListLimit
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			writeErr(w, http.StatusBadRequest, "limit must be a positive integer")
+			return
+		}
+		limit = n
+	}
+	writeJSON(w, http.StatusOK, s.node.Chain().RichList(limit))
+}
+
+// deployments reports every BIP9 rule change put to a miner vote and where the
+// chain has taken it: which bit carries it, how many blocks in the window in
+// progress have signalled, and — once it locks in — the height it takes effect.
+// An empty list means this node has no deployments configured, which is not the
+// same as a vote that failed, so the state is always spelled out per entry
+// rather than inferred from absence.
+func (s *Server) deployments(w http.ResponseWriter, r *http.Request) {
+	st := s.node.Chain().DeploymentStatuses()
+	if st == nil {
+		st = []core.DeploymentStatus{}
+	}
+	writeJSON(w, http.StatusOK, st)
+}
+
 // peers reports every live connection in full: the address, the authenticated
 // identity, the negotiated version and capabilities, who dialed whom, how long
 // it has been up, whether it is currently serving us blocks, and its ban score.
@@ -968,10 +960,7 @@ func (s *Server) peers(w http.ResponseWriter, r *http.Request) {
 // threshold. Keys BELOW the threshold are included deliberately: seeing a peer
 // at 80 of 100 points before it is cut off is most of the value of scoring.
 func (s *Server) bans(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
-		"threshold": s.node.BanThreshold(),
-		"entries":   s.node.Bans(),
-	})
+	writeJSON(w, http.StatusOK, BansResponse{Threshold: s.node.BanThreshold(), Entries: s.node.Bans()})
 }
 
 // unban clears a key's ban score: POST {"key":"<identity-or-ip>"}. Without it an
@@ -982,9 +971,7 @@ func (s *Server) unban(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusMethodNotAllowed, "POST only")
 		return
 	}
-	var req struct {
-		Key string `json:"key"`
-	}
+	var req unbanRequest
 	if err := decodeBody(w, r, maxControlBody, &req); err != nil {
 		return // decodeBody already answered 400 or 413
 	}
@@ -992,7 +979,7 @@ func (s *Server) unban(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"unbanned": req.Key})
+	writeJSON(w, http.StatusOK, UnbanResponse{Unbanned: req.Key})
 }
 
 // addPeer dials a peer at runtime: POST {"addr":"host:port"} — `-peers` without
@@ -1002,9 +989,7 @@ func (s *Server) addPeer(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusMethodNotAllowed, "POST only")
 		return
 	}
-	var req struct {
-		Addr string `json:"addr"`
-	}
+	var req addPeerRequest
 	if err := decodeBody(w, r, maxControlBody, &req); err != nil {
 		return // decodeBody already answered 400 or 413
 	}
@@ -1012,7 +997,7 @@ func (s *Server) addPeer(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"dialing": req.Addr})
+	writeJSON(w, http.StatusOK, AddPeerResponse{Dialing: req.Addr})
 }
 
 // dropPeer closes a connection, matched by advertised address or identity key:
@@ -1023,9 +1008,7 @@ func (s *Server) dropPeer(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusMethodNotAllowed, "POST only")
 		return
 	}
-	var req struct {
-		Peer string `json:"peer"`
-	}
+	var req dropPeerRequest
 	if err := decodeBody(w, r, maxControlBody, &req); err != nil {
 		return // decodeBody already answered 400 or 413
 	}
@@ -1034,7 +1017,7 @@ func (s *Server) dropPeer(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"dropped": req.Peer, "connections": closed})
+	writeJSON(w, http.StatusOK, DropPeerResponse{Dropped: req.Peer, Connections: closed})
 }
 
 // chainStats reports what the header numbers imply: GET /chainstats?window=N.
@@ -1100,15 +1083,10 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	if len(reasons) > 0 {
 		code = http.StatusServiceUnavailable
 	}
-	writeJSON(w, code, map[string]any{
-		"ok":            len(reasons) == 0,
-		"network":       core.NetworkName(),
-		"height":        tip.Index,
-		"tip_age":       age.Round(time.Second).String(),
-		"peers":         peers,
-		"blocks_behind": behind,
-		"mempool":       s.node.Mempool().Size(),
-		"reasons":       reasons,
+	writeJSON(w, code, HealthResponse{
+		OK: len(reasons) == 0, Network: core.NetworkName(), Height: tip.Index,
+		TipAge: age.Round(time.Second).String(), Peers: peers, BlocksBehind: behind,
+		Mempool: s.node.Mempool().Size(), Reasons: reasons,
 	})
 }
 
@@ -1123,7 +1101,7 @@ func (s *Server) address(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "node has no wallet")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"address": wal.Address()})
+	writeJSON(w, http.StatusOK, AddressResponse{Address: wal.Address()})
 }
 
 // submitTx accepts a fully signed transaction from an external wallet.
@@ -1140,7 +1118,7 @@ func (s *Server) submitTx(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"hash": tx.Hash()})
+	writeJSON(w, http.StatusOK, TxSubmitResponse{Hash: tx.Hash()})
 }
 
 // send builds, signs (with the node's wallet) and broadcasts a transaction.
@@ -1157,16 +1135,7 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) {
 	// Nonce is optional: omit it to auto-select the next one, or set it explicitly
 	// (with a higher fee) to fee-bump a stuck transaction. Expiry/LockUntil bound
 	// the height window in which the tx is valid; Memo is optional data.
-	var req struct {
-		To        string        `json:"to"`
-		Amount    uint64        `json:"amount"`
-		Outputs   []core.Output `json:"outputs"`
-		Fee       uint64        `json:"fee"`
-		Expiry    uint64        `json:"expiry"`
-		LockUntil uint64        `json:"lock_until"`
-		Memo      string        `json:"memo"`
-		Nonce     *uint64       `json:"nonce"`
-	}
+	var req sendRequest
 	if err := decodeBody(w, r, maxTxBody, &req); err != nil {
 		return // decodeBody already answered 400 or 413
 	}
@@ -1185,11 +1154,21 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, fmt.Sprintf("too many outputs (max %d)", core.MaxTxOutputs))
 		return
 	}
+	// Either spelling is accepted and normalized to the canonical one before the
+	// transaction is built, so a pasted bech32 address works and the state still
+	// sees exactly one address per account (see wallet/bech32.go).
 	for i, o := range recipients {
-		if err := wallet.ValidateAddress(o.To); err != nil {
+		canonical, err := wallet.NormalizeAddress(o.To)
+		if err != nil {
 			writeErr(w, http.StatusBadRequest, fmt.Sprintf("invalid recipient %d: %s", i, err))
 			return
 		}
+		recipients[i].To = canonical
+	}
+	if len(req.Outputs) > 0 {
+		req.Outputs = recipients
+	} else {
+		req.To = recipients[0].To
 	}
 	if len(req.Memo) > core.MaxMemoBytes {
 		writeErr(w, http.StatusBadRequest, "memo too long")
@@ -1220,7 +1199,7 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"hash": tx.Hash(), "nonce": tx.Nonce})
+	writeJSON(w, http.StatusOK, SendResponse{Hash: tx.Hash(), Nonce: tx.Nonce})
 }
 
 // multisigAddress derives an M-of-N multisig address from a threshold and member
@@ -1231,10 +1210,7 @@ func (s *Server) multisigAddress(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusMethodNotAllowed, "POST only")
 		return
 	}
-	var req struct {
-		Threshold int      `json:"threshold"`
-		PubKeys   []string `json:"pubkeys"`
-	}
+	var req multisigRequest
 	if err := decodeBody(w, r, maxControlBody, &req); err != nil {
 		return // decodeBody already answered 400 or 413
 	}
@@ -1243,10 +1219,8 @@ func (s *Server) multisigAddress(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"threshold": req.Threshold,
-		"n":         len(req.PubKeys),
-		"address":   addr,
+	writeJSON(w, http.StatusOK, MultisigAddressResponse{
+		Threshold: req.Threshold, N: len(req.PubKeys), Address: addr,
 	})
 }
 
@@ -1258,12 +1232,7 @@ func (s *Server) htlcAddress(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusMethodNotAllowed, "POST only")
 		return
 	}
-	var req struct {
-		Hash      string `json:"hash"`
-		Recipient string `json:"recipient"`
-		Sender    string `json:"sender"`
-		Timeout   uint64 `json:"timeout"`
-	}
+	var req htlcRequest
 	if err := decodeBody(w, r, maxControlBody, &req); err != nil {
 		return // decodeBody already answered 400 or 413
 	}
@@ -1272,7 +1241,7 @@ func (s *Server) htlcAddress(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"address": addr, "timeout": req.Timeout})
+	writeJSON(w, http.StatusOK, HTLCAddressResponse{Address: addr, Timeout: req.Timeout})
 }
 
 // vaultAddress derives a time-delayed vault address from its script. Stateless,
@@ -1283,11 +1252,7 @@ func (s *Server) vaultAddress(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusMethodNotAllowed, "POST only")
 		return
 	}
-	var req struct {
-		Hot    string `json:"hot"`
-		Cold   string `json:"cold"`
-		Unlock uint64 `json:"unlock"`
-	}
+	var req vaultRequest
 	if err := decodeBody(w, r, maxControlBody, &req); err != nil {
 		return // decodeBody already answered 400 or 413
 	}
@@ -1296,7 +1261,7 @@ func (s *Server) vaultAddress(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"address": addr, "unlock": req.Unlock})
+	writeJSON(w, http.StatusOK, VaultAddressResponse{Address: addr, Unlock: req.Unlock})
 }
 
 // walletHD generates or restores a BIP39 HD wallet and returns the mnemonic plus
@@ -1308,11 +1273,7 @@ func (s *Server) walletHD(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusMethodNotAllowed, "POST only")
 		return
 	}
-	var req struct {
-		Mnemonic   string `json:"mnemonic"`
-		Passphrase string `json:"passphrase"`
-		Count      int    `json:"count"`
-	}
+	var req walletHDRequest
 	if err := decodeBody(w, r, maxControlBody, &req); err != nil {
 		return // decodeBody already answered 400 or 413
 	}
@@ -1338,10 +1299,7 @@ func (s *Server) walletHD(w http.ResponseWriter, r *http.Request) {
 	for i := range addrs {
 		addrs[i] = hd.Derive(uint32(i)).Address()
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"mnemonic":  mnemonic,
-		"addresses": addrs,
-	})
+	writeJSON(w, http.StatusOK, WalletHDResponse{Mnemonic: mnemonic, Addresses: addrs})
 }
 
 // headers returns block headers from `from`, at most `limit` of them (light

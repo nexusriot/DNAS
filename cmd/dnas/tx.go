@@ -23,14 +23,17 @@ import (
 //	dnas tx inspect -in spend.json     everything about a transaction, checked
 //	dnas tx inspect -hash HASH         the same, for one the node knows
 //	dnas tx verify  -in spend.json     just the verdict, in the exit status
+//	dnas tx export  -address ADDR      an address's whole history as CSV
 //
 // `verify` exits non-zero when a transaction would be rejected, which is what
 // makes it usable in a script that must not submit a bad one.
 func runTx(args []string) {
 	if len(args) == 0 {
-		fmt.Println(`usage: dnas tx <inspect | verify> [flags]
+		fmt.Println(`usage: dnas tx <inspect | verify | export> [flags]
   inspect -in FILE | -hash HASH [-api URL]   decode, check, and describe it
-  verify  -in FILE | -hash HASH [-api URL]   exit 0 only if it would be accepted`)
+  verify  -in FILE | -hash HASH [-api URL]   exit 0 only if it would be accepted
+  export  -address ADDR [-o FILE] [-format csv|json]
+                                             the address's whole history, for accounting`)
 		return
 	}
 	switch args[0] {
@@ -38,8 +41,10 @@ func runTx(args []string) {
 		txInspect(args[1:], false)
 	case "verify":
 		txInspect(args[1:], true)
+	case "export":
+		runExport(args[1:])
 	default:
-		fmt.Println("unknown tx command:", args[0], "(inspect | verify)")
+		fmt.Println("unknown tx command:", args[0], "(inspect | verify | export)")
 	}
 }
 

@@ -1900,27 +1900,38 @@ See [scripts/README.md](scripts/README.md) for the script details.
   real balance; lifting it properly means package/ancestor tracking, which is the
   package-relay item in the ROADMAP. Chained spends still work within a *single
   sender's* nonce run, and for a recipient whose funds have confirmed.
-- Transactions are relayed in full to every peer rather than announced by hash and
-  pulled (there is `MsgInv`/`MsgGetData` for blocks but not for transactions), so
-  each transaction crosses each link once per peer regardless of who already has
-  it.
+- Transactions are announced by hash and pulled (`MsgTxInv`/`MsgGetTx`/`MsgTxs`,
+  gated on the `txinv` capability), so a body crosses each link once rather than
+  once per peer; a peer that does not advertise the capability still receives the
+  full push. Blocks are relayed compactly (`MsgCmpctBlock`, §11): a header plus
+  8-byte short ids that a peer resolves against its own mempool, asking only for
+  what it lacks. The short ids are keyed by the block hash, and a reconstruction
+  that does not reproduce the committed merkle root falls back to a full fetch —
+  so a collision costs a round trip, never a wrong chain.
 - Merkle SPV proves inclusion trustlessly; compact filters add non-inclusion but
   under the honest-node/multi-peer assumption (they aren't header-committed).
   State proofs prove account membership AND absence against the header's trie
-  state root, so "this address holds nothing" is now verifiable rather than
-  taken on a node's word. An authenticated trie that DOES prove
-  absence is implemented and tested ([core/trie.go](core/trie.go)) but is **not
-  yet wired into consensus**: the header still commits the sorted-leaf fold, so
-  the trie's proofs are not bound to proof of work and prove nothing about the
-  chain. Committing the trie root changes the genesis hash — a hard fork, and a
-  deliberate decision rather than a refactor (ROADMAP §1).
-- A coinbase transaction commits only its recipient and amount, so two blocks
-  paying the same miner the same subsidy share a **txid** (Bitcoin's pre-BIP34
-  problem). Lookups therefore resolve a duplicated coinbase to its first
-  occurrence (§6); binding the height into the coinbase would remove the
-  duplication but is a consensus change, so it is deliberately not done here.
-- Supply conservation (`minted − burned == circulating`, §9) is *reported* and
-  asserted in tests, not enforced per block as a consensus rule.
+  state root ([core/trie.go](core/trie.go), [core/state.go](core/state.go)), so
+  "this address holds nothing" is verifiable rather than taken on a node's word:
+  a key's position in the trie is fixed by the key, so arriving at an empty slot
+  is itself the proof. What the trie does NOT yet buy is the other two things it
+  could: the state is still a resident map, so memory bounds the ledger, and the
+  root is rebuilt from the whole account set per call rather than updated
+  incrementally (ROADMAP §1).
+- A coinbase transaction commits only its recipient and amount **until
+  `UpgradeUniqueCoinbase` activates**, so before that height two blocks paying
+  the same miner the same subsidy share a **txid** (Bitcoin's pre-BIP34 problem)
+  and lookups resolve a duplicated coinbase to its first occurrence (§6). From
+  the activation height the coinbase carries the block's height in its `Nonce`,
+  which makes every coinbase distinct. The upgrade may be scheduled by hand or
+  put to a BIP9 miner vote (`-deployments`, [core/versionbits.go](core/versionbits.go)).
+- Supply conservation is a consensus RULE, not only a report: applying a block
+  must change the coin held by accounts by exactly its subsidy minus the base fee
+  its transactions burned, and must change each asset's total only by what that
+  block issued, minted or burned ([core/conservation.go](core/conservation.go)).
+  The per-block identity sums to the chain-wide `minted − burned == circulating`
+  that §9 reports, so a block that would inflate or destroy coin is rejected
+  rather than noticed afterwards.
 - HTLC refund timing and coinbase maturity are enforced at block application, not
   in signature verification. HD is not SLIP-0010. Proof of work is a continuous
   256-bit target (nBits) retargeted by an LWMA with **no hard difficulty cap**, so

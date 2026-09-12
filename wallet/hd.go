@@ -33,10 +33,20 @@ func HDFromMnemonic(mnemonic, passphrase string) (*HDWallet, error) {
 	return &HDWallet{seed: seed}, nil
 }
 
-// Derive returns the Ed25519 wallet at the given account index. Child key
-// material is HMAC-SHA512(seed, "dnas/ed25519" || index), giving deterministic,
-// independent keys per index (a simple ed25519 HD scheme, not SLIP-0010).
-func (h *HDWallet) Derive(index uint32) *Wallet {
+// Derive returns the wallet at the given index of account 0, using SLIP-0010
+// (see slip10.go). It is the derivation every client here uses.
+//
+// This CHANGED: it used to be a one-level scheme of this project's own invention,
+// which produced different addresses. A mnemonic written down under the old
+// scheme still restores those addresses through DeriveLegacy — the keys are not
+// lost — but `dnas wallet restore` now lists the SLIP-0010 ones by default,
+// because those are the ones another wallet can also produce.
+func (h *HDWallet) Derive(index uint32) *Wallet { return h.DeriveAccount(0, index) }
+
+// DeriveLegacy is the pre-SLIP-0010 scheme: HMAC-SHA512(seed, "dnas/ed25519" ||
+// index). It exists only so a mnemonic used before the change can still reach
+// the coin it holds; nothing should derive NEW addresses with it.
+func (h *HDWallet) DeriveLegacy(index uint32) *Wallet {
 	mac := hmac.New(sha512.New, h.seed)
 	mac.Write([]byte("dnas/ed25519"))
 	var idx [4]byte

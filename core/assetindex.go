@@ -22,7 +22,14 @@ type AssetInfo struct {
 	ID     string `json:"id"`
 	Ticker string `json:"ticker"`
 	Issuer string `json:"issuer"`
-	Supply uint64 `json:"supply"` // fixed at issuance; assets cannot be minted twice
+	// Supply is the asset's CURRENT total: what was issued, plus everything its
+	// issuer has minted since, minus everything it has burned (see asset.go). It
+	// was fixed at issuance before UpgradeAssetOps existed, and on a chain where
+	// that upgrade never activates it still is.
+	Supply uint64 `json:"supply"`
+	// Issued is the supply the original issuance created, so a holder can see how
+	// far the total has moved from it.
+	Issued uint64 `json:"issued"`
 	Height uint64 `json:"height"` // the block that issued it
 	TxHash string `json:"tx"`
 }
@@ -44,10 +51,39 @@ func (bc *Blockchain) indexBlockAssetsLocked(b Block) {
 			continue
 		}
 		bc.assets[id] = AssetInfo{
-			ID: id, Ticker: tx.Issue.Ticker, Issuer: tx.From, Supply: tx.Issue.Supply,
+			ID: id, Ticker: tx.Issue.Ticker, Issuer: tx.From,
+			Supply: tx.Issue.Supply, Issued: tx.Issue.Supply,
 			Height: b.Index, TxHash: tx.Hash(),
 		}
 	}
+	// Mints and burns move the total the registry reports. Applied after the
+	// issuances above so a block that issues an asset and immediately mints more
+	// of it lands in the right order.
+	for _, tx := range b.Transactions {
+		bc.applyAssetOpToIndexLocked(tx, false)
+	}
+}
+
+// applyAssetOpToIndexLocked moves an asset's recorded total by one management
+// operation, or undoes it when reversing. bc.mu held for writing.
+func (bc *Blockchain) applyAssetOpToIndexLocked(tx Transaction, reverse bool) {
+	if !tx.IsAssetOp() {
+		return
+	}
+	info, ok := bc.assets[tx.AssetID]
+	if !ok {
+		return // an operation on an asset this node has no record of
+	}
+	mint := tx.AssetOp.Op == AssetOpMint
+	if reverse {
+		mint = !mint
+	}
+	if mint {
+		info.Supply += tx.AssetOp.Amount
+	} else if info.Supply >= tx.AssetOp.Amount {
+		info.Supply -= tx.AssetOp.Amount
+	}
+	bc.assets[tx.AssetID] = info
 }
 
 // unindexBlockAssetsLocked forgets the assets issued by a block being
@@ -55,6 +91,11 @@ func (bc *Blockchain) indexBlockAssetsLocked(b Block) {
 // exist: the balances went with it, and leaving the entry would advertise a
 // token nothing holds. bc.mu held for writing.
 func (bc *Blockchain) unindexBlockAssetsLocked(b Block) {
+	// Operations first, then issuances: undoing in the opposite order to indexing
+	// keeps a block that issued and then minted from leaving a stale total behind.
+	for _, tx := range b.Transactions {
+		bc.applyAssetOpToIndexLocked(tx, true)
+	}
 	for _, tx := range b.Transactions {
 		if !tx.IsIssue() {
 			continue

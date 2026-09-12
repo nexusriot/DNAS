@@ -14,8 +14,13 @@ preimage and the peer handshake ([core/network.go](core/network.go)), so a
 signature cannot be replayed across chains and nodes on different networks never
 try to converge, and a **permissionless, eclipse/DoS-hardened network** (open
 handshake, inbound caps, per-peer rate limiting, a node identity that is its own
-key rather than the operator's wallet). What remains is the long tail that turns
-a correct toy into something you could defend on a live network.
+key rather than the operator's wallet). Since then: **supply conservation is a
+consensus rule** rather than a report, rule changes can be put to a **BIP9 miner
+vote** instead of a hand-configured flag day, transactions are **announced and
+pulled** rather than pushed to every peer, blocks relay **compactly**, and the
+chain has a **Stratum-shaped pool** with per-miner difficulty and PPLNS payouts.
+What remains is the long tail that turns a correct toy into something you could
+defend on a live network.
 
 It is still a learning project. Nothing below should be read as a promise to ship,
 and none of it makes DNAS money. **Do not point it at the internet.**
@@ -112,27 +117,42 @@ sections matter most for "toy → real".
   to bech32 (§5) is a separate, cosmetic-plus-error-detection change that would
   invalidate every address string in the project, and is deliberately not bundled
   into this.
-- **`[M]` BIP9-style miner signaling for upgrades.** `core/upgrade.go` flips rules
-  at fixed activation heights, like checkpoints. Version-bits in the block header
-  would let hashpower signal readiness and activate on a threshold instead of a
-  hard-coded flag day.
-- **`[S]` Enforce supply conservation in consensus.** The accounting now exists:
-  minted (a function of height) and burned (accumulated per block) are tracked
-  independently, `Blockchain.Supply()` reports `minted − burned == circulating`,
-  and the tests assert it across mining, reorgs, reopen and fast-sync
-  ([core/supply.go](core/supply.go), §9). What remains is making it a *rule* —
-  checked per block during application, ideally committed in the header — plus the
-  same treatment for per-asset issue/transfer conservation, so an accounting bug
-  is rejected rather than merely reported.
-- **`[M]` Unique coinbase transactions (BIP34).** A coinbase commits only
-  (recipient, amount), so two blocks paying the same miner the same subsidy have
-  the same txid. Lookups work around it by resolving to the first occurrence
-  ([core/txindex.go](core/txindex.go)), but the duplication is real: an inclusion
-  proof for such a coinbase can only point at one of the blocks. Binding the block
-  height into the coinbase fixes it at the cost of a consensus change (existing
-  stores would not replay), so it wants an activation height via
-  [core/upgrade.go](core/upgrade.go).
-
+- ~~**`[M]` BIP9-style miner signaling for upgrades.**~~ **Done.** `core/upgrade.go`
+  flipped rules at fixed activation heights, like checkpoints: every node had to
+  be told the same number by hand, and nothing checked that the hashpower actually
+  producing blocks was running code that understood the new rule. Activate too
+  early and the miners fork; too late and the change waits on the slowest
+  operator. The block header now carries a `Version`
+  ([core/block.go](core/block.go)) and a deployment claims one of its bits
+  ([core/versionbits.go](core/versionbits.go)): when a window of blocks meets the
+  threshold the rule LOCKS IN, and activates one whole window later — so every
+  node learns the activation height from the chain, with warning. A locked-in
+  deployment has a known height, which is exactly what upgrade.go already
+  consumes, so every validation rule still just asks `IsUpgradeActive` and needs
+  no notion of signaling. A reorg that unwinds a lock-in withdraws the height
+  again. Configured with `-deployments name:bit:start:timeout:window:threshold`
+  and voted with `-signalbits`; `/deployments` reports where each stands.
+  **Consensus change** (the header gained a field, so every block hash differs).
+- ~~**`[S]` Enforce supply conservation in consensus.**~~ **Done.** The identity
+  was tracked and *reported*: a node whose accounting had silently inflated the
+  supply printed `consistent: false` and went on building on the block that did
+  it. It is now a rule, checked per block during application
+  ([core/conservation.go](core/conservation.go)): a block must change the coin
+  held by accounts by exactly `subsidy − burned`, and change each asset's total
+  only by what it issued, minted or burned. Stating it per block rather than
+  chain-wide is what makes it affordable — the delta is read from the undo log,
+  so it costs the block's own footprint rather than a walk of the ledger — and
+  summing the per-block identity over a chain gives back the global one. It is
+  deliberately NOT height-activated: a chain that fails it was already invalid
+  under the rules that produced it, so there is no valid history to protect.
+- ~~**`[M]` Unique coinbase transactions (BIP34).**~~ **Done, as a votable
+  upgrade.** A coinbase committed only (recipient, amount), so two blocks paying
+  the same miner the same subsidy had the same txid, and an inclusion proof for
+  one could only point at one of the blocks. `UpgradeUniqueCoinbase` requires the
+  coinbase's `Nonce` to equal the block height, which no two blocks in a chain
+  share. It is the first real user of the version-bits mechanism above — the
+  project had shipped three height-activated flag days already, and this would
+  have been a fourth.
 - ~~**`[?]` Pick a survivable finality window.**~~ **Done: block time 5s → 60s.**
   `MaxReorgDepth` was a bare 100 blocks and `TargetBlockTime` was 5 seconds, so
   the chain tolerated about **eight minutes** of divergence: any partition longer
@@ -158,9 +178,18 @@ sections matter most for "toy → real".
   ([node/protocol.go](node/protocol.go)) is still JSON. A binary framing on the hot
   path cuts bandwidth and parse CPU, and removes the last consensus-adjacent use of
   a text codec.
-- **`[M]` Compact block relay (BIP152).** Relay short transaction ids plus the
-  prefilled coinbase so a peer reconstructs a block from its own mempool. Large
-  latency/bandwidth win over shipping full blocks, and it reduces orphan rates.
+- ~~**`[M]` Compact block relay (BIP152).**~~ **Done.** A block was announced as a
+  hash and pulled in full, so every peer downloaded every transaction twice —
+  once into the mempool, once inside the block — at exactly the moment latency
+  costs the most work. A compact block ([node/compactblock.go](node/compactblock.go))
+  sends the header, the coinbase and 8-byte short ids; a peer resolves them
+  against its own pool and asks only for what it is missing. Two details make it
+  safe rather than merely clever: the short ids are KEYED BY THE BLOCK HASH, so a
+  colliding transaction cannot be prepared before the proof of work is found; and
+  a reconstruction is verified against the committed merkle root before it is
+  believed, so an honest collision costs a round trip rather than a wrong chain.
+  Gated on the `cmpct` capability, so a peer that does not speak it still gets
+  the hash it always got.
 - ~~**`[M/L]` Outbound address manager + DNS seeds.**~~ **Done, with one caveat.**
   [node/addrman.go](node/addrman.go) is a tried/new address manager: addresses
   that completed a handshake are preferred over ones merely gossiped, tables are
@@ -221,10 +250,24 @@ sections matter most for "toy → real".
   language would unify them behind one verifier and unlock covenants, richer
   vault policies, and arbitrary spend conditions — the single highest-leverage
   expressiveness change.
-- **`[M]` Richer native-asset operations + optional per-asset fees.** Assets today
-  support issue and transfer only, and fees are always paid in coin (§21). Add
-  mint/burn/freeze authority ops and (optionally) allow fees to be paid in an
-  asset.
+- **`[M]` Asset freeze authority + optional per-asset fees.** *Mint and burn are
+  done; these two are not.* An asset's supply was fixed at issuance forever. An
+  issuer can now mint more of it or burn units it holds, under
+  `UpgradeAssetOps` ([core/asset.go](core/asset.go)) — height-activated because a
+  holder of a fixed-supply asset knows the issuer cannot dilute them, so turning
+  it on changes what they are trusting.
+
+  The part worth stealing is how AUTHORITY is checked. "Only the issuer may mint"
+  seems to need a registry lookup, but the asset registry is DERIVED state that no
+  header commits, so a validation rule reading it would be a consensus rule
+  depending on nothing. An asset id is `sha256(issuer | ticker | nonce)`, so an
+  operation that names its ticker and issuing nonce PROVES the sender is the
+  issuer by reproducing the id — one hash, computed from data the transaction
+  itself carries.
+
+  What is still open: FREEZE, which needs per-holder state committed in the state
+  root and is the least defensible of the three anyway, and paying fees in an
+  asset, which is a much deeper change to fee accounting and conservation.
 - **`[L]` Confidential amounts / stealth addresses.** Amounts and parties are fully
   public; Dandelion++ only hides a tx's *origin* at relay time. Pedersen-commitment
   confidential amounts plus one-time stealth addresses would add real on-chain
@@ -239,15 +282,20 @@ sections matter most for "toy → real".
   of coin that is still unconfirmed (DESIGN §21), and a stuck low-fee parent cannot
   be bumped by its child. Ancestor/descendant accounting would restore both and
   close pinning attacks.
-- **`[M]` Announce transactions by hash (inv/getdata for `MsgTx`).** Blocks are
-  announced and pulled; transactions are still pushed in full to every peer, so
-  each one crosses each link once per peer whether or not the peer already has it.
-  Announcing the txid and letting peers request what they lack is the biggest
-  bandwidth win left after compact blocks. A node now *reconciles* its pool once
-  per peer on catch-up (`MsgGetMempool`), which fixes the cold-start hole but is
-  not continuous reconciliation: a transaction broadcast in the gap between that
-  request and the next push is still missed until someone rebroadcasts. Announcing
-  by hash subsumes both.
+- ~~**`[M]` Announce transactions by hash (inv/getdata for `MsgTx`).**~~ **Done.**
+  Every transaction was pushed in full to every peer, so on a well-connected node
+  the same body went out eight times, seven of them to peers that already had it.
+  `MsgTxInv`/`MsgGetTx`/`MsgTxs` ([node/txrelay.go](node/txrelay.go)) replace all
+  but one of those copies with 64 bytes. The detail that makes it correct rather
+  than merely smaller: an announcement is NOT recorded in the seen set — marking
+  it there would mean that a peer which announced and never delivered made the
+  transaction permanently unfetchable from anyone else. Requests are tracked
+  separately, one in flight per id with an expiry, so eight peers announcing the
+  same id produce one download and a peer that goes quiet does not block it
+  forever. Dandelion++ is untouched: its stem still pushes the body, because the
+  bandwidth argument does not apply to one peer and the extra round trip would
+  widen the timing signal the stem exists to hide. This also subsumes the
+  cold-start hole `MsgGetMempool` covered.
 - **`[S/M]` Weight-based congestion signal.** The EIP-1559 base fee currently
   responds to transaction *count* (§9); switching the signal to block weight/bytes
   makes it track real demand.
@@ -266,25 +314,77 @@ sections matter most for "toy → real".
 
 ## 5. Wallet & UX
 
-- **`[M]` SLIP-0010 / BIP32 HD + hardware wallets.** HD derivation is a simple
-  HMAC-SHA512 scheme (§21), and it is *hardened*, so there is no extended public
-  key to hand out — the light wallet's watch-only export is an address list
-  instead ([cmd/dnas/spvlabels.go](cmd/dnas/spvlabels.go)). Standard derivation is
-  the prerequisite for a real xpub, for Ledger / Trezor support, and for
-  cross-wallet interop.
-- **`[M]` bech32 addresses with consensus-checked checksums.** Recipient checksums
-  are validated client-side only (§21), so a malicious client can still burn coins.
-  A bech32 address format checked in consensus makes fat-finger and buggy-client
-  burns impossible.
-- **`[S]` Fresh addresses per invoice.** `dnas invoice` matches a payment by
+- **`[M]` Hardware wallets.** *SLIP-0010 is done; the devices are not.* Derivation
+  was a one-level scheme of this project's own invention, so a mnemonic written
+  down here could only ever be restored here. It is now SLIP-0010
+  ([wallet/slip10.go](wallet/slip10.go)), checked against the standard's own
+  Ed25519 test vectors, on the path `m/44'/9999'/account'/0'/index'`. The old
+  scheme remains reachable as `DeriveLegacy` (`-legacy`) so a mnemonic from
+  before the change still reaches its coin.
+
+  What standard derivation did NOT buy is an extended public key, and it cannot:
+  BIP32's public derivation works because a secp256k1 public key is a point you
+  can add to, and an Ed25519 public key is a hash of a scalar. Every level is
+  therefore hardened, there is no xpub, and a watch-only export stays a LIST of
+  addresses. Ledger/Trezor support is now a matter of the device protocol rather
+  than of the derivation.
+- ~~**`[M]` bech32 addresses**~~ **Done — as an interchange encoding, deliberately
+  not a second consensus format.** The consensus-checksum half of this item was
+  already closed by `UpgradeCheckedAddresses`, so what remained was the *quality*
+  of the error detection: a truncated hex checksum says "these bytes are wrong"
+  and nothing more. Bech32m ([wallet/bech32.go](wallet/bech32.go)) is a BCH code
+  over an alphabet that excludes the characters people confuse (1/l, 0/O, b/8):
+  it catches up to four wrong characters, is case-insensitive so an address
+  survives being read aloud, and a test asserts that EVERY single-character
+  substitution and transposition is rejected.
+
+  The honest limit, and the reason it stops there: the same 20 bytes have two
+  spellings, and every user-facing entry point normalizes to the canonical one
+  before signing. Teaching consensus about both would mean two state keys for one
+  owner — coin sent to `dnas1…` would sit in a different account from coin sent
+  to `dnas…` — which is the kind of split that strands money. The error detection
+  is worth having where typos happen; that is not.
+- **`[S]` Fresh addresses per invoice.** *Now unblocked: SLIP-0010 landed above.*
+  `dnas invoice` matches a payment by
   (address, amount, height), so two invoices for the same amount at the same
   address are indistinguishable — the file says so, which is not the same as
   fixing it. An HD-derived address per invoice would, and needs the standard
   derivation above to be worth exporting.
-- **`[M]` A watch-only daemon around `invoice watch`.** Watching is a foreground
-  poll (`-wait`, `-every`): a shop wants something that survives a restart,
-  remembers which invoices are outstanding, and calls a webhook when one settles
-  rather than holding a terminal open.
+- ~~**`[M]` A watch-only daemon around `invoice watch`.**~~ **Done.**
+  `invoice watch` was a foreground poll over one file; when the terminal closed,
+  the watching stopped. `dnas invoice serve`
+  ([cmd/dnas/invoiceserve.go](cmd/dnas/invoiceserve.go)) watches a whole directory,
+  remembers what it has reported across restarts, and calls a webhook when an
+  invoice settles or expires.
+
+  Its delivery guarantee is deliberately the opposite of the node's. A node's
+  webhooks are AT-MOST-once behind a bounded queue — the right trade for a node
+  and the wrong one for money. This keeps its state on disk and re-POSTs on every
+  pass until the receiver answers 2xx, so a webhook endpoint that was down for an
+  hour is told about the payment when it comes back. That makes delivery
+  at-least-once, which is why every notification carries the invoice reference to
+  deduplicate on.
+- **`[M]` Bidirectional payment channels.** *Unidirectional ones are done.*
+  `dnas channel` ([cmd/dnas/channel.go](cmd/dnas/channel.go)) settles a stream of
+  payments with ONE transaction on the chain: two parties lock funds in a 2-of-2,
+  pass signed-but-unbroadcast settlements between themselves for as long as they
+  like, and publish only the last. It is a protocol over primitives that already
+  existed — a multisig address, `LockUntil`, multi-output transfers, and the
+  partial-signature envelope — and needs no consensus change at all.
+
+  Two properties carry it, and both fall out of the account model. Every
+  transaction that can spend the channel uses the SAME nonce, and an account's
+  nonce advances once, so of all the alternatives that exist at most one can ever
+  confirm — an old settlement is not a second payment, it is a dead one. And
+  because the balance only moves one way, the newest settlement is also the one
+  that pays the receiver most, and only the receiver can complete it; a
+  bidirectional channel would need revocation and penalty transactions, which is
+  most of Lightning's complexity and the reason this stops here.
+
+  The one rule that cannot be relaxed is an ordering one: `channel fund` refuses
+  to broadcast until the funder holds a refund the RECEIVER has countersigned,
+  because without it a receiver who vanishes keeps the capacity forever.
+
 - **`[M]` PSBT-style partial signatures as a FORMAT.** `dnas multisig` and
   `dnas sponsor` pass a transaction between signers as a JSON envelope carrying
   the network it is for, which works and is not interoperable with anything: a
@@ -334,51 +434,80 @@ sections matter most for "toy → real".
   actually pays, since every record is parsed on open. It is explicitly not the
   consensus codec: these records are local, never hashed and never sent to a
   peer.
-- **`[S]` A Grafana dashboard for the Prometheus metrics.** The metrics themselves
-  are now complete: `GET /metrics` ([api/api.go](api/api.go)) exports 45 series —
-  height, difficulty, mempool depth *and bytes*, peer count, relay floor, base
-  fee, mining flag and the share ledger as before, plus everything that used to be
-  JSON-only: reorg totals and depth ([node/reorghist.go](node/reorghist.go)),
-  orphan count, ban scores and the threshold, hashrate and block intervals
-  ([core/chainstats.go](core/chainstats.go)), supply (minted/burned/circulating),
-  tip age, blocks-behind, and webhook delivery counters. What remains is a
-  dashboard to ship alongside them.
+- ~~**`[S]` A Grafana dashboard for the Prometheus metrics.**~~ **Done, with the
+  half that was missing from the request.** `/metrics` now exports 53 series, and
+  a dashboard with fifty series and no alerting is a dashboard nobody opens. So
+  [scripts/monitoring/](scripts/monitoring/) ships both: a 27-panel dashboard and
+  15 Prometheus alert rules, grouped by what has gone wrong. The rules are the
+  failure modes this project actually found rather than imagined —
+  `DnasReorgRefused` first, because a diverged node has peers, a fresh tip and by
+  its own reckoning is not behind, so nothing else on the dashboard would notice
+  it. A test scrapes a live node and fails if either file names a metric that is
+  not exported, since a renamed series turns a panel into a flat line and an
+  alert into one that can never fire — both of which look exactly like nothing
+  being wrong.
 - **`[M]` JSON-RPC 2.0 interface.** The HTTP API is REST; a bitcoind-style JSON-RPC
   surface eases integration with existing tooling and block explorers.
-- **`[S]` systemd unit + RPM + wider release matrix.** A `.deb` and tagged CI
-  releases exist; add a hardened systemd unit, an RPM, and darwin/windows to the
-  default `dist` targets.
-- **`[S/M]` Charts in the web explorer.** The page now has a universal search (a
-  height, a block hash, a transaction hash or an address), the asset registry, and
-  a panel for what the node can serve. What is still missing is anything over
-  TIME: supply / difficulty / fee-rate charts and a rich list. Every input exists
-  server-side — per-address history (`/address/{addr}/history` with `-addrindex`),
-  the mempool's fee-rate distribution (`/mempool/stats`), and hashrate / block
-  timing / fee flow (`/chainstats`) — so this is purely a rendering job. The TUI
-  draws the histogram and the PyQt client shows the stats; the web explorer is the
-  one client still showing only status, blocks and mempool.
+- **`[S]` Wider release matrix.** *The unit and the RPM are done; darwin/windows
+  are not.* [scripts/packaging/dnas.service](scripts/packaging/dnas.service) is a
+  sandboxed unit (`ProtectSystem=strict`, an empty capability bounding set, a
+  syscall filter, one writable path) with the API token in an `EnvironmentFile`
+  rather than on a command line every local user can read out of `/proc`.
+  `make rpm` builds an RPM from [scripts/packaging/dnas.spec](scripts/packaging/dnas.spec).
+  Unlike the `.deb` it does not cross-compile — rpmbuild runs the build itself —
+  so an RPM for another architecture must be built on or in a container for it.
+  What remains is darwin and windows in the default `dist` targets.
+- ~~**`[S/M]` Charts in the web explorer.**~~ **Done, plus the rich list.** The
+  page showed status, blocks and mempool and nothing over TIME. It now draws five
+  sparklines — difficulty, base fee, block interval, transactions per block, fees
+  per block — as inline SVG it renders itself, because the page is served by the
+  node and must work on a machine with no internet.
+
+  It turned out not to be purely a rendering job after all: `/chainstats`
+  summarizes a window into single numbers, which cannot show a quantity MOVING (a
+  median interval of 60s is the same number whether every block took 60s or half
+  took 5s and half took 115s). `/series` ([core/chainstats.go](core/chainstats.go))
+  is the per-height series the charts needed. `/richlist`
+  ([core/richlist.go](core/richlist.go)) ranks holders through a bounded min-heap,
+  so one request cannot sort a whole ledger.
 - **`[M]` Persist the address index.** It is in memory and rebuilt at every
   startup ([core/addrindex.go](core/addrindex.go)), which is fine for a devnet and
   not for a chain of any length. It also grows with an address's usage rather than
   with the chain, so it wants an on-disk, paged representation rather than a map
   of slices.
-- **`[M]` A real mining pool, not just shares.** Shares exist
-  ([node/shares.go](node/shares.go)) but the pool side does not: no per-miner
-  share difficulty (everyone gets the same target regardless of hashrate), no
-  variance-smoothing payout scheme (PPLNS/PPS), no persistence — the ledger is
-  lost on restart — and no authentication of who is submitting. Any of those makes
-  the current implementation a demonstration rather than something to point real
-  hashpower at.
+- ~~**`[M]` A real mining pool, not just shares.**~~ **Done.** Shares existed with
+  no pool around them: one target for everyone, no payout scheme, no persistence,
+  no authentication. All four are now closed.
+
+  `dnas node -stratum :3333` ([node/stratum.go](node/stratum.go)) serves a
+  Stratum-shaped protocol — line-delimited JSON-RPC,
+  subscribe/authorize/notify/submit, jobs PUSHED the moment the tip moves. It is
+  explicitly NOT Bitcoin-compatible: Stratum V1's job encoding is built around
+  Bitcoin's 80-byte header, so a cgminer pointed at this port would hash the
+  wrong bytes, and pretending otherwise would be worse than saying so. Each
+  connection gets its own EXTRANONCE, written into the coinbase memo so two
+  miners on one tip search different spaces rather than racing over identical
+  nonces; its own DIFFICULTY, retuned toward one share every ten seconds
+  ([node/pool.go](node/pool.go)); and its shares are weighted by their own
+  difficulty and paid PPLNS, so what a miner earns tracks the work it did rather
+  than the shares it happened to submit. `/pool` reports what the pool owes on
+  the next block it finds.
 - **`[S/M]` A public testnet with seeds and a hosted faucet.** The pieces exist —
   a distinct `testnet` network with its own genesis, and `-faucet` — but nothing is
   hosted, so joining still means knowing someone's address. It wants DNS seeds
   (the addrman item in §2), a public node, and a faucet whose abuse control is
   better than a per-IP cooldown.
-- **`[M]` Persist the reorg history and the share ledger.** Both are in-memory
-  rings today ([node/reorghist.go](node/reorghist.go), [node/shares.go](node/shares.go)),
-  so a restart loses exactly the record you want after an incident, and a pool
-  loses its accounting. They want the same treatment the peer/ban/mempool soft
-  state already gets in [node/persist.go](node/persist.go).
+- ~~**`[M]` Persist the reorg history and the share ledger.**~~ **Done.** Both
+  were in-memory rings, so a restart lost exactly the record you want after an
+  incident and cost a pool its accounting. They now get the same treatment the
+  peer/ban/mempool soft state already had ([node/persist.go](node/persist.go)),
+  along with the PPLNS payout window.
+
+  One deliberate asymmetry: the reorg ENTRIES are restored and the reorg COUNTERS
+  are not. `total`, `deepest` and the refusal tallies mean "what this node has
+  seen since it started", and an operator reading `refused: 3` needs to know
+  whether those happened in this run — because a refused reorg means the node may
+  have stopped following the network's chain right now.
 - ~~**`[S]` Size-bound the HTTP write endpoints.**~~ **Done.** Every write endpoint
   now decodes through `decodeBody` ([api/api.go](api/api.go)), which wraps the body
   in an `http.MaxBytesReader` and answers **413** before parsing: 64 KiB for the
@@ -389,10 +518,6 @@ sections matter most for "toy → real".
   stopped mid-stream. What remains on this axis is the P2P half: an inbound frame
   has only the coarse 64 MiB `maxFrame` cap, which is the per-message-type item
   in §2.
-- **`[S]` Binary block bodies on disk.** The block store's framing is binary but
-  each record is still the block's JSON ([core/store.go](core/store.go)).
-  Switching records to the canonical codec shrinks the file and speeds startup;
-  `dnas db export`/`import` already provides the migration path.
 - **`[S]` Expose the empty-block interval to operators.** The miner's idle throttle
   is a `node.Config` field (`EmptyBlockInterval`, default one `TargetBlockTime`),
   reachable only in Go — there is no `-emptyinterval` flag or `node.json` key, so a
@@ -400,9 +525,16 @@ sections matter most for "toy → real".
 
 ## 7. Assurance & testing
 
-- **`[M]` Structural / differential fuzzing.** Fuzz the canonical codec (round-trip
-  and hash-stability), transaction/block validation, and reorg+undo against a
-  from-scratch oracle.
+- ~~**`[M]` Structural / differential fuzzing.**~~ **Done.** The existing fuzz
+  targets checked that nothing panics, which finds crashes and is not what is most
+  likely to be wrong: a consensus bug is usually a correct-looking function that
+  computes a subtly different answer, and it will not crash.
+  [core/difffuzz_test.go](core/difffuzz_test.go) adds six differential targets,
+  each checked against a from-scratch oracle written to be obviously correct
+  rather than fast — a literal merkle fold, a trie built in the REVERSE order (so
+  an insertion-order dependence shows up), a block-by-block subsidy sum, and a
+  full state rebuild compared against what the undo log produced after a real
+  reorg.
 - **`[M]` Long-running adversarial testnet.** The in-process `simnet` harness proves
   convergence in seconds; a real multi-node testnet with churn, partitions, and a
   rogue miner running for days catches what a unit test cannot.

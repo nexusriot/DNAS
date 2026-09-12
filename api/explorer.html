@@ -44,6 +44,17 @@
   .tag { display:inline-block; font-size:10px; padding:1px 6px; border-radius:4px;
          border:1px solid var(--border); color:var(--muted); }
   .tag.cb { color:var(--warn); border-color:var(--warn); }
+  .charts { display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:8px; }
+  .chart { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:10px 12px; }
+  .chart .title { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
+  .chart .now { color:var(--accent); font-size:15px; margin:2px 0 6px; }
+  .chart svg { display:block; width:100%; height:60px; }
+  .chart .range { display:flex; justify-content:space-between; color:var(--muted); font-size:10px; }
+  .rich td, .rich th { padding:4px 8px; text-align:left; border-bottom:1px dotted var(--border); }
+  .rich { width:100%; border-collapse:collapse; font-size:13px; }
+  .rich th { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
+  .rich td.num { text-align:right; font-variant-numeric:tabular-nums; }
+  .bar { height:6px; background:var(--accent); border-radius:3px; min-width:1px; }
   input, button {
     font:inherit; background:#0e150f; color:var(--fg);
     border:1px solid var(--border); border-radius:6px; padding:7px 9px;
@@ -120,6 +131,12 @@
 
   <h2>Assets</h2>
   <div id="assets"></div>
+
+  <h2>Over time</h2>
+  <div class="charts" id="charts"></div>
+
+  <h2>Rich list</h2>
+  <div id="richlist"></div>
 
   <h2>This node</h2>
   <div id="nodeinfo"></div>
@@ -325,6 +342,101 @@ function renderAssets(list) {
 // What this node can and cannot answer. A pruning or fast-synced node cannot
 // serve old bodies, their proofs or their filters, and a page that did not say
 // so would make "not found" look like "not in the chain".
+// sparkline draws a series as an inline SVG path. No chart library: the page is
+// served by the node itself and must work on a machine with no internet, so
+// everything it draws it draws itself.
+//
+// The y-axis is scaled to the data's own range rather than to zero. For the
+// quantities here — difficulty, base fee, block interval — the interesting part
+// is nearly always the variation, and anchoring at zero flattens a retarget into
+// a straight line.
+function sparkline(values) {
+  const n = values.length;
+  if (n === 0) return '<svg viewBox="0 0 100 30" preserveAspectRatio="none"></svg>';
+  if (n === 1) return `<svg viewBox="0 0 100 30" preserveAspectRatio="none">` +
+    `<path d="M0 15 L100 15" fill="none" stroke="var(--accent)" stroke-width="1.5"/></svg>`;
+  let lo = Infinity, hi = -Infinity;
+  for (const v of values) { if (v < lo) lo = v; if (v > hi) hi = v; }
+  const span = (hi - lo) || 1;
+  const pts = values.map((v, i) => {
+    const x = (i / (n - 1)) * 100;
+    // SVG's y grows downward, so a larger value must map to a SMALLER y.
+    const y = 28 - ((v - lo) / span) * 26;
+    return `${x.toFixed(2)} ${y.toFixed(2)}`;
+  });
+  const line = "M" + pts.join(" L");
+  const area = line + ` L100 30 L0 30 Z`;
+  return `<svg viewBox="0 0 100 30" preserveAspectRatio="none">`
+    + `<path d="${area}" fill="var(--accent)" opacity="0.12"/>`
+    + `<path d="${line}" fill="none" stroke="var(--accent)" stroke-width="1.5"` +
+      ` vector-effect="non-scaling-stroke"/></svg>`;
+}
+
+function renderCharts(series) {
+  const el = document.getElementById("charts");
+  if (!series || series.length === 0) {
+    el.innerHTML = `<div class="chart muted">no data yet</div>`;
+    return;
+  }
+  // Heights 0 and 1 carry no usable interval. Genesis has nothing before it, and
+  // genesis's timestamp is a fixed constant years before any chain is actually
+  // mined — so block 1's "interval" is the age of that constant, not how long the
+  // block took. Plotting it puts a value of tens of millions next to values of
+  // tens, which flattens every real block onto the axis.
+  const intervals = series.filter(p => Number(p.height) > 1).map(p => Number(p.interval));
+  const panels = [
+    ["difficulty", series.map(p => Number(p.difficulty)), v => v.toFixed(2)],
+    ["base fee / byte", series.map(p => Number(p.base_fee)), v => String(v)],
+    ["block interval (s)", intervals, v => v.toFixed(0)],
+    ["transactions / block", series.map(p => Number(p.txs)), v => v.toFixed(0)],
+    ["fees / block", series.map(p => Number(p.fees) / COIN), v => v.toFixed(4)],
+  ];
+  el.innerHTML = panels.map(([title, values, fmtv]) => {
+    if (values.length === 0) return "";
+    const now = values[values.length - 1];
+    const lo = Math.min(...values), hi = Math.max(...values);
+    return `<div class="chart">`
+      + `<div class="title">${esc(title)}</div>`
+      + `<div class="now">${esc(fmtv(now))}</div>`
+      + sparkline(values)
+      + `<div class="range"><span>min ${esc(fmtv(lo))}</span>`
+      + `<span>${values.length} blocks</span>`
+      + `<span>max ${esc(fmtv(hi))}</span></div>`
+      + `</div>`;
+  }).join("");
+}
+
+function renderRichList(rl) {
+  const el = document.getElementById("richlist");
+  if (!rl || !rl.entries || rl.entries.length === 0) {
+    el.innerHTML = `<div class="card muted">nobody holds any coin yet</div>`;
+    return;
+  }
+  const top = rl.entries[0].percent || 1;
+  const rows = rl.entries.map(e => {
+    const pct = Number(e.percent) || 0;
+    // Bars are scaled against the LARGEST holder, not against 100%: on a young
+    // chain where one miner holds nearly everything, scaling to 100 makes every
+    // other bar invisible.
+    const width = Math.max(1, Math.round((pct / top) * 100));
+    return `<tr>`
+      + `<td class="num">${e.rank}</td>`
+      + `<td class="mono"><a href="#" onclick="searchAddress('${esc(e.address)}');return false">${esc(short(e.address, 24))}</a></td>`
+      + `<td class="num">${esc(e.balance_fmt)}</td>`
+      + `<td class="num">${pct.toFixed(2)}%</td>`
+      + `<td style="width:120px"><div class="bar" style="width:${width}%"></div></td>`
+      + `</tr>`;
+  }).join("");
+  el.innerHTML = `<div class="card">`
+    + `<div class="muted" style="margin-bottom:6px">`
+    + `top ${rl.shown} of ${rl.accounts} account(s) hold ${Number(rl.top_share).toFixed(2)}% `
+    + `of ${esc(fmt(rl.circulating))} ${esc("DNAS")}</div>`
+    + `<table class="rich"><thead><tr>`
+    + `<th>#</th><th>address</th><th style="text-align:right">balance</th>`
+    + `<th style="text-align:right">share</th><th></th>`
+    + `</tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
 function renderNodeInfo(info, health, stats, reorgs) {
   const rows = [];
   if (health) {
@@ -368,11 +480,13 @@ async function refresh() {
       [j("/info"), j("/chain?last=12"), j("/mempool"), j("/supply")]);
     // The panels below are best-effort: a node that predates any of these
     // endpoints still renders the rest of the page rather than going blank.
-    const [assets, health, stats, reorgs] = await Promise.all([
+    const [assets, health, stats, reorgs, series, rich] = await Promise.all([
       j("/assets").catch(() => null),
       jAny("/health").catch(() => null),
       j("/chainstats").catch(() => null),
       j("/reorgs").catch(() => null),
+      j("/series?last=144").catch(() => null),
+      j("/richlist?limit=15").catch(() => null),
     ]);
     const chips = [
       // Which chain this is. Testnet and regtest have their own genesis and their
@@ -395,6 +509,8 @@ async function refresh() {
     renderBlocks(chain);
     renderMempool(mp || []);
     renderAssets(assets);
+    renderCharts(series);
+    renderRichList(rich);
     renderNodeInfo(info, health, stats, reorgs);
     st.textContent = "● live";
     st.className = "sub ok";

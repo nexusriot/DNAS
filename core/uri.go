@@ -76,11 +76,14 @@ func ParsePaymentURI(s string) (PaymentURI, error) {
 
 	rest, hasScheme := cutScheme(s)
 	if !hasScheme {
-		// A bare address: no query to read, so validate and hand it back.
-		if err := wallet.ValidateAddress(s); err != nil {
+		// A bare address: no query to read, so validate and hand it back. Either
+		// spelling is accepted and normalized, so a pasted bech32 address works
+		// everywhere a canonical one does and consensus still sees one form.
+		canonical, err := wallet.NormalizeAddress(s)
+		if err != nil {
 			return PaymentURI{}, fmt.Errorf("not a %s: URI or a valid address: %w", URIScheme, err)
 		}
-		return PaymentURI{Address: s}, nil
+		return PaymentURI{Address: canonical}, nil
 	}
 
 	addr, query, _ := strings.Cut(rest, "?")
@@ -94,10 +97,11 @@ func ParsePaymentURI(s string) (PaymentURI, error) {
 	if addr == "" {
 		return PaymentURI{}, errors.New("payment URI has no address")
 	}
-	if err := wallet.ValidateAddress(addr); err != nil {
+	canonical, err := wallet.NormalizeAddress(addr)
+	if err != nil {
 		return PaymentURI{}, fmt.Errorf("payment URI address: %w", err)
 	}
-	out := PaymentURI{Address: addr}
+	out := PaymentURI{Address: canonical}
 
 	if query == "" {
 		return out, nil

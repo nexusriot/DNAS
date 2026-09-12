@@ -72,3 +72,71 @@ func (a Account) withAssetDelta(id string, delta int64) Account {
 	a.Assets = m
 	return a
 }
+
+// Asset management operations.
+//
+// Issuance fixes a supply and then the issuer has no further say: the units
+// exist, and that is the whole lifecycle. Real tokens are rarely like that —
+// most want to expand supply later, and all of them want a way to destroy units
+// that should no longer exist (a redemption, a bridge withdrawal, a mistake).
+//
+// The interesting part is AUTHORITY. "Only the issuer may mint" needs consensus
+// to know who issued an asset, and the obvious way to arrange that is a registry
+// lookup. But the asset registry (assetindex.go) is DERIVED state: it is rebuilt
+// by walking the chain and is not committed in any header, so a validation rule
+// that read it would be a consensus rule depending on something no block commits.
+//
+// The id is the answer instead. An asset id is sha256(issuer | ticker | nonce),
+// so a transaction that names its ticker and its issuing nonce PROVES the sender
+// is the issuer by reproducing the id — no lookup, nothing to trust, and it
+// cannot be forged without a preimage attack on sha256. The authority check is
+// therefore one hash, computed from data the transaction itself carries.
+
+// Asset operations.
+const (
+	AssetOpMint = "mint"
+	AssetOpBurn = "burn"
+)
+
+// AssetOp is a management operation on an existing asset. It travels on a
+// transaction whose AssetID names the asset; Ticker and IssueNonce reproduce the
+// id from the sender, which is what proves the sender issued it.
+type AssetOp struct {
+	Op     string `json:"op"`
+	Amount uint64 `json:"amount"`
+	// Ticker and IssueNonce are the issuance preimage: AssetID(From, Ticker,
+	// IssueNonce) must equal the transaction's AssetID.
+	Ticker     string `json:"ticker"`
+	IssueNonce uint64 `json:"issue_nonce"`
+}
+
+// KnownAssetOp reports whether op is an operation this build understands.
+func KnownAssetOp(op string) bool {
+	return op == AssetOpMint || op == AssetOpBurn
+}
+
+// Validate checks an operation's shape, independent of any chain state.
+func (o *AssetOp) Validate() error {
+	if o == nil {
+		return errors.New("no asset operation")
+	}
+	if !KnownAssetOp(o.Op) {
+		return fmt.Errorf("unknown asset operation %q (mint | burn)", o.Op)
+	}
+	if o.Amount == 0 || o.Amount > MaxAssetSupply {
+		return fmt.Errorf("asset operation amount must be in 1..%d", MaxAssetSupply)
+	}
+	return validTicker(o.Ticker)
+}
+
+// AuthorizedBy reports whether `issuer` is the account that issued `assetID`,
+// by reproducing the id from the operation's stated preimage.
+func (o *AssetOp) AuthorizedBy(issuer, assetID string) bool {
+	if o == nil {
+		return false
+	}
+	return AssetID(issuer, o.Ticker, o.IssueNonce) == assetID
+}
+
+// IsAssetOp reports whether this transaction manages an existing asset.
+func (t Transaction) IsAssetOp() bool { return t.AssetOp != nil }

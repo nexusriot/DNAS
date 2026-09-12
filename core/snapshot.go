@@ -96,7 +96,7 @@ func NewFromSnapshot(s Snapshot, headers []Header) (*Blockchain, error) {
 	if minted := CumulativeSubsidy(s.Height); minted > totalBalance(state) {
 		burned = minted - totalBalance(state)
 	}
-	return &Blockchain{
+	bc := &Blockchain{
 		blocks:  blocks,
 		state:   state,
 		work:    work,
@@ -111,7 +111,11 @@ func NewFromSnapshot(s Snapshot, headers []Header) (*Blockchain, error) {
 		filterBase:    s.Height + 1,
 		filterHeaders: nil,
 		sigCache:      NewValidationCache(DefaultValidationCacheSize),
-	}, nil
+	}
+	// The snapshot's headers carry the votes that were cast below it, so a
+	// deployment that locked in before the snapshot stays locked in after it.
+	bc.refreshDeploymentsLocked()
+	return bc, nil
 }
 
 // blockFromHeader returns a header-only placeholder block (no transaction
@@ -120,6 +124,7 @@ func NewFromSnapshot(s Snapshot, headers []Header) (*Blockchain, error) {
 // median-time-past and difficulty retargeting keep working unchanged.
 func blockFromHeader(h Header) Block {
 	return Block{
+		Version:    h.Version,
 		Index:      h.Index,
 		Timestamp:  h.Timestamp,
 		PrevHash:   h.PrevHash,

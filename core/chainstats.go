@@ -207,3 +207,81 @@ func trimFloat(v float64) string {
 	}
 	return s
 }
+
+// DefaultSeriesLimit is how many points a series returns when none is asked for,
+// and MaxSeriesLimit the most it will return.
+const (
+	DefaultSeriesLimit = 144
+	MaxSeriesLimit     = 2000
+)
+
+// ChainPoint is one block's worth of the quantities worth plotting over time.
+//
+// ChainStats summarizes a window into single numbers, which answers "what is the
+// chain doing now" and cannot answer "what has it been doing" — a median interval
+// of 60s is the same number whether every block took 60s or half took 5s and half
+// took 115s. A per-height series is what a chart needs, and deriving it here
+// rather than in each client is what stops four clients each reimplementing the
+// compact-target arithmetic.
+type ChainPoint struct {
+	Height    uint64 `json:"height"`
+	Timestamp int64  `json:"timestamp"`
+	// Interval is seconds since the previous block; 0 at the first point of the
+	// series, where there is no previous block to measure from.
+	Interval   int64   `json:"interval"`
+	Difficulty float64 `json:"difficulty"`
+	BaseFee    uint64  `json:"base_fee"`
+
+	// Body reports whether this height's transactions are still held. A pruned
+	// height keeps its header, so everything above is exact and Txs/Bytes/Fees
+	// below are zero because the body is gone — not because the block was empty.
+	Body  bool   `json:"body"`
+	Txs   int    `json:"txs"`
+	Bytes int    `json:"bytes"`
+	Fees  uint64 `json:"fees"`
+}
+
+// Series returns per-height chain metrics from `from`, at most `limit` points.
+func (bc *Blockchain) Series(from uint64, limit int) []ChainPoint {
+	if limit <= 0 {
+		limit = DefaultSeriesLimit
+	}
+	if limit > MaxSeriesLimit {
+		limit = MaxSeriesLimit
+	}
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+
+	if int(from) >= len(bc.blocks) {
+		return []ChainPoint{}
+	}
+	end := int(from) + limit
+	if end > len(bc.blocks) {
+		end = len(bc.blocks)
+	}
+	out := make([]ChainPoint, 0, end-int(from))
+	for i := int(from); i < end; i++ {
+		b := bc.blocks[i]
+		p := ChainPoint{
+			Height:     b.Index,
+			Timestamp:  b.Timestamp,
+			Difficulty: TargetDifficulty(b.Bits),
+			BaseFee:    b.BaseFee,
+			Body:       !b.IsPlaceholder(),
+		}
+		if i > 0 {
+			p.Interval = b.Timestamp - bc.blocks[i-1].Timestamp
+		}
+		// Genesis carries no transactions at all — not even a coinbase — so it is
+		// not a placeholder and still has nothing to count.
+		if p.Body && len(b.Transactions) > 0 {
+			p.Txs = len(b.Transactions) - 1 // the coinbase is not a payment
+			for _, tx := range b.Transactions[1:] {
+				p.Bytes += tx.Size()
+				p.Fees += tx.Fee
+			}
+		}
+		out = append(out, p)
+	}
+	return out
+}

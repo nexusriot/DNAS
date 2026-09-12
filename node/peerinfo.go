@@ -34,6 +34,11 @@ type PeerInfo struct {
 	// Syncing reports whether we currently have a ranged block request
 	// outstanding to this peer — the peer-level view of catch-up.
 	Syncing bool `json:"syncing"`
+	// TimeOffset is this peer's clock minus ours at handshake, in seconds. The
+	// node already applies the bounded median of these when validating timestamps
+	// (nettime.go); exposing the samples is what lets an operator see that THIS
+	// machine is the one that is wrong, which the median deliberately hides.
+	TimeOffset int64 `json:"time_offset"`
 }
 
 // Peers returns full information about every connected peer, sorted by address
@@ -57,13 +62,14 @@ func (n *Node) Peers() []PeerInfo {
 		}
 		sort.Strings(caps)
 		info := PeerInfo{
-			Addr:     p.addr,
-			IP:       p.ip,
-			Identity: p.id,
-			Version:  p.version,
-			Caps:     caps,
-			Inbound:  p.inbound,
-			Syncing:  inflight[p],
+			Addr:       p.addr,
+			IP:         p.ip,
+			Identity:   p.id,
+			Version:    p.version,
+			Caps:       caps,
+			Inbound:    p.inbound,
+			Syncing:    inflight[p],
+			TimeOffset: p.timeOffset,
 		}
 		if !p.since.IsZero() {
 			info.Connected = time.Since(p.since).Round(time.Second).String()

@@ -474,9 +474,18 @@ export DNAS_WALLET_PASSPHRASE='correct horse battery staple'
 export DNAS_API_TOKEN='a-long-random-secret'
 ```
 
-Peers, ban scores, and the pending mempool are persisted next to the `-db` file
-(`peers.json`, `bans.json`, `mempool.json`) and restored on the next start, so a
-graceful restart resumes warm. The node's **identity** key lands there too
+```sh
+# serve pool miners (Stratum-shaped; per-miner difficulty, PPLNS payouts)
+go run ./cmd/dnas node -api :8080 -stratum :3333
+
+# put a rule change to a miner vote instead of a hand-configured flag day
+go run ./cmd/dnas node -deployments uniquecoinbase:0:1000:5000:144:108 -signalbits 0
+```
+
+Peers, ban scores, the pending mempool, the reorg log and the pool's share ledger
+and payout window are persisted next to the `-db` file (`peers.json`, `bans.json`,
+`mempool.json`, `reorgs.json`, `shares.json`, `pool.json`) and restored on the
+next start, so a graceful restart resumes warm. The node's **identity** key lands there too
 (`nodekey.json`) — it holds no coin, but it is a private key, so like
 `wallet.json` it is in `.gitignore`. [QUICKSTART §10](QUICKSTART.md) inventories
 every file a node and wallet write and says which of them can be deleted for
@@ -556,6 +565,11 @@ go run ./cmd/dnas node -listen :3001 -api :8081 -peers localhost:3000 -mine \
 | GET    | `/mempool/stats`  | the pending queue's fee-rate distribution (min / median / max + buckets) |
 | GET    | `/tx/{txhash}`    | one transaction, confirmed (block + confirmations) or pending |
 | GET    | `/supply`         | coin supply: minted, burned, circulating, conservation check  |
+| GET    | `/richlist`       | the largest holders, ranked (`?limit=N`); no index needed, the answer is already in the resident account state |
+| GET    | `/series`         | per-height difficulty, block interval, base fee and fee flow — the series `/chainstats` cannot show, for charts |
+| GET    | `/deployments`    | BIP9 rule changes under a miner vote, and where the chain has taken each |
+| GET    | `/pool`           | PPLNS payout accounting: who has a claim on the next block the pool finds |
+| GET    | `/openapi.json`   | this API's OpenAPI 3.1 document, generated from the same route table that registers the handlers |
 | GET    | `/peers`          | connected peers in detail (identity, version, caps, direction, uptime, ban score) |
 | GET    | `/bans`           | scored and banned keys, with the threshold                    |
 | POST   | `/unban` 🔒       | `{"key":"…"}` — clear a ban score                             |
@@ -655,6 +669,31 @@ dnas htlc swap -hash H -asset-owner A -coin-owner B -asset <id> \
 # fee sponsorship is a two-party flow: the sender signs, the payer counter-signs
 dnas sponsor request -key sender.json -to <addr> -amount 1.5 -payer <payer-addr> -o tx.json
 dnas sponsor pay -wallet payer.json -in tx.json -submit
+
+# payment channels: many payments off chain, ONE transaction on it
+# (the funder must hold the receiver's countersigned refund BEFORE funding —
+#  `channel fund` refuses otherwise, because a receiver who vanishes would
+#  otherwise keep the capacity forever)
+dnas channel open -key alice.json -peer-pubkey BOB_PUB -amount 10 -expire-in 720
+dnas channel countersign -in refund-request.json -key bob.json   # receiver
+dnas channel arm  -in channel.json -refund signed-refund.json    # funder
+dnas channel fund -in channel.json -key alice.json
+dnas channel pay  -in channel.json -key alice.json -add 0.5      # repeat, off chain
+dnas channel accept -in bob-channel.json -settlement settlement.json
+dnas channel close  -in bob-channel.json -key bob.json           # the only on-chain tx
+
+# operational checks, with what to do about each
+dnas doctor -api localhost:8080
+
+# an address's whole history, for accounting (node needs -addrindex)
+dnas tx export -address <addr> -o history.csv
+
+# assets: the issuer can mint more or burn what it holds (needs the assetops upgrade)
+dnas spv -api localhost:8080 wallet -key alice.json mint GOLD 0 500
+dnas spv -api localhost:8080 wallet -key alice.json burn GOLD 0 100
+
+# addresses have a second, better-checksummed spelling for handing to a person
+dnas wallet bech32 <address>
 
 dnas vault address -hot HOT_PUB -cold COLD_PUB -unlock H         # a time-delayed vault
 dnas vault spend -wallet cold.json -hot HOT_PUB -unlock H -to <addr>   # cold key: any time
@@ -824,63 +863,81 @@ asset.
 - The network is open/permissionless with inbound caps (total + per-IP-group) and
   per-peer rate limiting for eclipse/DoS resistance, but node identities and IPs
   aren't cost-bound, so it isn't fully sybil-resistant (no PoW/stake peer gating,
-  no ASN-diversity addrman), and the open handshake is anonymous (no MITM auth).
+  no ASN-diversity addrman — grouping is by /16, which raises the cost of an
+  eclipse rather than settling it), and the open handshake is anonymous (no MITM
+  auth).
   Ban scores persist across a *graceful* restart but a hard kill can lose the
   latest state (re-synced from peers).
 - Consensus uses a canonical binary encoding (portable across implementations),
   but there is still only one implementation and no cross-client test vectors.
 - Locator sync transfers only the divergent suffix for normal forks; genuinely
   deep or losing forks still fall back to a whole-chain exchange.
-- Recipient checksums are enforced client-side (in `/send` and the console), not in
-  consensus — a malicious client can still burn its own coins.
+- Recipient checksums are consensus-enforced once the `checkedaddresses` upgrade
+  activates; below that height they are a client-side convention, so a buggy
+  client could burn coin to a typo. Addresses also have a bech32m spelling with
+  far better error detection, but it is an interchange encoding only — consensus
+  and the account state see exactly one spelling per account.
 - The fee market is a burned EIP-1559 base fee (consensus) plus eviction,
-  replace-by-fee, and a dynamic relay-policy floor. HD derivation is a simple
-  HMAC-SHA512 scheme, not SLIP-0010.
-- State-root balance proofs prove *membership* (a present account's exact
-  balance/nonce); they do not prove *absence* of an account (that would need a
-  sorted-tree non-membership proof).
+  replace-by-fee, and a dynamic relay-policy floor; its congestion signal is
+  transaction count rather than block weight.
+- State-root proofs prove membership AND absence: the root is a trie root, so a
+  key's position is fixed by the key and arriving at an empty slot is itself the
+  proof that nothing is there. What the trie does not yet buy is a disk-backed
+  ledger — state is still a resident map, so memory bounds it — or an incremental
+  root, which is rebuilt from the whole account set per call.
 - Merkle SPV proves *inclusion*; compact filters add *non-inclusion*, but the
   filters aren't committed in the PoW header, so (like BIP157/158) their
   correctness rests on the honest-node / multi-peer assumption rather than being
   trustless. Committing a filter root in the header would be a consensus change.
 - Proof-of-work difficulty is unbounded (it tracks hashpower); a devnet/regtest
   pins it to the easy genesis floor (`NoRetarget`) so a laptop mines instantly.
-- Consensus rules can change via height-activated upgrades (`core/upgrade.go`,
-  `-upgrades name:height`), but there's no on-chain miner signaling (BIP9) —
-  activation heights are set at startup, like checkpoints.
+- Consensus rules change either at a height set at startup (`core/upgrade.go`,
+  `-upgrades name:height`) or by a BIP9 miner vote on a block-header version bit
+  (`core/versionbits.go`, `-deployments`, `-signalbits`). A locked-in deployment
+  simply installs its activation height in the same table, so validation never
+  learns which route set the number.
 - Mempool admission measures a sender against its *confirmed* state, so a
   recipient cannot queue a spend of coin that is still unconfirmed. That is the
   account-model norm, and it is what makes a pool slot cost real balance; package
   relay would lift it.
 - The address index (`-addrindex`) lives in memory and is rebuilt at every
   startup, and its size grows with an address's usage rather than with the chain.
-- Mining shares are node-local, unauthenticated accounting: nothing is stored on
-  chain, the ledger is lost on restart, and nothing stops an operator reporting
-  whatever they like. Enough for a toy pool between machines you control.
-- Mempool reconciliation is one request per peer once caught up, not a continuous
-  set-reconciliation protocol; a transaction broadcast in the gap is still missed
-  until someone rebroadcasts.
+- Mining shares are node-local accounting: nothing is stored on chain, and
+  nothing stops an operator reporting whatever they like. The pool side is real
+  enough to point miners at — `-stratum` gives each connection its own extranonce
+  and its own difficulty, shares are paid PPLNS by weight, and the ledger now
+  survives a restart — but a miner is "authenticated" only by the address it asks
+  to be paid at.
+- Transaction relay announces ids and pulls bodies, which also closes the
+  cold-start gap the one-shot mempool request covered. It is still not a
+  continuous set-reconciliation protocol (Erlay); what it guarantees is that a
+  body crosses each link once rather than once per peer.
 - Fee sponsorship makes a transaction depend on an account the sender does not
   control: a sponsor that spends its balance elsewhere invalidates the
   sponsorships it has outstanding, which are dropped at the next block.
 - The faucet's per-address/per-IP cooldown is a speed bump, not a defence — which
   is why the *network parameters*, not a flag, decide whether one may exist.
-- Pruning (`-prune`) drops block bodies from memory, not from the store on disk:
-  the append-only file still holds every block, and a restart replays it. What it
-  buys is a node whose *resident* size does not grow with the chain; what it
-  costs is the ability to serve old bodies, their inclusion proofs and their
-  compact filters, which the node reports (`410 Gone`, `body_height`) rather than
-  answering "not found".
-- Webhook delivery is at-most-once with a bounded queue: a receiver that is down
-  long enough loses events rather than the node growing a backlog for it. A
-  service that must not miss a payment should reconcile with `/chain` or
-  `/address/{addr}/history` rather than trust the stream.
+- Pruning (`-prune`) bounds disk as well as memory: the log is compacted to match
+  the pruned chain and a verified state snapshot is written beside it to restart
+  from. Two honest limits remain. Pruned heights keep a header-only record — the
+  headers are load-bearing for linkage, median-time-past and the retarget — so the
+  saving is the transaction bodies, which on a chain of empty blocks is close to
+  nothing. And a pruned store is no longer fully re-verifiable: `dnas db verify`
+  replays the bodies it still has and takes everything below the cutoff on the
+  snapshot's authority, which it says rather than glosses.
+- Webhook delivery from the NODE is at-most-once with a bounded queue: a receiver
+  that is down long enough loses events rather than the node growing a backlog for
+  it. That is the right trade for a node and the wrong one for money, so a service
+  that must not miss a payment should reconcile with `/chain` or
+  `/address/{addr}/history` — or use `dnas invoice serve`, which keeps its state
+  on disk and retries until the receiver acknowledges.
 - The API rate limit keys on the client IP and deliberately ignores
   `X-Forwarded-For` (a client-set header would hand out a fresh bucket per
   request). A node behind a real proxy needs the limit at the proxy.
 - An invoice is matched by (address, amount, height): an address can be paid more
   than once, so two invoices for the same amount at the same address cannot be
-  told apart. Use a fresh key per invoice.
+  told apart. Use a fresh key per invoice — now that derivation is SLIP-0010, one
+  mnemonic backs an address per invoice.
 - Message signing is domain-separated from transaction signing, so neither can be
   replayed as the other — but a signature still only proves control of a key at
   the moment it was made, and this project has no revocation.
@@ -888,8 +945,10 @@ asset.
   implementing the transaction encoding themselves. That keeps one copy of the
   consensus-critical part, at the cost of a process launch per payment and a
   dependency on the binary being present.
-- Reorg history is an in-memory ring (64 entries) and is lost on restart; it is
-  operator telemetry, not chain state.
+- Reorg history is a bounded ring (64 entries) and is operator telemetry, not
+  chain state. The entries now survive a restart; the COUNTERS deliberately do
+  not, because `refused: 3` means "since this node started" and an operator needs
+  to know whether those happened in this run.
 - `/chainstats` is a *reporting* view: the hashrate figure is an estimate over a
   window, and proof-of-work variance means a short window says more about luck
   than about hashpower.
@@ -897,6 +956,15 @@ asset.
   filter headers still folds the chain from genesis, because the fold is
   cumulative. A client that keeps its own verified prefix (which `dnas spv` now
   does) avoids both.
+
+- A payment channel is unidirectional: the balance only moves from funder to
+  receiver. A bidirectional one needs revocation and penalty transactions so that
+  publishing an old state is punishable, which is most of Lightning's complexity.
+  The receiver must also close before the refund's expiry, or the funder can take
+  the capacity back.
+- An asset's issuer can mint and burn once `assetops` activates, so a holder is
+  trusting them not to dilute. There is no freeze authority and no way to renounce
+  minting — both need per-asset state the state root does not commit yet.
 
 Each of these is a deliberate stopping point, not an oversight; the prioritized
 plan for closing them is in [ROADMAP.md](ROADMAP.md).

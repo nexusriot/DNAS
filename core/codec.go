@@ -30,6 +30,7 @@ const (
 	feePayerTag byte = 2 // fee sponsor address, in the signed fields
 	feeAuthTag  byte = 3 // fee sponsor key + signature, in the authorization fields
 	vaultTag    byte = 4 // vault script, in the authorization fields
+	assetOpTag  byte = 5 // asset management operation, in the signed fields
 )
 
 // cbuf is a tiny append-only canonical-encoding buffer.
@@ -109,6 +110,15 @@ func (t Transaction) signedFields(c *cbuf) {
 	if t.FeePayer != "" {
 		c.byte(feePayerTag)
 		c.str(t.FeePayer)
+	}
+	// An asset management operation is appended only when present, so every
+	// transaction that predates it encodes byte-for-byte as it always did.
+	if t.AssetOp != nil {
+		c.byte(assetOpTag)
+		c.str(t.AssetOp.Op)
+		c.u64(t.AssetOp.Amount)
+		c.str(t.AssetOp.Ticker)
+		c.u64(t.AssetOp.IssueNonce)
 	}
 }
 

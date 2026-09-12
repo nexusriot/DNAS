@@ -27,6 +27,11 @@ const AddressPrefix = "dnas"
 // typo'd address fails validation instead of silently sending coins into a hole.
 const addressChecksumLen = 4
 
+// addressBodyLen is how many bytes of hashed public key an address carries. It
+// is the payload both spellings encode — the canonical hex one below and the
+// bech32m one in bech32.go.
+const addressBodyLen = 20
+
 // Wallet holds an Ed25519 keypair.
 type Wallet struct {
 	priv ed25519.PrivateKey
@@ -132,14 +137,36 @@ func ValidateAddress(addr string) error {
 	if err != nil {
 		return errors.New("address is not valid hex")
 	}
-	if len(raw) != 20+addressChecksumLen {
+	if len(raw) != addressBodyLen+addressChecksumLen {
 		return errors.New("address has the wrong length")
 	}
-	body, sum := raw[:20], raw[20:]
+	body, sum := raw[:addressBodyLen], raw[addressBodyLen:]
 	if !bytes.Equal(sum, addressChecksum(body)) {
 		return errors.New("address checksum mismatch (typo?)")
 	}
 	return nil
+}
+
+// addressBody returns the 20-byte payload of a canonical address, after checking
+// it. It is the seam the two spellings meet at: bech32.go re-encodes this, and
+// addressFromBody puts one back.
+func addressBody(addr string) ([]byte, error) {
+	if err := ValidateAddress(addr); err != nil {
+		return nil, err
+	}
+	raw, err := hex.DecodeString(addr[len(AddressPrefix):])
+	if err != nil {
+		return nil, err
+	}
+	return raw[:addressBodyLen], nil
+}
+
+// addressFromBody renders a 20-byte payload as a canonical address.
+func addressFromBody(body []byte) string {
+	payload := make([]byte, 0, addressBodyLen+addressChecksumLen)
+	payload = append(payload, body...)
+	payload = append(payload, addressChecksum(body)...)
+	return AddressPrefix + hex.EncodeToString(payload)
 }
 
 // AddressFromPubKeyHex derives the address from a hex-encoded public key.

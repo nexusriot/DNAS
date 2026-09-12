@@ -38,6 +38,9 @@ documents and some code comments cite them.)
 [8d9b. Webhooks](#8d9b-getting-told-about-a-payment-webhooks) ·
 [8d9c. Pruning](#8d9c-running-a-node-that-does-not-grow-pruning) ·
 [8d10. Identity vs wallet](#8d10-a-nodes-identity-is-not-its-wallet) ·
+[8d19. One command that checks everything](#8d19-one-command-that-checks-everything-dnas-doctor) ·
+[8d20. Dashboards and alerts](#8d20-dashboards-and-alerts) ·
+[8d21. Running a mining pool](#8d21-running-a-mining-pool-stratum) ·
 [8f. Lock down the API](#8f-lock-down-the-api)
 
 **Money: assets, fees, contracts**
@@ -48,7 +51,8 @@ documents and some code comments cite them.)
 [8d11. Fee-bump / cancel](#8d11-fee-bumping-and-cancelling-a-stuck-payment) ·
 [8d12. Spending from a multisig](#8d12-spending-from-a-multisig-account) ·
 [8d13. Escrow](#8d13-escrow-a-2-of-3-with-names-on-the-members) ·
-[8e. Atomic swaps (HTLCs)](#8e-hash-time-locked-contracts-atomic-swaps)
+[8e. Atomic swaps (HTLCs)](#8e-hash-time-locked-contracts-atomic-swaps) ·
+[8e2. Payment channels](#8e2-payment-channels-many-payments-one-transaction)
 
 **Getting paid, and proving things**
 [8d14. Timestamping a file](#8d14-timestamping-a-file-on-the-chain-anchoring) ·
@@ -963,6 +967,98 @@ It reports what the JSON does not: whether the signatures actually hold, the fee
 expired window, a spent nonce, a fee under the floor), what kind of account it
 spends from, and for a multisig file which members have signed.
 
+## 8d19. One command that checks everything (`dnas doctor`)
+
+Every number below is already somewhere in `/info`, `/health`, `/metrics` or
+`/reorgs`. What those do not tell you is which numbers MATTER, or what a bad one
+means.
+
+```sh
+dnas doctor -api localhost:8080
+```
+
+```
+ok    fork-choice        no refused reorgs
+FAIL  peers              no peers connected — this node sees no network at all
+                         fix: check -peers/-dnsseeds and that the listen port is reachable
+WARN  liveness           not ready: no peers connected
+NOTE  api-auth           no API token set (loopback only)
+
+PROBLEMS FOUND on regtest at height 57
+```
+
+It exits non-zero when something is wrong, so it works from cron. The check to
+read first is **fork-choice**: a node whose reorg was refused may have stopped
+following the network's chain, permanently, and nothing else would notice —
+a diverged node has peers, a fresh tip, and by its own reckoning is not behind.
+
+Use `-quiet` to print only the findings.
+
+## 8d20. Dashboards and alerts
+
+`GET /metrics` exports 53 Prometheus series. A dashboard with fifty series and no
+alerting is a dashboard nobody opens, so [scripts/monitoring/](scripts/monitoring/)
+ships both.
+
+```sh
+# prometheus.yml
+#   scrape_configs:
+#     - job_name: dnas
+#       static_configs: [{targets: ["127.0.0.1:8080"]}]
+#   rule_files: ["prometheus-alerts.yml"]
+
+# Grafana → Dashboards → Import → scripts/monitoring/grafana-dashboard.json
+```
+
+The 15 alert rules are failure modes this project actually hit rather than
+imagined — `DnasReorgRefused`, `DnasSupplyNotConserved`,
+`DnasOutboundConcentrated` (all outbound peers in one /16, which a peer *count*
+cannot tell you), `DnasWebhookEventsDropped`.
+
+## 8d21. Running a mining pool (Stratum)
+
+```sh
+dnas node -api :8080 -stratum :3333 -mine=false
+```
+
+Miners connect over one long TCP connection and are pushed a fresh job the moment
+the tip moves, instead of polling `/blocktemplate` and mining a template that is
+already dead.
+
+```
+-> {"id":1,"method":"mining.subscribe","params":["my-miner/1.0"]}
+<- {"id":1,"result":[[["mining.set_difficulty","3f2a1b7c"],["mining.notify","3f2a1b7c"]],"3f2a1b7c",0],"error":null}
+-> {"id":2,"method":"mining.authorize","params":["dnas…your-address.rig1","x"]}
+<- {"id":2,"result":true,"error":null}
+<- {"id":null,"method":"mining.set_difficulty","params":[256]}
+<- {"id":null,"method":"mining.notify","params":["<job>", {…block…}, <share bits>, true]}
+-> {"id":3,"method":"mining.submit","params":["dnas…rig1","<job>","1f3a"]}
+```
+
+It is **not** Bitcoin-compatible, and does not pretend to be: Stratum V1's job
+encoding is built around Bitcoin's 80-byte header, so a cgminer pointed at this
+port would hash the wrong bytes. The framing and method names are Stratum's; the
+job carries a DNAS block, and the miner searches its `nonce`.
+
+Each connection gets its own extranonce (written into the coinbase memo, so two
+miners on one tip search different spaces) and its own difficulty, retuned toward
+one share every ten seconds. Shares are weighted by their own difficulty and paid
+PPLNS:
+
+```sh
+curl -s localhost:8080/pool | jq
+```
+
+```json
+{"window": 412, "reward": 5000000000, "payouts": [
+  {"address": "dnas…", "shares": 300, "percent": 72.8, "amount_fmt": "36.40000000 DNAS"},
+  {"address": "dnas…", "shares": 112, "percent": 27.2, "amount_fmt": "13.60000000 DNAS"}]}
+```
+
+The pool's coinbase pays the NODE's wallet; the addresses above are what it owes.
+Paying them out is left to the operator — this tells you what is owed, not how to
+send it.
+
 ## 8e. Hash-time-locked contracts (atomic swaps)
 
 An HTLC address is spendable two ways: by the recipient revealing a preimage
@@ -995,6 +1091,87 @@ Both parties should derive the addresses themselves and check they match before
 funding anything. Fees are always paid in coin, so an asset contract must be
 funded with a little coin too or nobody can spend it — the printed plan does that.
 Run `./scripts/swap-demo.sh` to watch a full swap settle.
+
+## 8e2. Payment channels: many payments, one transaction
+
+Paying someone a hundred times costs a hundred fees and a hundred block
+intervals. A channel settles all of it with ONE transaction: lock funds in a
+2-of-2, pass signed-but-unbroadcast settlements between yourselves, publish only
+the last.
+
+Nothing here is a consensus feature — it is a protocol over a multisig address,
+`LockUntil`, multi-output transfers and the partial-signature envelope, all of
+which already existed.
+
+**Alice opens, and hands Bob a refund to countersign:**
+
+```sh
+BOBPUB=$(dnas wallet pubkey -o bob.json)
+dnas channel open -api localhost:8080 -key alice.json \
+    -peer-pubkey $BOBPUB -amount 10 -expire-in 720
+# writes channel.json and refund-request.json
+```
+
+**Bob countersigns it** (and gets his own view of the channel out of it — the
+refund carries the script, the amount and the expiry, so he cannot be told a
+different version of any of them):
+
+```sh
+dnas channel countersign -in refund-request.json -key bob.json \
+    -o signed-refund.json -channel-out bob-channel.json
+```
+
+**Alice arms it and only then funds.** This order is the one rule that cannot be
+relaxed, and the tool enforces it:
+
+```sh
+dnas channel fund -in channel.json -key alice.json
+# refusing to fund: no countersigned refund.
+# Without it the capacity can only be spent with the receiver's cooperation, and
+# a receiver who vanishes keeps it forever.
+
+dnas channel arm  -in channel.json -refund signed-refund.json
+dnas channel fund -in channel.json -key alice.json    # now it goes through
+```
+
+**Then pay, as often as you like. None of this touches the chain:**
+
+```sh
+dnas channel pay    -in channel.json -key alice.json -add 0.5 -o settle.json
+dnas channel accept -in bob-channel.json -settlement settle.json
+# accepted: +0.50000000 DNAS, running total 0.50000000 DNAS
+```
+
+**Bob banks it when he likes — one transaction for the lot:**
+
+```sh
+dnas channel close -in bob-channel.json -key bob.json
+# closed: 2.50000000 DNAS to the receiver, 7.49900000 DNAS back to the funder
+```
+
+**Why an old settlement is harmless.** Every transaction that can spend the
+channel uses the same nonce, and an account's nonce advances exactly once — so of
+all the alternatives, at most one can ever confirm. Try replaying an earlier one
+after the close and the chain says so:
+
+```
+submit: 400 Bad Request: nonce 0 already used (account is at 1)
+```
+
+The same rule is why Alice cannot claw the payment back with the refund once Bob
+has closed. And because the balance only moves one way, the newest settlement is
+also the one paying Bob most, and only Bob can complete it — so no revocation or
+penalty machinery is needed. That is exactly what a *bidirectional* channel would
+need, and the reason this stops here.
+
+**If Bob vanishes**, Alice waits out the expiry and takes it back:
+
+```sh
+dnas channel status -in channel.json    # says how many blocks remain
+dnas channel refund -in channel.json -key alice.json
+```
+
+Bob must close before that height. `channel status` warns him as it approaches.
 
 ## 8f. Lock down the API
 

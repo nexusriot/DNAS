@@ -1,0 +1,82 @@
+# A hardened systemd unit for a DNAS node.
+#
+# Install:
+#   sudo install -m 0644 scripts/packaging/dnas.service /etc/systemd/system/
+#   sudo useradd --system --home-dir /var/lib/dnas --shell /usr/sbin/nologin dnas
+#   sudo install -d -o dnas -g dnas -m 0750 /var/lib/dnas /etc/dnas
+#   sudo systemctl daemon-reload && sudo systemctl enable --now dnas
+#
+# Configuration lives in /etc/dnas/node.env (read below) and /etc/dnas/node.json
+# (the node's own -config file). The API token in particular belongs in the env
+# file, not on the command line, because a command line is world-readable in
+# /proc — which is exactly the sort of thing `dnas doctor` will tell you about.
+#
+# DNAS is a learning project, not money. Do not point it at the internet.
+
+[Unit]
+Description=DNAS node
+Documentation=https://github.com/nexusriot/DNAS
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dnas
+Group=dnas
+WorkingDirectory=/var/lib/dnas
+
+# DNAS_API_TOKEN goes here. The file should be 0640 root:dnas.
+EnvironmentFile=-/etc/dnas/node.env
+
+ExecStart=/usr/bin/dnas node -config /etc/dnas/node.json -db /var/lib/dnas/chain.db \
+          -wallet /var/lib/dnas/wallet.json -nodekey /var/lib/dnas/nodekey.json
+ExecReload=/bin/kill -HUP $MAINPID
+
+# A node that is killed mid-write poisons its store rather than corrupting it
+# silently, but a graceful stop lets it save its peers, bans, mempool and pool
+# accounting. Give it room to do that.
+KillSignal=SIGTERM
+TimeoutStopSec=90
+Restart=on-failure
+RestartSec=5s
+
+# --- Sandboxing -------------------------------------------------------------
+# A node handles attacker-controlled input on an open port. None of the below
+# changes what it can do on the network; all of it shrinks what a compromise
+# reaches.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateUsers=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# The only paths it may write. ProtectSystem=strict makes everything else
+# read-only, so a bug that tries to write elsewhere fails loudly.
+ReadWritePaths=/var/lib/dnas
+
+# Resource bounds. A node with many peers holds a file descriptor per
+# connection, per stratum session and per SSE subscriber.
+LimitNOFILE=8192
+TasksMax=512
+
+[Install]
+WantedBy=multi-user.target

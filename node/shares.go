@@ -146,6 +146,19 @@ func (n *Node) Shares() ShareReport { return n.shares.report(n.ShareFactor(), n.
 // transactions, and carry a coinbase (whose recipient is credited). What it is
 // NOT is validated as a block — that happens only if it turns out to be one.
 func (n *Node) SubmitShare(b core.Block) (ShareResult, error) {
+	return n.submitShareChecked(b, core.ShareBits(b.Bits, n.ShareFactor()), "")
+}
+
+// submitShareChecked is the body of SubmitShare against an explicit share target
+// and an explicit accounting key.
+//
+// Both are what a pool needs and a standalone miner does not. The TARGET is
+// per-connection, because one difficulty for every miner either floods the pool
+// or leaves a slow miner's work invisible (see pool.go). The KEY is separate from
+// the coinbase recipient because a pool's coinbase pays the POOL: the address to
+// credit is the one the worker authorized with, not the one being paid on chain.
+// An empty creditTo keeps the old behaviour of crediting the coinbase recipient.
+func (n *Node) submitShareChecked(b core.Block, shareBits uint32, creditTo string) (ShareResult, error) {
 	n.shares.mu.Lock()
 	n.shares.submitted++
 	n.shares.mu.Unlock()
@@ -166,7 +179,6 @@ func (n *Node) SubmitShare(b core.Block) (ShareResult, error) {
 	if len(b.Transactions) == 0 || !b.Transactions[0].IsCoinbase() {
 		return ShareResult{}, errors.New("share has no coinbase to credit")
 	}
-	shareBits := core.ShareBits(b.Bits, n.ShareFactor())
 	if !core.MeetsShareTarget(b.Hash, shareBits) {
 		return ShareResult{}, errors.New("hash does not meet the share target")
 	}
@@ -179,7 +191,10 @@ func (n *Node) SubmitShare(b core.Block) (ShareResult, error) {
 			isBlock = true
 		}
 	}
-	addr := b.Transactions[0].To
+	addr := creditTo
+	if addr == "" {
+		addr = b.Transactions[0].To
+	}
 	total := n.shares.record(addr, b.Index, isBlock)
 	return ShareResult{Accepted: true, Block: isBlock, Height: b.Index, Hash: b.Hash, Address: addr, Shares: total}, nil
 }
@@ -216,5 +231,39 @@ func (n *Node) WaitForTip(prevHash string, timeout time.Duration) bool {
 				return true
 			}
 		}
+	}
+}
+
+// snapshot and restore let the ledger survive a restart. The counters are
+// totals, so they are carried across verbatim rather than recomputed from the
+// per-miner rows: `submitted` and `stale` count work that produced no row at all.
+func (l *shareLedger) snapshot() poolState {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	st := poolState{
+		Submitted: l.submitted,
+		Accepted:  l.accepted,
+		Stale:     l.stale,
+		Blocks:    l.blocks,
+		Miners:    make([]MinerShares, 0, len(l.byMiner)),
+	}
+	for _, m := range l.byMiner {
+		st.Miners = append(st.Miners, *m)
+	}
+	sort.Slice(st.Miners, func(i, j int) bool { return st.Miners[i].Address < st.Miners[j].Address })
+	return st
+}
+
+func (l *shareLedger) restore(st poolState) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.submitted, l.accepted, l.stale, l.blocks = st.Submitted, st.Accepted, st.Stale, st.Blocks
+	l.byMiner = make(map[string]*MinerShares, len(st.Miners))
+	for _, m := range st.Miners {
+		if len(l.byMiner) >= maxTrackedMiners {
+			break
+		}
+		row := m
+		l.byMiner[row.Address] = &row
 	}
 }

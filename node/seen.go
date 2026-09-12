@@ -43,3 +43,14 @@ func (s *seenSet) len() int {
 	defer s.mu.Unlock()
 	return len(s.set)
 }
+
+// has reports whether h is present WITHOUT recording it. Announcement-based
+// relay needs this distinction: seeing a transaction announced is not the same as
+// having it, and marking it on the announcement would mean never fetching the
+// body if the peer that announced it went away.
+func (s *seenSet) has(h string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.set[h]
+	return ok
+}

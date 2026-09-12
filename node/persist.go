@@ -20,7 +20,25 @@ const (
 	addrsFile   = "addrs.json"
 	bansFile    = "bans.json"
 	mempoolFile = "mempool.json"
+	// The three in-memory rings that used to die with the process. A restart is
+	// exactly when their contents matter most: the reorg log is the record of the
+	// incident you are restarting because of, and the share ledger and PPLNS
+	// window are a pool's accounting — losing them means miners are not paid for
+	// work they actually did.
+	sharesFile = "shares.json"
+	poolFile   = "pool.json"
+	reorgsFile = "reorgs.json"
 )
+
+// poolState is the pool's accounting as it is written to disk.
+type poolState struct {
+	Submitted uint64        `json:"submitted"`
+	Accepted  uint64        `json:"accepted"`
+	Stale     uint64        `json:"stale"`
+	Blocks    uint64        `json:"blocks"`
+	Miners    []MinerShares `json:"miners"`
+	Window    []PoolShare   `json:"window"`
+}
 
 func (n *Node) statePath(name string) string { return filepath.Join(n.cfg.StateDir, name) }
 
@@ -52,6 +70,23 @@ func (n *Node) loadState() {
 	if readJSONFile(n.statePath(bansFile), &bans) == nil && len(bans) > 0 {
 		n.bans.restore(bans)
 		Infof("restored ban scores", "count", len(bans))
+	}
+	var pool poolState
+	if readJSONFile(n.statePath(sharesFile), &pool) == nil {
+		n.shares.restore(pool)
+		if len(pool.Miners) > 0 || pool.Accepted > 0 {
+			Infof("restored share ledger", "miners", len(pool.Miners), "accepted", pool.Accepted)
+		}
+	}
+	var window []PoolShare
+	if readJSONFile(n.statePath(poolFile), &window) == nil && len(window) > 0 {
+		n.window.restore(window)
+		Infof("restored pool payout window", "shares", len(window))
+	}
+	var reorgs []Reorg
+	if readJSONFile(n.statePath(reorgsFile), &reorgs) == nil && len(reorgs) > 0 {
+		n.reorgs.restore(reorgs)
+		Infof("restored reorg history", "count", len(reorgs))
 	}
 	var txs []core.Transaction
 	if readJSONFile(n.statePath(mempoolFile), &txs) == nil {
@@ -87,6 +122,9 @@ func (n *Node) saveState() {
 	writeJSONFile(n.statePath(addrsFile), n.addrs.Snapshot())
 	writeJSONFile(n.statePath(bansFile), n.bans.snapshot())
 	writeJSONFile(n.statePath(mempoolFile), n.mempool.All())
+	writeJSONFile(n.statePath(sharesFile), n.shares.snapshot())
+	writeJSONFile(n.statePath(poolFile), n.window.snapshot())
+	writeJSONFile(n.statePath(reorgsFile), n.reorgs.snapshot())
 }
 
 func readJSONFile(path string, v any) error {

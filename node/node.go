@@ -107,6 +107,15 @@ type Config struct {
 	// to be called rather than hold an SSE connection open (see webhook.go).
 	Webhooks []string
 
+	// SignalBits are the BIP9 version bits this node's miner sets in every block
+	// it produces (see core/versionbits.go). Setting a bit is a vote that this
+	// node is ready to enforce the deployment claiming it — so it is deliberately
+	// opt-in per operator rather than derived from the registered deployments: a
+	// node that has merely been TOLD about a deployment has not thereby agreed to
+	// it, and a bit set by a node whose operator has not chosen it would be a vote
+	// nobody cast.
+	SignalBits []uint8
+
 	// EmptyBlockInterval is how long the miner waits before minting a block with
 	// no transactions in it, so an idle network isn't flooded with empty blocks.
 	// Zero means one TargetBlockTime, which is what a real network wants; devnets
@@ -161,7 +170,20 @@ type Node struct {
 
 	seenBlk *seenSet
 	seenTx  *seenSet
-	shares  *shareLedger
+	txReq   *txRequests // transaction bodies requested but not yet received
+	// assembly holds compact blocks waiting on the transactions this node lacked.
+	assembly *blockAssembly
+	// compactHit/compactMiss count reconstructions that produced the miner's
+	// block and those that had to fall back to a full fetch, which is the number
+	// that says whether compact relay is paying for itself here.
+	compactHit  atomic.Int64
+	compactMiss atomic.Int64
+	shares      *shareLedger
+	// window is the pool's PPLNS accounting over recent shares, and stratum the
+	// miner-facing server that feeds it (pool.go, stratum.go). Both are nil-safe:
+	// a node with no pool simply never touches them.
+	window  *shareWindow
+	stratum *StratumServer
 	faucet  *faucet
 	reorgs  *reorgLog
 	book    *peerbook
@@ -241,6 +263,9 @@ func New(cfg Config, chain *core.Blockchain, mp *core.Mempool, w *wallet.Wallet)
 		inboundGroup: map[string]int{},
 		seenBlk:      newSeenSet(seenCapacity),
 		seenTx:       newSeenSet(seenCapacity),
+		txReq:        newTxRequests(),
+		assembly:     newBlockAssembly(),
+		window:       newShareWindow(pplnsWindow),
 		shares:       newShareLedger(),
 		faucet:       newFaucet(),
 		reorgs:       newReorgLog(),
@@ -298,6 +323,9 @@ func (n *Node) Shutdown() {
 	}
 	n.lnMu.Unlock()
 	n.dand.stopAll() // cancel any pending Dandelion++ embargo timers
+	if n.stratum != nil {
+		n.stratum.Stop() // close miner sessions before the state below is written
+	}
 	n.peersMu.Lock()
 	ps := make([]*peer, 0, len(n.peers))
 	for p := range n.peers {
@@ -833,6 +861,7 @@ func (n *Node) handleMessage(p *peer, m Message) {
 			return
 		}
 		h := m.Tx.Hash()
+		n.txReq.done(h) // whether we asked for it or it was pushed, it is here
 		if !m.Stem {
 			n.dand.cancelEmbargo(h) // it's fluffing on the network; stop our embargo
 		}
@@ -857,6 +886,15 @@ func (n *Node) handleMessage(p *peer, m Message) {
 	case MsgMempool:
 		n.onMempoolBatch(p, m.Txs)
 
+	case MsgTxInv:
+		n.onTxInv(p, m.Hashes)
+
+	case MsgGetTx:
+		n.onGetTx(p, m.Hashes)
+
+	case MsgTxs:
+		n.onMempoolBatch(p, m.Txs)
+
 	// block propagation: announce a hash, pull the body we lack
 	case MsgInv:
 		n.noteBestHeight(m.Index)
@@ -873,31 +911,20 @@ func (n *Node) handleMessage(p *peer, m Message) {
 		}
 
 	case MsgBlock:
-		if m.Block == nil || n.markSeenBlock(m.Block.Hash) {
+		if m.Block == nil {
 			return
 		}
-		// A block that is malformed on its own terms (bad PoW or merkle root) is
-		// peer misbehaviour and earns ban points; one that is well-formed but
-		// doesn't link to our tip is just a fork, handled below with a re-sync.
-		if err := m.Block.SelfValid(); err != nil {
-			if n.bans.add(p.id, banInvalidBlock) {
-				Warnf("peer banned", "peer", short(p.id), "reason", "invalid block", "err", err)
-			}
-			return
-		}
-		n.noteBestHeight(m.Block.Index)
-		if err := n.chain.AddBlock(*m.Block); err != nil {
-			// Ahead of our tip: keep it, so it connects the moment its parent lands
-			// instead of costing another round trip. Otherwise we are behind or on a
-			// fork, and the locator finds where we diverged.
-			n.bufferOrphan(*m.Block)
-			p.send(n.getHeadersMsg())
-			return
-		}
-		Infof("accepted block", "height", m.Block.Index, "hash", short(m.Block.Hash))
-		n.connectOrphans()
-		n.afterNewBlock(false)
-		n.broadcastExcept(Message{Type: MsgInv, Index: m.Block.Index, Hash: m.Block.Hash}, p)
+		n.onBlockReceived(p, *m.Block)
+
+	// compact block relay: a header plus short ids, reconstructed locally
+	case MsgCmpctBlock:
+		n.onCompactBlock(p, m.Cmpct)
+
+	case MsgGetBlockTxn:
+		n.onGetBlockTxn(p, m.Index, m.Hash, m.Indexes)
+
+	case MsgBlockTxn:
+		n.onBlockTxn(p, m.Hash, m.Txs)
 
 	// headers-first ranged sync
 	case MsgGetHeaders:
@@ -1086,7 +1113,7 @@ func (n *Node) broadcastExcept(m Message, except *peer) {
 
 // caps returns this node's advertised protocol capabilities.
 func (n *Node) caps() []string {
-	c := []string{CapMempool}
+	c := []string{CapMempool, CapTxInv, CapCompact}
 	if n.cfg.Dandelion {
 		c = append(c, CapDandelion)
 	}
@@ -1122,6 +1149,7 @@ func (n *Node) onMempoolBatch(from *peer, txs []core.Transaction) {
 			continue
 		}
 		h := tx.Hash()
+		n.txReq.done(h)
 		if n.markSeenTx(h) {
 			continue
 		}
@@ -1136,6 +1164,38 @@ func (n *Node) onMempoolBatch(from *peer, txs []core.Transaction) {
 		Infof("learned pending transactions", "count", learned, "peer", short(from.id))
 		n.onNewTx() // a miner idling between blocks should build with them
 	}
+}
+
+// onBlockReceived is the one path a newly-arrived block takes, however it got
+// here: pushed in full, pulled after an announcement, or reconstructed from a
+// compact block. Keeping it in one place is what lets compact relay be a
+// transport detail rather than a second, subtly different validation path.
+func (n *Node) onBlockReceived(p *peer, b core.Block) {
+	if n.markSeenBlock(b.Hash) {
+		return
+	}
+	// A block that is malformed on its own terms (bad PoW or merkle root) is
+	// peer misbehaviour and earns ban points; one that is well-formed but
+	// doesn't link to our tip is just a fork, handled below with a re-sync.
+	if err := b.SelfValid(); err != nil {
+		if n.bans.add(p.id, banInvalidBlock) {
+			Warnf("peer banned", "peer", short(p.id), "reason", "invalid block", "err", err)
+		}
+		return
+	}
+	n.noteBestHeight(b.Index)
+	if err := n.chain.AddBlock(b); err != nil {
+		// Ahead of our tip: keep it, so it connects the moment its parent lands
+		// instead of costing another round trip. Otherwise we are behind or on a
+		// fork, and the locator finds where we diverged.
+		n.bufferOrphan(b)
+		p.send(n.getHeadersMsg())
+		return
+	}
+	Infof("accepted block", "height", b.Index, "hash", short(b.Hash))
+	n.connectOrphans()
+	n.afterNewBlock(false)
+	n.announceBlock(b, p)
 }
 
 // relayTx propagates a transaction using Dandelion++ when enabled: in the stem
@@ -1157,9 +1217,11 @@ func (n *Node) relayTx(tx core.Transaction, from *peer, stemPhase bool) {
 	n.dand.startEmbargo(tx.Hash(), func() { n.fluff(tx, nil) })
 }
 
-// fluff broadcasts a transaction to every peer except one, ending its stem phase.
+// fluff ends a transaction's stem phase by telling every peer but one about it.
+// It ANNOUNCES rather than pushes wherever the peer supports it (see
+// txrelay.go); a peer that does not still receives the body.
 func (n *Node) fluff(tx core.Transaction, except *peer) {
-	n.broadcastExcept(Message{Type: MsgTx, Tx: &tx}, except)
+	n.announceTx(tx, except)
 }
 
 // stemSuccessor returns this epoch's Dandelion++ stem successor: a random,
@@ -1174,6 +1236,33 @@ func (n *Node) stemSuccessor(exclude *peer) *peer {
 	}
 	n.peersMu.Unlock()
 	return n.dand.pick(cands, time.Now())
+}
+
+// RelayStats reports what the two relay optimizations are actually doing, which
+// is otherwise invisible: both are pure wins when they work and a silent extra
+// round trip when they do not.
+type RelayStats struct {
+	// CompactHit and CompactMiss count blocks rebuilt from the local mempool and
+	// blocks that had to be fetched in full after a failed reconstruction. A miss
+	// rate that is not near zero means peers' pools and this node's disagree.
+	CompactHit  int64 `json:"compact_hit"`
+	CompactMiss int64 `json:"compact_miss"`
+	// TxInFlight is how many announced transactions have been requested and not
+	// yet received. A number that stays high means peers are announcing and not
+	// delivering.
+	TxInFlight int `json:"tx_in_flight"`
+	// PendingBlocks is how many compact blocks are waiting on transactions.
+	PendingBlocks int `json:"pending_blocks"`
+}
+
+// RelayStats returns the relay counters.
+func (n *Node) RelayStats() RelayStats {
+	return RelayStats{
+		CompactHit:    n.compactHit.Load(),
+		CompactMiss:   n.compactMiss.Load(),
+		TxInFlight:    n.txReq.len(),
+		PendingBlocks: n.assembly.len(),
+	}
 }
 
 func (n *Node) markSeenBlock(h string) bool { return n.seenBlk.seen(h) }
@@ -1247,12 +1336,13 @@ func (n *Node) assembleBlock(minerAddr string) (core.Block, []core.Transaction) 
 	txs := n.mempool.Select(n.chain, core.MaxBlockTxs) // already excludes fee < baseFee
 	// Miner is paid the subsidy plus tips (fees above the base fee); the base-fee
 	// portion is burned.
-	coinbase := core.NewCoinbase(minerAddr, core.CoinbaseAmount(height, txs, baseFee))
+	coinbase := core.NewCoinbaseAt(minerAddr, core.CoinbaseAmount(height, txs, baseFee), height)
 	ts := time.Now().Unix()
 	if ts <= tip.Timestamp {
 		ts = tip.Timestamp + 1
 	}
 	candidate := core.Block{
+		Version:      core.SignalVersion(n.cfg.SignalBits...),
 		Index:        height,
 		Timestamp:    ts,
 		Transactions: append([]core.Transaction{coinbase}, txs...),
@@ -1294,7 +1384,7 @@ func (n *Node) SubmitMinedBlock(b core.Block) error {
 	Infof("accepted externally-mined block", "height", b.Index,
 		"difficulty", core.TargetDifficulty(b.Bits), "hash", short(b.Hash))
 	n.afterNewBlock(false)
-	n.broadcast(Message{Type: MsgInv, Index: b.Index, Hash: b.Hash})
+	n.announceBlock(b, nil)
 	return nil
 }
 
@@ -1310,7 +1400,7 @@ func (n *Node) commitMined(mined core.Block, txs []core.Transaction) error {
 	n.mempool.Remove(txs)
 	n.onTipChanged()
 	// Announce the new block by inventory; peers pull the body if they lack it.
-	n.broadcast(Message{Type: MsgInv, Index: mined.Index, Hash: mined.Hash})
+	n.announceBlock(mined, nil)
 	n.publishBlock(false)
 	return nil
 }

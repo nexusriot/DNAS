@@ -1,0 +1,198 @@
+# Prometheus alerting rules for a DNAS node.
+#
+# A dashboard with 53 series and no alerting is a dashboard nobody opens. These
+# are the conditions this project has actually found to matter, in the order they
+# matter: each one is a failure mode that was discovered rather than imagined,
+# and several of them are invisible on every other signal a node emits.
+#
+#   groups: load this file into Prometheus with
+#     rule_files: ["prometheus-alerts.yml"]
+#   and scrape a node with
+#     - job_name: dnas
+#       static_configs: [{targets: ["127.0.0.1:8080"]}]
+#
+# DNAS is a learning project, not money. Do not point it at the internet.
+
+groups:
+  - name: dnas-consensus
+    rules:
+      # The one that justifies alerting at all. A node whose reorg was refused may
+      # have stopped following the network's chain — permanently, since the same
+      # guard refuses the same switch every time it is offered. Nothing else here
+      # would notice: it has peers, a fresh tip, and by its own reckoning is not
+      # behind.
+      - alert: DnasReorgRefused
+        expr: increase(dnas_reorgs_refused_total[1h]) > 0
+        for: 0m
+        labels: {severity: critical}
+        annotations:
+          summary: "DNAS node {{ $labels.instance }} REFUSED a reorg"
+          description: >-
+            Fork choice preferred a chain and the finality guard declined it
+            (too deep, or below a checkpoint). This node may no longer be on the
+            network's chain and will not recover on its own. Compare its tip with
+            another node; if they disagree, resync from a trusted store.
+
+      # Coin appearing from nowhere, or vanishing. Consensus now rejects a block
+      # that breaks this, so a non-zero value means an accounting bug that got
+      # past the rule rather than a chain someone attacked.
+      - alert: DnasSupplyNotConserved
+        expr: (dnas_supply_minted - dnas_supply_burned) != dnas_supply_circulating
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "DNAS supply accounting broken on {{ $labels.instance }}"
+          description: >-
+            minted − burned != circulating. This identity holds for every valid
+            chain and is enforced per block, so a break here is an accounting bug
+            in the node, not a property of the chain.
+
+      # A deep reorg that was ACCEPTED is not a bug, and it is worth knowing about.
+      - alert: DnasDeepReorg
+        expr: dnas_reorg_deepest > 10
+        for: 0m
+        labels: {severity: warning}
+        annotations:
+          summary: "DNAS node {{ $labels.instance }} adopted a {{ $value }}-block reorg"
+          description: >-
+            Fork choice discarded {{ $value }} committed blocks. Expected on a
+            devnet with intermittent connectivity; on a real network it means a
+            substantial amount of hashpower was working in isolation.
+
+  - name: dnas-liveness
+    rules:
+      - alert: DnasNodeDown
+        expr: up{job="dnas"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "DNAS node {{ $labels.instance }} is not answering"
+
+      # A stale tip is either "the chain stopped" or "this node stopped hearing
+      # about it", and both need someone to look.
+      - alert: DnasTipStale
+        expr: dnas_tip_age_seconds > 15 * dnas_block_interval_target
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "DNAS tip on {{ $labels.instance }} is {{ $value | humanizeDuration }} old"
+          description: >-
+            No block has arrived for fifteen times the target interval. Either the
+            chain has stalled or this node is not hearing about it.
+
+      - alert: DnasNoPeers
+        expr: dnas_peers == 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "DNAS node {{ $labels.instance }} has no peers"
+          description: >-
+            The node sees no network at all. Check -peers/-dnsseeds and that the
+            listen port is reachable.
+
+      - alert: DnasFallingBehind
+        expr: dnas_blocks_behind > 10
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "DNAS node {{ $labels.instance }} is {{ $value }} blocks behind"
+          description: >-
+            It knows of a better height than its own and is not closing the gap.
+            If DnasReorgRefused is also firing, that is the cause.
+
+  - name: dnas-network
+    rules:
+      # A peer COUNT cannot say this: eight connections into one operator's range
+      # is one connection as far as an eclipse is concerned. Grouping is by /16,
+      # not by ASN, so this bounds the cost of an eclipse rather than settling it.
+      - alert: DnasOutboundConcentrated
+        expr: dnas_outbound_groups < 2 and dnas_outbound_dialed > 1
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "DNAS node {{ $labels.instance }} has all outbound peers in one address group"
+          description: >-
+            Every outbound connection sits in one /16. One operator may hold all of
+            them. Add peers in unrelated networks.
+
+      - alert: DnasFewPeers
+        expr: dnas_peers < 3
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "DNAS node {{ $labels.instance }} has only {{ $value }} peers"
+
+      - alert: DnasOrphansPiling
+        expr: dnas_orphan_blocks > 8
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "DNAS node {{ $labels.instance }} is parking {{ $value }} orphan blocks"
+          description: >-
+            It is missing an ancestor its peers have. Check connectivity.
+
+  - name: dnas-delivery
+    rules:
+      # Webhook delivery is at-most-once behind a bounded queue: a dropped event
+      # is gone, and a silently failing receiver looks exactly like a quiet chain.
+      - alert: DnasWebhookEventsDropped
+        expr: increase(dnas_webhook_dropped[15m]) > 0
+        for: 0m
+        labels: {severity: warning}
+        annotations:
+          summary: "DNAS node {{ $labels.instance }} dropped webhook events"
+          description: >-
+            The receiver fell far enough behind that events were discarded rather
+            than queued. They are not coming back. A service that must not miss a
+            payment should reconcile against /chain or /address/{addr}/history —
+            or use `dnas invoice serve`, whose delivery is at-least-once.
+
+      - alert: DnasWebhooksFailing
+        expr: increase(dnas_webhook_failed[15m]) > 5
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "DNAS webhooks from {{ $labels.instance }} are failing"
+
+  - name: dnas-relay
+    rules:
+      # Compact relay is a pure win when it works and a silent extra round trip
+      # when it does not.
+      - alert: DnasCompactBlocksMissing
+        expr: >-
+          increase(dnas_compact_block_miss[1h]) >
+          increase(dnas_compact_block_hit[1h])
+        for: 1h
+        labels: {severity: info}
+        annotations:
+          summary: "DNAS node {{ $labels.instance }} is reconstructing more blocks than it rebuilds"
+          description: >-
+            More compact blocks fell back to a full fetch than were rebuilt from
+            the local mempool, so compact relay is costing a round trip rather
+            than saving bandwidth. Usually means this node's pool and its peers'
+            disagree — check transaction relay and the mempool byte budget.
+
+      - alert: DnasTransactionsStuckInFlight
+        expr: dnas_tx_in_flight > 500
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "DNAS node {{ $labels.instance }} has {{ $value }} transactions announced but not delivered"
+          description: >-
+            Peers are announcing transaction ids and not answering the requests
+            for the bodies.
+
+  - name: dnas-storage
+    rules:
+      - alert: DnasStoreGrowingOnAPruningNode
+        expr: >-
+          dnas_store_bytes > 2 * 1024 * 1024 * 1024
+          and increase(dnas_store_bytes_saved[24h]) == 0
+        for: 1h
+        labels: {severity: warning}
+        annotations:
+          summary: "DNAS store on {{ $labels.instance }} is large and compaction has reclaimed nothing in a day"
+          description: >-
+            Either this node is not pruning, or compaction is failing. `dnas db
+            verify` reports which heights it could still check; /info carries the
+            last compaction error.

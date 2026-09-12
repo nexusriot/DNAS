@@ -10,7 +10,16 @@ const (
 	MsgHello    MsgType = "hello"    // announce our advertised address
 	MsgGetPeers MsgType = "getpeers" // request the peer's known addresses
 	MsgPeers    MsgType = "peers"    // known peer addresses (for discovery)
-	MsgTx       MsgType = "tx"       // a pending transaction
+	MsgTx       MsgType = "tx"       // a pending transaction (pushed in full)
+
+	// Transaction propagation by announcement. Pushing every transaction to every
+	// peer means each one crosses each link once per peer, whether or not the peer
+	// already has it — on a well-connected node that is the same body sent eight
+	// times over. Announcing a 64-character hash and letting a peer ask for what it
+	// lacks replaces all but one of those copies with 64 bytes.
+	MsgTxInv MsgType = "txinv" // announce pending transactions by hash
+	MsgGetTx MsgType = "gettx" // request transaction bodies by hash
+	MsgTxs   MsgType = "txs"   // the requested bodies
 
 	// Mempool reconciliation: ask a peer for what it has pending. Transactions are
 	// otherwise only ever PUSHED as they arrive, so a node that starts up after a
@@ -23,6 +32,13 @@ const (
 	MsgInv     MsgType = "inv"     // announce a block (index + hash)
 	MsgGetData MsgType = "getdata" // request a block body by index
 	MsgBlock   MsgType = "block"   // a single block body
+
+	// Compact block relay: send the header and 8-byte short ids instead of the
+	// bodies, so a peer rebuilds the block from transactions it already has and
+	// asks only for the ones it is missing (see compactblock.go).
+	MsgCmpctBlock  MsgType = "cmpctblock"  // header + coinbase + short ids
+	MsgGetBlockTxn MsgType = "getblocktxn" // request block transactions by position
+	MsgBlockTxn    MsgType = "blocktxn"    // the requested block transactions
 
 	// Headers-first, ranged catch-up sync.
 	MsgGetHeaders MsgType = "getheaders" // request headers starting at an index
@@ -60,6 +76,11 @@ const (
 	// capability rather than the version number means a node that does not want to
 	// serve its pool simply stops advertising it.
 	CapMempool = "mpool"
+	// CapTxInv advertises that the peer understands announcement-based transaction
+	// relay (MsgTxInv/MsgGetTx/MsgTxs). A peer that does not advertise it keeps
+	// receiving full pushes, so an older node loses nothing and the rollout needs
+	// no flag day.
+	CapTxInv = "txinv"
 )
 
 // Protocol limits (caps on what a single message may carry, to bound work).
@@ -71,6 +92,10 @@ const (
 	// carries, so serving a peer's pool request cannot be turned into an unbounded
 	// message (the pool itself holds up to core.DefaultMempoolSize).
 	maxMempoolBatch = 256
+	// maxTxInvBatch bounds one announcement or request. A peer could otherwise
+	// name a million hashes in a single message and make us allocate a reply for
+	// each before anything has been validated.
+	maxTxInvBatch = 512
 )
 
 // Message is the single JSON envelope exchanged between peers over the
@@ -114,8 +139,15 @@ type Message struct {
 	Locator []string      `json:"locator,omitempty"` // block-locator for fork discovery
 
 	// inventory / ranges
-	Index uint64 `json:"index,omitempty"`
-	Hash  string `json:"hash,omitempty"`
-	From  uint64 `json:"from,omitempty"`
-	To    uint64 `json:"to,omitempty"`
+	// Hashes carries transaction ids for MsgTxInv (here they are) and MsgGetTx
+	// (send me these), bounded by maxTxInvBatch.
+	Hashes []string `json:"hashes,omitempty"`
+	// Indexes carries POSITIONS in a block's transaction list, for the compact
+	// block round trip (MsgGetBlockTxn).
+	Indexes []uint32      `json:"indexes,omitempty"`
+	Cmpct   *CompactBlock `json:"cmpct,omitempty"`
+	Index   uint64        `json:"index,omitempty"`
+	Hash    string        `json:"hash,omitempty"`
+	From    uint64        `json:"from,omitempty"`
+	To      uint64        `json:"to,omitempty"`
 }

@@ -49,6 +49,9 @@ type effectiveConfig struct {
 	LogJSON     bool
 	Checkpoints []string
 	Upgrades    []string
+	Deployments []string
+	SignalBits  string
+	Stratum     string
 	APIAuth     bool
 }
 
@@ -114,6 +117,9 @@ func printEffectiveConfig(c effectiveConfig) {
 	row("webhooks", list(c.Webhooks))
 	row("checkpoints", list(c.Checkpoints))
 	row("upgrades", list(c.Upgrades))
+	row("deployments", list(c.Deployments))
+	row("signalbits", c.SignalBits)
+	row("stratum", c.Stratum)
 	fmt.Println()
 	fmt.Println("nothing was started; drop -printconfig to run the node.")
 }

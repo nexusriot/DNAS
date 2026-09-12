@@ -103,7 +103,7 @@ func GenesisBlock() Block {
 // NewBlockchain returns a chain containing only the genesis block.
 func NewBlockchain() *Blockchain {
 	genesis := GenesisBlock()
-	return &Blockchain{
+	bc := &Blockchain{
 		filterHeaders: FilterHeaderChain([]BlockFilter{BuildBlockFilter(genesis)}),
 		blocks:        []Block{genesis},
 		state:         map[string]Account{},
@@ -113,6 +113,8 @@ func NewBlockchain() *Blockchain {
 		assets:        map[string]AssetInfo{},
 		sigCache:      NewValidationCache(DefaultValidationCacheSize),
 	}
+	bc.refreshDeploymentsLocked()
+	return bc
 }
 
 func (bc *Blockchain) Tip() Block {
@@ -307,6 +309,9 @@ func (bc *Blockchain) AddBlock(block Block) error {
 	}
 	bc.blocks = append(bc.blocks, block)
 	bc.undos = append(bc.undos, undo)
+	// A miner vote may have closed a window with this block, which fixes (or
+	// withdraws) an activation height the NEXT block is validated against.
+	bc.refreshDeploymentsLocked()
 	bc.work.Add(bc.work, BlockWork(block.Bits))
 	bc.indexBlock(block)
 	bc.burned += blockBurned(block)
@@ -494,6 +499,7 @@ func (bc *Blockchain) reorgLocked(fork int, suffix []Block) (bool, []Block, erro
 		bc.burned -= blockBurned(bc.blocks[i])
 	}
 	bc.blocks = blocks
+	bc.refreshDeploymentsLocked() // a reorg can undo a lock-in (see versionbits.go)
 	bc.state = state
 	bc.undos = undos
 	bc.work = candWork
@@ -959,7 +965,7 @@ func validateBlockStructure(blocks []Block, block Block) error {
 	if coinbase.To == "" {
 		return errors.New("coinbase has no recipient")
 	}
-	return validateCoinbaseShape(coinbase)
+	return validateCoinbaseShape(coinbase, block.Index)
 }
 
 // validateCoinbaseShape pins the coinbase to the one form it is allowed to take:
@@ -971,17 +977,27 @@ func validateBlockStructure(blocks []Block, block Block) error {
 // mean nothing, so leaving them free only invites divergence between
 // implementations. Every coinbase this code has ever produced (NewCoinbase sets
 // exactly From/To/Amount) satisfies this.
-func validateCoinbaseShape(cb Transaction) error {
+func validateCoinbaseShape(cb Transaction, height uint64) error {
 	if n := cb.Size(); n > MaxCoinbaseBytes {
 		return fmt.Errorf("coinbase too large: %d bytes (max %d)", n, MaxCoinbaseBytes)
 	}
 	if len(cb.To) > MaxAddressBytes {
 		return fmt.Errorf("coinbase recipient too long (%d > %d)", len(cb.To), MaxAddressBytes)
 	}
-	if cb.Fee != 0 || cb.Nonce != 0 || cb.Expiry != 0 || cb.LockUntil != 0 {
-		return errors.New("coinbase must not set fee, nonce, expiry or lock_until")
+	if cb.Fee != 0 || cb.Expiry != 0 || cb.LockUntil != 0 {
+		return errors.New("coinbase must not set fee, expiry or lock_until")
 	}
-	if cb.AssetID != "" || cb.Issue != nil {
+	// The Nonce field is where the block height is bound once BIP34 is active; it
+	// is the only field of the coinbase whose legal value depends on the block
+	// carrying it (see UpgradeUniqueCoinbase).
+	if IsUpgradeActive(UpgradeUniqueCoinbase, height) {
+		if cb.Nonce != height {
+			return fmt.Errorf("coinbase nonce %d must equal the block height %d", cb.Nonce, height)
+		}
+	} else if cb.Nonce != 0 {
+		return errors.New("coinbase must not set nonce")
+	}
+	if cb.AssetID != "" || cb.Issue != nil || cb.AssetOp != nil {
 		return errors.New("coinbase must not carry an asset")
 	}
 	if cb.PubKey != "" || cb.Signature != "" || len(cb.Signatures) > 0 {
@@ -1032,6 +1048,12 @@ func checkTxAtHeight(tx Transaction, height uint64) error {
 	// Height-activated rule (consensus upgrade): vault-authorized spends.
 	if tx.IsVault() && !IsUpgradeActive(UpgradeVault, height) {
 		return errors.New("vault spends are not active at this height")
+	}
+	// Height-activated rule (consensus upgrade): minting and burning an existing
+	// asset. Before this, a supply is fixed at issuance and holders can rely on
+	// that, so switching it on changes what they are trusting.
+	if tx.IsAssetOp() && !IsUpgradeActive(UpgradeAssetOps, height) {
+		return errors.New("asset mint/burn operations are not active at this height")
 	}
 	// Height-activated rule (consensus upgrade): fee sponsorship.
 	if tx.IsSponsored() && !IsUpgradeActive(UpgradeFeeSponsor, height) {
@@ -1089,7 +1111,7 @@ func applyTxsAndCoinbase(state map[string]Account, blocks []Block, block Block, 
 
 	baseFee := block.BaseFee
 	seen := make(map[string]bool)
-	var tips uint64
+	var tips, burned uint64
 	for i := 1; i < len(block.Transactions); i++ {
 		tx := block.Transactions[i]
 		if tx.IsCoinbase() {
@@ -1122,6 +1144,7 @@ func applyTxsAndCoinbase(state map[string]Account, blocks []Block, block Block, 
 			return fail(&TxRejection{Index: i, Err: err})
 		}
 		tips += tx.Fee - minFee // base fee × size is burned; miner keeps only the tip
+		burned += minFee
 	}
 
 	// Miner is paid the subsidy plus tips; the base-fee portion of every fee is
@@ -1137,6 +1160,16 @@ func applyTxsAndCoinbase(state map[string]Account, blocks []Block, block Block, 
 	}
 	acc.Balance += coinbase.Amount
 	set(coinbase.To, acc)
+
+	// Everything above checks that each transaction is individually legal. This
+	// checks the block as a whole: that applying it created exactly the subsidy
+	// and destroyed exactly the base fees, and moved no asset into or out of
+	// existence. An arithmetic slip anywhere in the application path shows up
+	// here as a rejected block rather than as silent inflation (see
+	// conservation.go).
+	if err := checkConservation(state, undo, block.Transactions, reward, burned); err != nil {
+		return fail(err)
+	}
 	return undo, nil
 }
 
@@ -1163,6 +1196,9 @@ func applyTxTo(state map[string]Account, tx Transaction, reserve, payerReserve u
 	}
 	if tx.IsIssue() {
 		return applyIssue(state, tx, reserve, payerReserve, set)
+	}
+	if tx.IsAssetOp() {
+		return applyAssetOp(state, tx, reserve, payerReserve, set)
 	}
 	if tx.IsAssetTransfer() {
 		return applyAssetTransfer(state, tx, reserve, payerReserve, set)
@@ -1234,6 +1270,64 @@ func applyIssue(state map[string]Account, tx Transaction, reserve, payerReserve 
 	sender.Balance -= fee
 	sender.Nonce++
 	sender = sender.withAssetDelta(AssetID(tx.From, tx.Issue.Ticker, tx.Nonce), int64(tx.Issue.Supply))
+	set(tx.From, sender)
+	return chargeSponsor(state, tx, payerReserve, set)
+}
+
+// applyAssetOp mints or burns units of an asset the sender issued.
+//
+// Authority is checked by reproducing the asset id from the sender and the
+// operation's stated ticker and issuing nonce: an id that matches can only have
+// been produced by that issuer (see asset.go). Nothing is looked up, so this is
+// a pure function of the transaction and the sender's account, exactly like
+// every other rule here.
+func applyAssetOp(state map[string]Account, tx Transaction, reserve, payerReserve uint64, set func(string, Account)) error {
+	op := tx.AssetOp
+	if err := op.Validate(); err != nil {
+		return err
+	}
+	if !op.AuthorizedBy(tx.From, tx.AssetID) {
+		return fmt.Errorf("%s did not issue asset %s (the stated ticker and nonce do not derive it)", tx.From, tx.AssetID)
+	}
+
+	sender := state[tx.From]
+	if tx.Nonce != sender.Nonce {
+		return fmt.Errorf("bad nonce for %s: got %d, want %d", tx.From, tx.Nonce, sender.Nonce)
+	}
+	fee := senderFee(tx)
+	need := fee + reserve
+	if need < fee {
+		return errors.New("fee+reserve overflow")
+	}
+	if sender.Balance < need {
+		return fmt.Errorf("insufficient coin for fee for %s: have %d, need %d (%d immature)", tx.From, sender.Balance, fee, reserve)
+	}
+
+	held := sender.Assets[tx.AssetID]
+	var delta int64
+	switch op.Op {
+	case AssetOpMint:
+		// The cap is on the issuer's holding, which is the whole supply for a mint:
+		// nothing else can create units, so this is where the total is bounded and
+		// where the signed arithmetic elsewhere is kept from overflowing.
+		if held+op.Amount < held || held+op.Amount > MaxAssetSupply {
+			return fmt.Errorf("minting %d would take asset %s past the %d cap", op.Amount, tx.AssetID, MaxAssetSupply)
+		}
+		delta = int64(op.Amount)
+	case AssetOpBurn:
+		// An issuer may only burn what it HOLDS. Burning someone else's units
+		// would be confiscation, which is a different feature and not this one.
+		if held < op.Amount {
+			return fmt.Errorf("cannot burn %d of asset %s: the issuer holds %d", op.Amount, tx.AssetID, held)
+		}
+		delta = -int64(op.Amount)
+	default:
+		return fmt.Errorf("unknown asset operation %q", op.Op)
+	}
+
+	sender.Balance -= fee
+	sender.Nonce++
+	sender = sender.withAssetDelta(tx.AssetID, delta)
 	set(tx.From, sender)
 	return chargeSponsor(state, tx, payerReserve, set)
 }

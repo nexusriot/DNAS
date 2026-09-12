@@ -31,7 +31,7 @@ E2E_DOCKER_RUN := --rm --init --network none --read-only \
 # Pass computed settings down to the build/packaging scripts.
 export VERSION PLATFORMS ARCHES GO
 
-.PHONY: all build dnas tui test test-race e2e e2e-docker e2e-docker-shell vet fmt dist deb demo install uninstall clean version help
+.PHONY: all build dnas tui test test-race e2e e2e-docker e2e-docker-shell vet fmt dist deb rpm demo install uninstall clean version help
 
 all: build
 
@@ -100,6 +100,12 @@ dist:
 ## deb: build .deb packages (ARCHES) into dist/
 deb:
 	./scripts/build-deb.sh
+
+## rpm: build an RPM for THIS machine's architecture into dist/
+# Unlike deb it does not cross-compile: rpmbuild runs the build itself, so an
+# RPM for another architecture has to be built on (or in a container for) it.
+rpm:
+	./scripts/build-rpm.sh
 
 ## demo: run the 3-node end-to-end demo
 demo:
