@@ -33,6 +33,12 @@ func stateLeaf(addr string, acc Account) string {
 		}
 		s = b.String()
 	}
+	// A name record commits its owner and expiry. Appended only when set, so a
+	// coin-only account's leaf — and the state root of a chain with no names —
+	// is unchanged by the name service existing.
+	if acc.Owner != "" || acc.Expires != 0 {
+		s = fmt.Sprintf("%s|owner:%s|expires:%d", s, acc.Owner, acc.Expires)
+	}
 	return hashBytes([]byte(s))
 }
 
@@ -61,11 +67,57 @@ func stateRoot(state map[string]Account) string {
 	return stateTrieOf(state).Root()
 }
 
-// stateTrieOf builds the state trie for an account set. Deterministic: the trie
-// is canonical, so insertion order cannot change the root (which is what stops
-// two honest nodes committing different roots for identical state).
+// stateRootInto is stateRoot with the nodes the rebuild produces written
+// through to cache rather than thrown away. It is the fallback path of the
+// incremental committer (statetrie.go): a rebuild that repopulates the cache
+// leaves the next block cheap again.
+func stateRootInto(cache NodeStore, state map[string]Account) string {
+	return stateTrieWarming(cache, state).Root()
+}
+
+// stateTrieWarming builds the state trie, warming cache as it goes.
+//
+// It does NOT build directly into the cache. A build reads back the
+// intermediate nodes it has just written, and a bounded cache may have evicted
+// them by then — so building into one can fail on a trie it is itself in the
+// middle of constructing. The authoritative store for the build is therefore
+// unbounded and private to it, and the cache only ever receives copies.
+func stateTrieWarming(cache NodeStore, state map[string]Account) *Trie {
+	return stateTrieInto(&teeNodeStore{build: NewMemNodeStore(), cache: cache}, state)
+}
+
+// teeNodeStore reads from an authoritative store first and writes to both. It
+// is what lets a build warm a cache that may be evicting underneath it.
+type teeNodeStore struct {
+	build NodeStore
+	cache NodeStore
+}
+
+func (t *teeNodeStore) GetNode(hash string) ([]byte, bool) {
+	if data, ok := t.build.GetNode(hash); ok {
+		return data, true
+	}
+	return t.cache.GetNode(hash)
+}
+
+func (t *teeNodeStore) PutNode(hash string, data []byte) error {
+	if err := t.build.PutNode(hash, data); err != nil {
+		return err
+	}
+	return t.cache.PutNode(hash, data)
+}
+
+// stateTrieOf builds the state trie for an account set in a throwaway store.
 func stateTrieOf(state map[string]Account) *Trie {
-	t := NewTrie(NewMemNodeStore(), EmptyTrieRoot())
+	return stateTrieInto(NewMemNodeStore(), state)
+}
+
+// stateTrieInto builds the state trie for an account set into store.
+// Deterministic: the trie is canonical, so insertion order cannot change the
+// root (which is what stops two honest nodes committing different roots for
+// identical state).
+func stateTrieInto(store NodeStore, state map[string]Account) *Trie {
+	t := NewTrie(store, EmptyTrieRoot())
 	// Sorted for reproducibility of the NODE STORE, not of the root: the root is
 	// order-independent by construction (see TestTrieRootIsInsertionOrderIndependent).
 	addrs := make([]string, 0, len(state))
@@ -113,7 +165,14 @@ func (bc *Blockchain) ProveAccount(addr string) (AccountProof, bool) {
 	tip := bc.blocks[len(bc.blocks)-1]
 	acct, present := bc.state[addr]
 
-	proof, err := stateTrieOf(bc.state).Prove(trieKeyFor(addr))
+	// Prove against the retained trie at the tip's committed root: O(depth)
+	// rather than a full rebuild of the ledger per request, which is what made
+	// this unauthenticated endpoint the most expensive call on the node. A cache
+	// miss falls back to the rebuild, which is the old cost and the old answer.
+	proof, err := NewTrie(bc.nodes, tip.StateRoot).Prove(trieKeyFor(addr))
+	if err != nil {
+		proof, err = stateTrieWarming(bc.nodes, bc.state).Prove(trieKeyFor(addr))
+	}
 	if err != nil {
 		// Same reasoning as stateTrieOf: unreachable short of a hash collision,
 		// and there is nothing truthful to return.

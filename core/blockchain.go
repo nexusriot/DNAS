@@ -18,6 +18,12 @@ type Account struct {
 	Balance uint64            `json:"balance"`
 	Nonce   uint64            `json:"nonce"`
 	Assets  map[string]uint64 `json:"assets,omitempty"`
+	// Owner and Expires are set only on a NAME RECORD — a state entry under the
+	// reserved name prefix rather than an address (see name.go). They are
+	// omitempty so an ordinary account's JSON, and its state leaf, are
+	// byte-identical to before the name service existed.
+	Owner   string `json:"owner,omitempty"`
+	Expires uint64 `json:"expires,omitempty"`
 }
 
 // Blockchain is a thread-safe chain of blocks plus the account state derived by
@@ -66,6 +72,14 @@ type Blockchain struct {
 	// verified, so a payment's signature is not re-checked when the block carrying
 	// it arrives (see valcache.go). Shared with the mempool by the node.
 	sigCache *ValidationCache
+	// nodes retains the account trie's nodes so a state root costs the path to
+	// the accounts a block touched rather than a rebuild over the whole ledger.
+	// It is a bounded CACHE, never a source of truth — see statetrie.go.
+	nodes NodeStore
+	// history accumulates the hash of every block from UpgradeHistoryRoot's
+	// activation height onward, so a header can commit to the whole chain
+	// behind it and ancestry becomes provable in O(log n). See mmr.go.
+	history *MMR
 }
 
 // ValidationCache returns the chain's signature-verification cache, so the
@@ -112,6 +126,8 @@ func NewBlockchain() *Blockchain {
 		txIndex:       map[string]TxLoc{}, // genesis carries no transactions
 		assets:        map[string]AssetInfo{},
 		sigCache:      NewValidationCache(DefaultValidationCacheSize),
+		nodes:         NewBoundedNodeStore(DefaultTrieCacheNodes),
+		history:       &MMR{},
 	}
 	bc.refreshDeploymentsLocked()
 	return bc
@@ -297,7 +313,8 @@ func (bc *Blockchain) FindTxProof(txHash string) (TxProof, bool) {
 func (bc *Blockchain) AddBlock(block Block) error {
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
-	undo, err := applyBlock(bc.state, bc.blocks, block, bc.sigCache)
+	cc := bc.commitCtxAt(len(bc.blocks) - 1)
+	undo, err := applyBlock(bc.state, bc.blocks, block, bc.sigCache, cc)
 	if err != nil {
 		return err
 	}
@@ -309,6 +326,7 @@ func (bc *Blockchain) AddBlock(block Block) error {
 	}
 	bc.blocks = append(bc.blocks, block)
 	bc.undos = append(bc.undos, undo)
+	bc.history = cc.history // cc worked on a clone; adopt it now the block is ours
 	// A miner vote may have closed a window with this block, which fixes (or
 	// withdraws) an activation height the NEXT block is validated against.
 	bc.refreshDeploymentsLocked()
@@ -457,8 +475,12 @@ func (bc *Blockchain) reorgLocked(fork int, suffix []Block) (bool, []Block, erro
 	}
 	blocks := append([]Block(nil), bc.blocks[:fork+1]...)
 	undos := append([][]undoEntry(nil), bc.undos[:fork+1]...)
+	// Positioned at the fork point: a historical state root is as readable as
+	// the tip's, which is what makes rolling back cost nothing there, and the
+	// accumulator is rebuilt to that point once rather than per suffix block.
+	cc := bc.commitCtxAt(fork)
 	for i, b := range suffix {
-		undo, err := applyBlock(state, blocks, b, bc.sigCache)
+		undo, err := applyBlock(state, blocks, b, bc.sigCache, cc)
 		if err != nil {
 			return false, nil, fmt.Errorf("block %d: %w", fork+1+i, err)
 		}
@@ -503,6 +525,7 @@ func (bc *Blockchain) reorgLocked(fork int, suffix []Block) (bool, []Block, erro
 	bc.state = state
 	bc.undos = undos
 	bc.work = candWork
+	bc.history = cc.history // the suffix advanced it block by block as it validated
 	bc.truncateFilterHeadersLocked(uint64(fork))
 	for i := fork + 1; i < len(blocks); i++ {
 		bc.indexBlock(blocks[i])
@@ -888,8 +911,8 @@ func medianTimePast(blocks []Block) int64 {
 // On any error the state is rolled back so it is left exactly as it was. It also
 // verifies the committed state root: the post-block account state must hash to
 // block.StateRoot.
-func applyBlock(state map[string]Account, blocks []Block, block Block, cache *ValidationCache) ([]undoEntry, error) {
-	if err := validateBlockStructure(blocks, block); err != nil {
+func applyBlock(state map[string]Account, blocks []Block, block Block, cache *ValidationCache, cc *commitCtx) ([]undoEntry, error) {
+	if err := validateBlockStructure(blocks, block, cc); err != nil {
 		return nil, err
 	}
 	// Warm the signature cache across all cores before the serial pass below, so
@@ -899,10 +922,11 @@ func applyBlock(state map[string]Account, blocks []Block, block Block, cache *Va
 	if err != nil {
 		return nil, err
 	}
-	if root := stateRoot(state); block.StateRoot != root {
+	if root := commitStateRoot(cc, state, undo); block.StateRoot != root {
 		applyUndo(state, undo)
 		return nil, fmt.Errorf("state root mismatch: got %q, want %q", block.StateRoot, root)
 	}
+	cc.advance(block)
 	return undo, nil
 }
 
@@ -910,7 +934,7 @@ func applyBlock(state map[string]Account, blocks []Block, block Block, cache *Va
 // account state: linkage, timestamps, difficulty, proof of work, the merkle root,
 // and the coinbase's shape. It is separated from state application so the miner
 // can compute the resulting state root (NextStateRoot) before a block is mined.
-func validateBlockStructure(blocks []Block, block Block) error {
+func validateBlockStructure(blocks []Block, block Block, cc *commitCtx) error {
 	prev := blocks[len(blocks)-1]
 	if block.Index != prev.Index+1 {
 		return fmt.Errorf("bad index %d after %d", block.Index, prev.Index)
@@ -934,6 +958,9 @@ func validateBlockStructure(blocks []Block, block Block) error {
 	}
 	if block.BaseFee != expectedBaseFee(blocks, block.Index) {
 		return fmt.Errorf("wrong base fee %d, want %d", block.BaseFee, expectedBaseFee(blocks, block.Index))
+	}
+	if err := checkCommitments(prev, block, cc); err != nil {
+		return err
 	}
 	if !block.HasValidPoW() {
 		return errors.New("invalid proof of work")
@@ -1042,6 +1069,10 @@ func checkTxAtHeight(tx Transaction, height uint64) error {
 	if tx.HTLCRefundNotReady(height) {
 		return fmt.Errorf("htlc refund before timeout (timeout %d > height %d)", tx.HTLC.Timeout, height)
 	}
+	if tx.ScriptNotReady(height) {
+		min, _ := tx.ScriptMinHeight()
+		return fmt.Errorf("script height constraint unmet (needs height %d, this is %d)", min, height)
+	}
 	if tx.VaultHotNotReady(height) {
 		return fmt.Errorf("vault hot-key spend before unlock (unlock %d > height %d)", tx.Vault.Unlock, height)
 	}
@@ -1054,6 +1085,18 @@ func checkTxAtHeight(tx Transaction, height uint64) error {
 	// that, so switching it on changes what they are trusting.
 	if tx.IsAssetOp() && !IsUpgradeActive(UpgradeAssetOps, height) {
 		return errors.New("asset mint/burn operations are not active at this height")
+	}
+	// Height-activated rule (consensus upgrade): script-authorized spends.
+	if tx.IsScript() && !IsUpgradeActive(UpgradeScript, height) {
+		return errors.New("script-authorized spends are not active at this height")
+	}
+	// Height-activated rule (consensus upgrade): name-service operations.
+	if tx.IsNameOp() && !IsUpgradeActive(UpgradeNameService, height) {
+		return errors.New("name-service operations are not active at this height")
+	}
+	// Height-activated rule (consensus upgrade): non-fungible issuance.
+	if tx.Issue.IsNonFungible() && !IsUpgradeActive(UpgradeNonFungible, height) {
+		return errors.New("non-fungible asset issuance is not active at this height")
 	}
 	// Height-activated rule (consensus upgrade): fee sponsorship.
 	if tx.IsSponsored() && !IsUpgradeActive(UpgradeFeeSponsor, height) {
@@ -1102,6 +1145,20 @@ func applyTxsAndCoinbase(state map[string]Account, blocks []Block, block Block, 
 	set := func(addr string, acc Account) {
 		prevAcc, existed := state[addr]
 		undo = append(undo, undoEntry{addr: addr, prev: prevAcc, existed: existed})
+		// A released NAME is removed rather than stored empty, so a chain where
+		// a name was claimed and given up commits the same state root as one
+		// where it never existed. An empty record left behind would be
+		// permanent state committing to nothing, and every node would carry it
+		// forever.
+		//
+		// Only name keys: an ACCOUNT drained to exactly zero stays, because
+		// dropping it would change the state root of every existing chain that
+		// has one. The undo log records existence either way, so a reorg
+		// restores whichever it was.
+		if isNameKey(addr) && acc.isEmpty() {
+			delete(state, addr)
+			return
+		}
 		state[addr] = acc
 	}
 	fail := func(err error) ([]undoEntry, error) {
@@ -1140,7 +1197,7 @@ func applyTxsAndCoinbase(state map[string]Account, blocks []Block, block Block, 
 		if tx.IsSponsored() {
 			payerReserve = immatureCoinbase(blocks, height, tx.FeePayer)
 		}
-		if err := applyTxTo(state, tx, reserve, payerReserve, set, cache); err != nil {
+		if err := applyTxTo(state, tx, height, reserve, payerReserve, set, cache); err != nil {
 			return fail(&TxRejection{Index: i, Err: err})
 		}
 		tips += tx.Fee - minFee // base fee × size is burned; miner keeps only the tip
@@ -1181,18 +1238,26 @@ func (bc *Blockchain) NextStateRoot(candidate Block) (string, error) {
 	bc.mu.RLock()
 	defer bc.mu.RUnlock()
 	s := cloneState(bc.state)
-	if _, err := applyTxsAndCoinbase(s, bc.blocks, candidate, bc.sigCache); err != nil {
+	undo, err := applyTxsAndCoinbase(s, bc.blocks, candidate, bc.sigCache)
+	if err != nil {
 		return "", err
 	}
-	return stateRoot(s), nil
+	// A speculative root, so the committer is a throwaway positioned at the tip:
+	// the nodes it writes are shared (they are content-addressed, so a candidate
+	// that becomes the next block has already warmed the cache) but the
+	// committer's own cursor must not move the chain's.
+	return commitStateRoot(bc.commitCtxAt(len(bc.blocks)-1), s, undo), nil
 }
 
 // applyTxTo validates a single signed transfer against state and applies it via
 // set (which records undo information). reserve is the sender's immature
 // coinbase amount that must remain unspent (coinbase maturity).
-func applyTxTo(state map[string]Account, tx Transaction, reserve, payerReserve uint64, set func(string, Account), cache *ValidationCache) error {
+func applyTxTo(state map[string]Account, tx Transaction, height, reserve, payerReserve uint64, set func(string, Account), cache *ValidationCache) error {
 	if err := cache.Verify(tx); err != nil {
 		return err
+	}
+	if tx.IsNameOp() {
+		return applyNameOp(state, tx, height, reserve, payerReserve, set)
 	}
 	if tx.IsIssue() {
 		return applyIssue(state, tx, reserve, payerReserve, set)
@@ -1255,6 +1320,14 @@ func applyIssue(state map[string]Account, tx Transaction, reserve, payerReserve 
 	if tx.Issue.Supply == 0 || tx.Issue.Supply > MaxAssetSupply {
 		return fmt.Errorf("asset supply must be in 1..%d", MaxAssetSupply)
 	}
+	if tx.Issue.IsNonFungible() {
+		if err := validMetadata(tx.Issue.Metadata); err != nil {
+			return err
+		}
+		if tx.Issue.Supply != 1 {
+			return fmt.Errorf("a non-fungible asset has a supply of exactly 1, got %d", tx.Issue.Supply)
+		}
+	}
 	sender := state[tx.From]
 	if tx.Nonce != sender.Nonce {
 		return fmt.Errorf("bad nonce for %s: got %d, want %d", tx.From, tx.Nonce, sender.Nonce)
@@ -1269,7 +1342,7 @@ func applyIssue(state map[string]Account, tx Transaction, reserve, payerReserve 
 	}
 	sender.Balance -= fee
 	sender.Nonce++
-	sender = sender.withAssetDelta(AssetID(tx.From, tx.Issue.Ticker, tx.Nonce), int64(tx.Issue.Supply))
+	sender = sender.withAssetDelta(IssuedAssetID(tx.From, tx.Nonce, tx.Issue), int64(tx.Issue.Supply))
 	set(tx.From, sender)
 	return chargeSponsor(state, tx, payerReserve, set)
 }
@@ -1427,4 +1500,128 @@ func cloneState(s map[string]Account) map[string]Account {
 		c[k] = v
 	}
 	return c
+}
+
+// checkCommitments validates the two header commitments that are scheduled
+// rather than always-on: the compact-filter root and the history accumulator.
+//
+// Both are checked BEFORE the proof of work, deliberately. The proof of work
+// covers them, so a block whose commitment is wrong cannot have valid work
+// either — but saying "wrong filter root" is a far more useful rejection than
+// "invalid proof of work", and a peer sending the former is making a different
+// mistake from one sending the latter.
+func checkCommitments(prev, block Block, cc *commitCtx) error {
+	if IsUpgradeActive(UpgradeFilterCommit, block.Index) {
+		want, err := BlockFilterRoot(prev.FilterRoot, block)
+		if err != nil {
+			return fmt.Errorf("compute filter root: %w", err)
+		}
+		if block.FilterRoot != want {
+			return fmt.Errorf("wrong filter root %s, want %s", short12(block.FilterRoot), short12(want))
+		}
+	} else if block.FilterRoot != "" {
+		// A field nobody validates is a field anyone may fill. Rejecting it
+		// before activation keeps the pre-upgrade block hash exactly what it was.
+		return errors.New("filter root set before the commitment upgrade activates")
+	}
+
+	if IsUpgradeActive(UpgradeHistoryRoot, block.Index) {
+		// An empty expectation means the accumulator was unavailable to this
+		// caller, not that the root should be empty — skip rather than reject,
+		// the same way a missing trie node falls back instead of failing.
+		if want := cc.expectedHistoryRoot(); want != "" && block.HistoryRoot != want {
+			return fmt.Errorf("wrong history root %s, want %s", short12(block.HistoryRoot), short12(want))
+		}
+	} else if block.HistoryRoot != "" {
+		return errors.New("history root set before the accumulator upgrade activates")
+	}
+	return nil
+}
+
+// NextCommitments returns the filter root and history root a candidate block
+// must carry, for a miner to fill in before it starts hashing.
+//
+// Both depend only on fields fixed before the nonce search — the candidate's
+// transactions, its merkle root and its parent — which is precisely why they
+// can be inside the proof-of-work preimage at all. Set MerkleRoot on the
+// candidate before calling: the filter is keyed on it (see filterKeyFor).
+//
+// Either value is "" when its upgrade is not active at the candidate's height,
+// which is also what the header must then carry.
+func (bc *Blockchain) NextCommitments(candidate Block) (filterRoot, historyRoot string, err error) {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+	tip := bc.blocks[len(bc.blocks)-1]
+	if IsUpgradeActive(UpgradeFilterCommit, candidate.Index) {
+		filterRoot, err = BlockFilterRoot(tip.FilterRoot, candidate)
+		if err != nil {
+			return "", "", err
+		}
+	}
+	if IsUpgradeActive(UpgradeHistoryRoot, candidate.Index) && bc.history != nil {
+		historyRoot = bc.history.Root()
+	}
+	return filterRoot, historyRoot, nil
+}
+
+// HistoryRoot is the accumulator root as of the tip — the value the NEXT block
+// commits. Exposed so a client can check a proof it was served against a value
+// it computed, and for /info.
+func (bc *Blockchain) HistoryRoot() string {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+	if bc.history == nil {
+		return EmptyMMRRoot
+	}
+	return bc.history.Root()
+}
+
+// ProveAncestry proves that the block at `height` is in the chain committed by
+// the header at `asOf`, in O(log n) hashes rather than the O(n) headers the
+// chain itself would take.
+//
+// The accumulator a header commits covers the blocks BELOW it, so asOf must be
+// strictly greater than height. The proof is checked against
+// blocks[asOf].HistoryRoot, which a light client takes from a header whose
+// proof of work it has verified.
+func (bc *Blockchain) ProveAncestry(height, asOf uint64) (AncestryProof, error) {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+	if asOf >= uint64(len(bc.blocks)) {
+		return AncestryProof{}, fmt.Errorf("height %d is above the tip", asOf)
+	}
+	if height >= asOf {
+		return AncestryProof{}, fmt.Errorf("a header commits the blocks BELOW it: %d is not below %d", height, asOf)
+	}
+	if !IsUpgradeActive(UpgradeHistoryRoot, asOf) {
+		return AncestryProof{}, errors.New("the history accumulator is not active at that height")
+	}
+	if !IsUpgradeActive(UpgradeHistoryRoot, height) {
+		return AncestryProof{}, errors.New("that block is below the accumulator's activation height")
+	}
+	// The range the header at asOf commits covers the activated blocks strictly
+	// below it, in order; the leaf's position is its offset within that run.
+	var leaves []string
+	var position uint64
+	found := false
+	for i := uint64(0); i < asOf; i++ {
+		b := bc.blocks[i]
+		if !IsUpgradeActive(UpgradeHistoryRoot, b.Index) {
+			continue
+		}
+		if b.Index == height {
+			position = uint64(len(leaves))
+			found = true
+		}
+		leaves = append(leaves, b.Hash)
+	}
+	if !found {
+		return AncestryProof{}, fmt.Errorf("block %d is not in the range committed at %d", height, asOf)
+	}
+	p, err := BuildAncestryProof(leaves, position)
+	if err != nil {
+		return AncestryProof{}, err
+	}
+	p.Height = height
+	return p, nil
 }

@@ -2,7 +2,6 @@ package node
 
 import (
 	"bytes"
-	"encoding/json"
 	"testing"
 
 	"github.com/nexusriot/DNAS/core"
@@ -12,13 +11,13 @@ import (
 // bufPeer returns a peer whose sent messages are captured in a buffer.
 func bufPeer() (*peer, *bytes.Buffer) {
 	var buf bytes.Buffer
-	return &peer{enc: json.NewEncoder(&buf), id: "peer-id"}, &buf
+	return &peer{enc: newMsgWriter(&buf), id: "peer-id"}, &buf
 }
 
 // sentMsgs decodes the messages a peer sent into its buffer.
 func sentMsgs(t *testing.T, buf *bytes.Buffer) []Message {
 	t.Helper()
-	dec := json.NewDecoder(buf)
+	dec := newMsgReader(buf)
 	var out []Message
 	for {
 		var m Message

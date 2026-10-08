@@ -31,12 +31,12 @@ E2E_DOCKER_RUN := --rm --init --network none --read-only \
 # Pass computed settings down to the build/packaging scripts.
 export VERSION PLATFORMS ARCHES GO
 
-.PHONY: all build dnas tui test test-race e2e e2e-docker e2e-docker-shell vet fmt dist deb rpm demo install uninstall clean version help
+.PHONY: all build dnas tui wasm test test-race bench bench-update bench-check verify-reproducible e2e e2e-docker e2e-docker-shell vet fmt dist deb rpm demo install uninstall clean version help
 
 all: build
 
-## build: compile dnas + dnas-tui for the host into bin/
-build: dnas tui
+## build: compile the wasm bundle + dnas + dnas-tui for the host into bin/
+build: wasm dnas tui
 
 ## dnas: build just the dnas CLI/daemon into bin/
 dnas:
@@ -45,6 +45,20 @@ dnas:
 ## tui: build just the terminal client into bin/ (its own module)
 tui:
 	cd tui && $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o ../bin/dnas-tui .
+
+## wasm: build the browser verification bundle into api/wasmdist/
+# The explorer verifies proofs by calling into core compiled to WebAssembly,
+# rather than a JavaScript reimplementation of the consensus rules. Every copy
+# of those rules this project kept outside core has silently rotted — the
+# explorer's own was hashing a preimage without the header's Version field — so
+# the bundle is the only verifier the page has, and `build` depends on it.
+#
+# wasm_exec.js is Go's runtime shim and must come from the toolchain that built
+# the .wasm, so it is copied here rather than vendored.
+wasm:
+	$(GO) env GOROOT >/dev/null
+	GOOS=js GOARCH=wasm $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o api/wasmdist/dnas.wasm ./cmd/wasmverify
+	cp "$$($(GO) env GOROOT)/lib/wasm/wasm_exec.js" api/wasmdist/wasm_exec.js
 
 ## test: run all Go tests (root modules + tui) and the GUI tests (skipped if PyQt6 is absent)
 test:
@@ -67,6 +81,18 @@ test:
 test-race:
 	$(GO) test -race -timeout 20m $(GOMODS)
 	cd tui && $(GO) test -race -timeout 20m ./...
+
+## bench: run the performance benchmarks (core hot paths)
+bench:
+	./scripts/bench.sh
+
+## bench-update: re-record the benchmark baseline (do this deliberately)
+bench-update:
+	./scripts/bench.sh --update
+
+## bench-check: fail if a benchmark regressed past the baseline threshold
+bench-check:
+	./scripts/bench.sh --check
 
 ## e2e: run the black-box end-to-end suite against a binary built from this tree
 e2e:
@@ -100,6 +126,10 @@ fmt:
 dist:
 	./scripts/build.sh
 
+## verify-reproducible: build the release twice and check the artifacts match
+verify-reproducible:
+	./scripts/verify-reproducible.sh
+
 ## deb: build .deb packages (ARCHES) into dist/
 deb:
 	./scripts/build-deb.sh
@@ -131,6 +161,7 @@ version:
 ## clean: remove build artifacts
 clean:
 	rm -rf bin dist dnas dnas-tui dnas-race tui/tui
+	rm -f api/wasmdist/dnas.wasm api/wasmdist/wasm_exec.js
 
 ## help: list targets
 help:

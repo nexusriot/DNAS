@@ -78,7 +78,7 @@ func BuildBlockFilter(b Block) BlockFilter {
 	if n == 0 {
 		return f
 	}
-	k0, k1 := filterKey(b.Hash)
+	k0, k1 := filterKeyFor(b)
 	modulus := uint64(n) * gcsM
 	vals := make([]uint64, n)
 	for i, a := range addrs {
@@ -276,7 +276,26 @@ func FoldFilterHeaders(prevHex string, filters []BlockFilter) ([]string, error) 
 	return out, nil
 }
 
-// filterKey derives the 128-bit SipHash key from a block hash (its first 16
+// filterKeyFor picks the SipHash key for a block's filter.
+//
+// Below UpgradeFilterCommit the key is the block's own hash, as BIP158 does it.
+// At and above it the key is derived from PrevHash and MerkleRoot instead —
+// fields that are fixed before the nonce search begins. That is what makes the
+// filter computable BEFORE the header hash exists, and so what allows the
+// filter's commitment to be a field inside that hash. Keying on the block hash
+// and committing the filter in the block hash cannot both be true at once.
+//
+// Both inputs are needed: MerkleRoot alone repeats across two blocks with
+// identical transaction sets, and PrevHash alone repeats across siblings at the
+// same height. Together they are distinct per block in any chain that extends.
+func filterKeyFor(b Block) (uint64, uint64) {
+	if !IsUpgradeActive(UpgradeFilterCommit, b.Index) {
+		return filterKey(b.Hash)
+	}
+	return filterKey(hashBytes([]byte("dnas-cfilter-key:" + b.PrevHash + "|" + b.MerkleRoot)))
+}
+
+// filterKey derives the 128-bit SipHash key from a hex digest (its first 16
 // bytes, little-endian), so both builder and verifier key the filter identically.
 func filterKey(blockHash string) (uint64, uint64) {
 	raw, _ := hex.DecodeString(blockHash)
@@ -459,4 +478,39 @@ func (bc *Blockchain) FilterHeaderBase() uint64 {
 	bc.mu.RLock()
 	defer bc.mu.RUnlock()
 	return bc.filterBase
+}
+
+// BlockFilterRoot is the value a block commits in Header.FilterRoot: this
+// block's filter folded onto its parent's committed filter root, which is the
+// BIP157 filter-header construction moved inside the proof of work.
+//
+// The chain of committed roots starts at the activation height, where the
+// parent carries no root to extend — so prevRoot is empty there and the fold
+// begins from nothing, exactly as FoldFilterHeaders does at genesis.
+func BlockFilterRoot(prevRoot string, b Block) (string, error) {
+	rooted, err := FoldFilterHeaders(prevRoot, []BlockFilter{BuildBlockFilter(b)})
+	if err != nil {
+		return "", err
+	}
+	return rooted[0], nil
+}
+
+// VerifyCommittedFilter checks a filter against the FilterRoot a header commits
+// to, given the parent's committed root.
+//
+// This is the whole point of the commitment: a light client that has verified a
+// header's proof of work can check the filter it was served against that
+// header, and a node that invents a filter — to hide a payment, or to claim one
+// that never happened — produces something that does not fold to the committed
+// value. Below the activation height there is no commitment to check and the
+// client is back to trusting whoever answered.
+func VerifyCommittedFilter(f BlockFilter, prevRoot, committedRoot string) bool {
+	if committedRoot == "" {
+		return false
+	}
+	folded, err := FoldFilterHeaders(prevRoot, []BlockFilter{f})
+	if err != nil {
+		return false
+	}
+	return folded[0] == committedRoot
 }

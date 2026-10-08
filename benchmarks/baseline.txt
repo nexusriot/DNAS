@@ -1,0 +1,26 @@
+# DNAS benchmark baseline — ns/op, recorded by scripts/bench.sh --update
+# host: Linux/x86_64  go: go1.26.8
+# These are a REGRESSION TRIPWIRE, not a spec. Re-record deliberately.
+BenchmarkStateRootRebuild/accounts=100 807758
+BenchmarkStateRootRebuild/accounts=1000 11244330
+BenchmarkStateRootRebuild/accounts=10000 162986970
+BenchmarkStateCommitIncremental/accounts=100 8578
+BenchmarkStateCommitIncremental/accounts=1000 10548
+BenchmarkStateCommitIncremental/accounts=10000 16061
+BenchmarkProveAccount/accounts=100 2870
+BenchmarkProveAccount/accounts=1000 1961
+BenchmarkProveAccount/accounts=10000 5735
+BenchmarkAddBlock/txs=0 12615
+BenchmarkAddBlock/txs=10 242041
+BenchmarkAddBlock/txs=100 2809003
+BenchmarkTransactionVerify 33195
+BenchmarkTransactionHash 434.4
+BenchmarkMerkleRoot 455247
+BenchmarkBuildBlockFilter 199782
+BenchmarkSelect 38584822
+BenchmarkSelectReference 6146794289
+BenchmarkStoreEncodeBlock/binary 144330
+BenchmarkStoreEncodeBlock/json 126529
+BenchmarkStoreDecodeBlock/binary 110138
+BenchmarkStoreDecodeBlock/json 595535
+BenchmarkTrieUpdate 12389

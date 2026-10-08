@@ -36,19 +36,19 @@ wait_converge() {
 run() { ( cd "$1" && shift && exec "$BIN" node "$@" </dev/null ); }
 
 # node1: miner, no peers.  (stdin from /dev/null -> headless, no REPL)
-run "$DATA/n1" -listen :19000 -api :19080 -mine -db chain.db -wallet w.json >"$DATA/n1.log" 2>&1 &
+run "$DATA/n1" -listen :19000 -api :19080 -mine -emptyinterval 2 -db chain.db -wallet w.json >"$DATA/n1.log" 2>&1 &
 N1=$!
 wait_api localhost:19080
 
 # node2: connects to node1.
-run "$DATA/n2" -listen :19001 -api :19081 -peers localhost:19000 -mine -db chain.db -wallet w.json >"$DATA/n2.log" 2>&1 &
+run "$DATA/n2" -listen :19001 -api :19081 -peers localhost:19000 -mine -emptyinterval 2 -db chain.db -wallet w.json >"$DATA/n2.log" 2>&1 &
 N2=$!
 wait_api localhost:19081
 
 # node3: a third miner that knows ONLY node1 -- it must discover node2 by gossip.
 # Three racing miners produce frequent equal-work forks; the deterministic
 # tie-break (smaller tip hash wins) still converges them.
-run "$DATA/n3" -listen :19002 -api :19082 -peers localhost:19000 -mine -db chain.db -wallet w.json >"$DATA/n3.log" 2>&1 &
+run "$DATA/n3" -listen :19002 -api :19082 -peers localhost:19000 -mine -emptyinterval 2 -db chain.db -wallet w.json >"$DATA/n3.log" 2>&1 &
 N3=$!
 wait_api localhost:19082
 
@@ -109,28 +109,14 @@ curl -s -X POST localhost:19080/wallet/hd -d '{"count":3}'
 echo
 
 echo; echo "== (SPV) light client verifies the transfer with a merkle proof =="
-PROOF=$(curl -s "localhost:19082/proof/$TXH")
-IDX=$(echo "$PROOF" | grep -oP '"block_index":\K[0-9]+')
-HDR=$(curl -s "localhost:19082/header/$IDX")
-if command -v python3 >/dev/null 2>&1; then
-  # A light client trusts only block headers. Verify the header's PoW, then
-  # fold the merkle proof and check it reproduces that header's merkle root.
-  python3 -c '
-import sys, json, hashlib
-proof = json.loads(sys.argv[1]); hdr = json.loads(sys.argv[2]); leaf = sys.argv[3]
-def sha(x): return hashlib.sha256(x.encode()).hexdigest()
-hs = "{}|{}|{}|{}|{}|{}|{}|{}".format(hdr["index"], hdr["timestamp"], hdr["prev_hash"], hdr["merkle_root"], hdr["state_root"], hdr["base_fee"], hdr["bits"], hdr["nonce"])
-def compact_to_big(bits):
-    mant, exp = bits & 0x007fffff, bits >> 24
-    return mant >> (8 * (3 - exp)) if exp <= 3 else mant << (8 * (exp - 3))
-pow_ok = sha(hs) == hdr["hash"] and int(hdr["hash"], 16) <= compact_to_big(hdr["bits"])
-h = leaf
-for s in proof["proof"]:
-    h = sha(h + s["hash"]) if s["right"] else sha(s["hash"] + h)
-print("  header %d PoW valid: %s" % (hdr["index"], pow_ok))
-print("  merkle proof folds to header root: %s" % (h == hdr["merkle_root"]))
-print("  => tx PROVEN in block %d (%s confirmations)" % (proof["block_index"], proof["confirmations"]) if pow_ok and h == hdr["merkle_root"] else "  => VERIFICATION FAILED")
-' "$PROOF" "$HDR" "$TXH"
-else
-  echo "  (python3 not found; raw proof: $PROOF)"
-fi
+# The light client is `dnas spv verify`, which is core: it fetches the header
+# chain, checks each header's proof of work against the target it commits to,
+# then folds the merkle proof into the header's root.
+#
+# This script used to do that inline, in Python. The transcription drifted —
+# it hashed a preimage without the header's Version field, so it printed
+# VERIFICATION FAILED for a transfer that was perfectly valid — and it was one
+# of FOUR copies in this repo that had drifted the same way at the same time.
+# A demo that verifies with a second implementation is demonstrating the second
+# implementation, not the chain.
+"$BIN" spv -api localhost:19082 -cache "" verify "$TXH" 2>&1 | sed "s/^/  /"

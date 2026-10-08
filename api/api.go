@@ -3,7 +3,7 @@ package api
 
 import (
 	"crypto/subtle"
-	_ "embed"
+	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +22,22 @@ import (
 
 //go:embed explorer.html
 var explorerHTML []byte
+
+// wasmBundle is the browser verification bundle (see api/wasmdist/README.md):
+// core compiled to WebAssembly, plus Go's runtime shim. It is embedded as a
+// directory rather than two files because `make wasm` produces it and a plain
+// `go build` must still work in a tree where that has not been run — an
+// embedded directory may be missing its contents, an embedded file may not.
+//
+// When the bundle is absent the explorer says its verifier is unavailable.
+// That is deliberate and it is the whole point: the alternative is a
+// JavaScript reimplementation of the consensus rules, and every copy of those
+// rules this project has kept outside core has silently rotted. The explorer's
+// own copy was computing a preimage without the header's Version field, so it
+// had been reporting a wrong hash for every block since BIP9 signaling landed.
+//
+//go:embed all:wasmdist
+var wasmBundle embed.FS
 
 // Server serves the HTTP API for a node. When token is non-empty, the mutating
 // endpoints (/send, /tx, /mine) require an "Authorization: Bearer <token>"
@@ -253,6 +269,11 @@ func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 		Store:          chain.StoreStats(),
 		PruneKeep:      chain.PruneKeep(),
 		PrunedBodies:   chain.PrunedCount(),
+		FilterRoot:     tip.FilterRoot,
+		HistoryRoot:    tip.HistoryRoot,
+		TrieCache:      chain.TrieCacheSize(),
+		Upgrades:       core.ScheduledUpgrades(),
+		Verifier:       WasmBundleAvailable(),
 	})
 }
 
@@ -1470,5 +1491,127 @@ func (s *Server) stateProof(w http.ResponseWriter, r *http.Request) {
 	// actually needs to reject a forged "you were never paid" — so it is served
 	// as a proof (found=false) rather than an error.
 	p, _ := s.node.Chain().ProveAccount(addr)
+	writeJSON(w, http.StatusOK, p)
+}
+
+// ancestry serves a proof that one block is an ancestor of a later one, from
+// the Merkle Mountain Range the later header commits: GET
+// /ancestry?height=N&as_of=M.
+//
+// as_of defaults to the tip, which is what a client that just wants "is this
+// block really in the chain I am following" asks for.
+func (s *Server) ancestry(w http.ResponseWriter, r *http.Request) {
+	chain := s.node.Chain()
+	v := r.URL.Query().Get("height")
+	if v == "" {
+		writeErr(w, http.StatusBadRequest, "height is required")
+		return
+	}
+	height, err := strconv.ParseUint(v, 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "height must be a block height")
+		return
+	}
+	asOf := chain.Height()
+	if v := r.URL.Query().Get("as_of"); v != "" {
+		h, err := strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "as_of must be a block height")
+			return
+		}
+		asOf = h
+	}
+	p, err := chain.ProveAncestry(height, asOf)
+	if err != nil {
+		// Every failure here is the caller asking for something the chain cannot
+		// answer — a height above the tip, a pair the accumulator does not cover
+		// — rather than a fault, so it is a 400 with the reason rather than a 500.
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
+}
+
+// wasmAsset serves the browser verification bundle: GET /wasm/{dnas.wasm,wasm_exec.js}.
+//
+// A 404 here is a normal state, not a fault — it means the tree was built
+// without `make wasm`. The explorer handles it by saying its verifier is
+// unavailable, which is the honest answer and is strictly better than the
+// alternative this bundle exists to remove.
+func (s *Server) wasmAsset(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimPrefix(r.URL.Path, "/wasm/")
+	// Only the two files the bundle is allowed to contain. The embed is a
+	// directory, so without this a path could name the README (harmless) or
+	// anything a future build dropped in there (less so).
+	switch name {
+	case "dnas.wasm":
+		w.Header().Set("Content-Type", "application/wasm")
+	case "wasm_exec.js":
+		w.Header().Set("Content-Type", "text/javascript")
+	default:
+		writeErr(w, http.StatusNotFound, "no such verification asset")
+		return
+	}
+	data, err := wasmBundle.ReadFile("wasmdist/" + name)
+	if err != nil {
+		writeErr(w, http.StatusNotFound,
+			"the browser verifier was not built into this binary; run `make wasm` and rebuild")
+		return
+	}
+	// Immutable for a build: the bundle is rebuilt whenever core changes, and
+	// the binary serving it is rebuilt with it.
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	w.Write(data)
+}
+
+// WasmBundleAvailable reports whether this binary carries the browser verifier,
+// so /info and the explorer can say so rather than failing mysteriously.
+func WasmBundleAvailable() bool {
+	_, err := wasmBundle.ReadFile("wasmdist/dnas.wasm")
+	return err == nil
+}
+
+// names lists every name currently held: GET /names.
+func (s *Server) names(w http.ResponseWriter, r *http.Request) {
+	out := s.node.Chain().Names()
+	if out == nil {
+		out = []core.NameRecord{}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// name resolves one name: GET /name/{name}.
+//
+// An unregistered name is a 200 with held=false, not a 404. "Nobody owns this"
+// is an answer rather than an error — it is what a client checking whether a
+// name is available needs — and the state key it returns lets that answer be
+// PROVEN against the header, which a 404 could never be.
+func (s *Server) name(w http.ResponseWriter, r *http.Request) {
+	n := strings.TrimPrefix(r.URL.Path, "/name/")
+	if err := core.ValidName(n); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	rec, held := s.node.Chain().LookupName(n)
+	writeJSON(w, http.StatusOK, NameResponse{
+		Name: n, Owner: rec.Owner, Held: held, Expires: rec.Expires,
+		StateKey: core.NameStateKey(n),
+	})
+}
+
+// nameProof serves a state proof for a name: GET /nameproof/{name}.
+//
+// It exists because a name's state key carries a NUL byte, which cannot be put
+// in a URL path, so /stateproof cannot be asked about one. The key is derived
+// here from the name — and the client must derive it too and check the proof
+// is about that key, exactly as it would for an address. A proof that is
+// internally valid but about a DIFFERENT name would otherwise verify.
+func (s *Server) nameProof(w http.ResponseWriter, r *http.Request) {
+	n := strings.TrimPrefix(r.URL.Path, "/nameproof/")
+	if err := core.ValidName(n); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	p, _ := s.node.Chain().ProveAccount(core.NameStateKey(n))
 	writeJSON(w, http.StatusOK, p)
 }

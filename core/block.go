@@ -27,6 +27,13 @@ type Block struct {
 	Bits         uint32        `json:"bits"`       // proof-of-work target in compact form (nBits)
 	Nonce        uint64        `json:"nonce"`
 	Hash         string        `json:"hash"`
+	// FilterRoot commits this block's compact filter into the proof of work, so
+	// a light client's non-inclusion answer rests on the chain's work rather
+	// than on the honesty of the node that served it (UpgradeFilterCommit).
+	FilterRoot string `json:"filter_root,omitempty"`
+	// HistoryRoot commits a Merkle Mountain Range over all earlier block hashes,
+	// making ancestry provable in O(log n) instead of O(chain) (UpgradeHistoryRoot).
+	HistoryRoot string `json:"history_root,omitempty"`
 }
 
 func hashBytes(b []byte) string {
@@ -55,21 +62,29 @@ type Header struct {
 	Bits       uint32 `json:"bits"`
 	Nonce      uint64 `json:"nonce"`
 	Hash       string `json:"hash"`
+	// FilterRoot is the block's compact-filter header, committed by the proof of
+	// work from UpgradeFilterCommit onward. Empty below the activation height.
+	FilterRoot string `json:"filter_root,omitempty"`
+	// HistoryRoot is the MMR root over every block hash from the activation
+	// height up to (not including) this block. Empty below it.
+	HistoryRoot string `json:"history_root,omitempty"`
 }
 
 // Header returns this block's header.
 func (b Block) Header() Header {
 	return Header{
-		Version:    b.Version,
-		Index:      b.Index,
-		Timestamp:  b.Timestamp,
-		PrevHash:   b.PrevHash,
-		MerkleRoot: b.MerkleRoot,
-		StateRoot:  b.StateRoot,
-		BaseFee:    b.BaseFee,
-		Bits:       b.Bits,
-		Nonce:      b.Nonce,
-		Hash:       b.Hash,
+		Version:     b.Version,
+		Index:       b.Index,
+		Timestamp:   b.Timestamp,
+		PrevHash:    b.PrevHash,
+		MerkleRoot:  b.MerkleRoot,
+		StateRoot:   b.StateRoot,
+		BaseFee:     b.BaseFee,
+		Bits:        b.Bits,
+		Nonce:       b.Nonce,
+		Hash:        b.Hash,
+		FilterRoot:  b.FilterRoot,
+		HistoryRoot: b.HistoryRoot,
 	}
 }
 
@@ -107,7 +122,20 @@ func appendPreimagePrefix(dst []byte, h Header) []byte {
 	dst = strconv.AppendUint(dst, h.BaseFee, 10)
 	dst = append(dst, '|')
 	dst = strconv.AppendUint(dst, uint64(h.Bits), 10)
-	return append(dst, '|')
+	dst = append(dst, '|')
+	// The commitments below are appended only once their upgrade is active, so
+	// scheduling one changes no existing block's hash — genesis included. A
+	// header's own Index is the height the rule is asked about, which is what
+	// lets the preimage be height-aware without a chain in hand.
+	if IsUpgradeActive(UpgradeFilterCommit, h.Index) {
+		dst = append(dst, h.FilterRoot...)
+		dst = append(dst, '|')
+	}
+	if IsUpgradeActive(UpgradeHistoryRoot, h.Index) {
+		dst = append(dst, h.HistoryRoot...)
+		dst = append(dst, '|')
+	}
+	return dst
 }
 
 // ComputeHash returns the hash the header should have.

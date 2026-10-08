@@ -30,7 +30,10 @@ const (
 	feePayerTag byte = 2 // fee sponsor address, in the signed fields
 	feeAuthTag  byte = 3 // fee sponsor key + signature, in the authorization fields
 	vaultTag    byte = 4 // vault script, in the authorization fields
+	scriptTag   byte = 8 // script predicate + witness, in the authorization fields
 	assetOpTag  byte = 5 // asset management operation, in the signed fields
+	nftTag      byte = 6 // non-fungible issuance metadata, in the signed fields
+	nameTag     byte = 7 // name-service operation, in the signed fields
 )
 
 // cbuf is a tiny append-only canonical-encoding buffer.
@@ -120,6 +123,23 @@ func (t Transaction) signedFields(c *cbuf) {
 		c.str(t.AssetOp.Ticker)
 		c.u64(t.AssetOp.IssueNonce)
 	}
+	// A non-fungible issuance appends its metadata commitment here rather than
+	// extending the AssetIssue block above, so a fungible issuance encodes
+	// byte-for-byte as it always did and keeps its txid.
+	if t.Issue != nil && t.Issue.Metadata != "" {
+		c.byte(nftTag)
+		c.str(t.Issue.Metadata)
+	}
+	// A name operation is appended only when present, for the same reason as
+	// every optional block above: a transaction without one encodes, hashes and
+	// signs exactly as it did before the name service existed.
+	if t.Name != nil {
+		c.byte(nameTag)
+		c.str(t.Name.Op)
+		c.str(t.Name.Name)
+		c.str(t.Name.Target)
+		c.u64(uint64(t.Name.Periods))
+	}
 }
 
 // canonicalSigningBytes is the message a sender signs: the codec version plus the
@@ -173,6 +193,16 @@ func (t Transaction) canonicalBytes() []byte {
 		c.str(t.Vault.Hot)
 		c.str(t.Vault.Cold)
 		c.u64(t.Vault.Unlock)
+	}
+	// The predicate and its witness are part of the TXID but not of the signing
+	// bytes — a signature inside the witness cannot cover the witness holding
+	// it. The block's merkle root covers them once mined, which is the same
+	// place the multisig signatures and the sponsor's authorization are
+	// covered.
+	if t.Script != nil {
+		c.byte(scriptTag)
+		c.str(t.Script.Script)
+		c.strs(t.Script.Args)
 	}
 	return c.b
 }

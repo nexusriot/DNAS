@@ -87,6 +87,10 @@ func main() {
 		runStats(args[1:])
 	case "reorgs":
 		runReorgs(args[1:])
+	case "name":
+		runName(os.Args[2:])
+	case "script":
+		runScript(os.Args[2:])
 	case "doctor":
 		runDoctor(args[1:])
 	case "health":
@@ -139,6 +143,9 @@ Usage:
   dnas backup save|list|restore       encrypt the files a re-sync cannot replace
   dnas tx inspect|verify              decode and check a transaction before submitting
   dnas assets [show ID]               what assets exist, and who holds them
+  dnas script new -type TYPE          build a spending condition and its address
+  dnas name resolve NAME              resolve a name, proving it against the chain
+  dnas name register NAME -key W      claim a name (register|renew|transfer|release|list)
   dnas invoice new|watch|pay          ask to be paid, and verify that you were
   dnas db <info|verify|export|import|compact>  inspect, check, move and shrink a chain store
   dnas peers [list|bans|unban|add|drop]  inspect and manage peers and bans
@@ -167,6 +174,8 @@ Node flags:
   -minrelayfee N  base min relay fee, base units per byte; rises with load (default 10)
   -prune N        keep only the N most recent block bodies in memory (0 = keep all)
   -webhook LIST   comma-separated URLs to POST every block/tx event to
+  -emptyinterval N  seconds the miner idles before minting an EMPTY block
+                  (default 0 = one target block time, currently 60s)
   -apirate N      sustained HTTP API requests per second per client (default 20; 0 = off)
   -apiburst N     HTTP API requests allowed back to back per client (default 60)
   -console        run the interactive console even when stdin is not a terminal
@@ -447,6 +456,7 @@ func runNode(args []string) {
 	console := fs.Bool("console", cfg.boolean("console", false), "run the interactive console even when stdin is not a terminal (for scripts)")
 	prune := fs.Int("prune", cfg.integer("prune", 0), "keep only this many recent block bodies in memory (0 = keep all; minimum "+strconv.Itoa(core.MinPruneKeep)+")")
 	webhooks := fs.String("webhook", cfg.str("webhook", ""), "comma-separated URLs to POST every block/tx event to")
+	emptyInterval := fs.Int("emptyinterval", cfg.integer("emptyinterval", 0), "seconds the miner idles before minting an EMPTY block (0 = one target block time)")
 	apiRate := fs.Int("apirate", cfg.integer("apirate", int(api.DefaultAPIRate)), "sustained HTTP API requests per second per client (0 disables the limit)")
 	apiBurst := fs.Int("apiburst", cfg.integer("apiburst", int(api.DefaultAPIBurst)), "HTTP API requests allowed back to back per client")
 	mine := fs.Bool("mine", cfg.boolean("mine", false), "enable mining")
@@ -653,6 +663,11 @@ func runNode(args []string) {
 		FaucetCooldown: time.Duration(*faucetCooldown) * time.Second,
 		Webhooks:       parsePeers(*webhooks),
 		SignalBits:     bits,
+		// How long the miner waits before minting a block with nothing in it.
+		// The default is one target block time, which is right for a real
+		// network and far too slow for a demo or a test harness that wants a
+		// chain to exist within a few seconds.
+		EmptyBlockInterval: time.Duration(*emptyInterval) * time.Second,
 	}, chain, mp, w)
 	if *faucet {
 		if n.FaucetEnabled() {

@@ -10,7 +10,6 @@ It can also launch a local node so mining works out of the box.
 Only the Python standard library + PyQt6 are required (HTTP via urllib).
 """
 import argparse
-import hashlib
 import json
 import os
 import subprocess
@@ -32,48 +31,28 @@ from PyQt6.QtWidgets import (
 COIN = 100_000_000
 
 
-def header_string(hdr) -> str:
-    """The exact preimage a block header hashes over. It must match
-    core.Header.headerString byte for byte, or every proof-of-work check here is
-    meaningless — this client fell out of step with it once already, when the
-    chain moved from a leading-zero difficulty to a 256-bit nBits target and
-    gained a state root."""
-    return "%d|%d|%s|%s|%s|%d|%d|%d" % (
-        hdr["index"], hdr["timestamp"], hdr["prev_hash"], hdr["merkle_root"],
-        hdr["state_root"], hdr["base_fee"], hdr["bits"], hdr["nonce"])
-
-
 def compact_to_big(bits: int) -> int:
     """Decode a compact nBits target into the 256-bit integer it represents
-    (mantissa x 256^(exponent-3)), mirroring core.CompactToBig."""
+    (mantissa x 256^(exponent-3)), mirroring core.CompactToBig.
+
+    This is the only target arithmetic left in this file, and it is kept
+    because it is COSMETIC: it labels a column in the block table. Nothing is
+    believed on the strength of it. Everything load-bearing — whether a payment
+    is really in the chain — goes through the dnas binary (Api.verify), for the
+    reason spelled out there.
+    """
     mantissa = bits & 0x007FFFFF
     exponent = bits >> 24
-    if exponent <= 3:
-        return mantissa >> (8 * (3 - exponent))
-    return mantissa << (8 * (exponent - 3))
+    return mantissa >> (8 * (3 - exponent)) if exponent <= 3 else mantissa << (8 * (exponent - 3))
 
 
 def difficulty_of(bits: int) -> str:
-    """Human-readable difficulty (PowLimit / target), the display-only ratio
-    core.TargetDifficulty computes. Blocks carry `bits`, not a difficulty."""
+    """Render a compact target as a human difficulty ratio, for the block table."""
     target = compact_to_big(bits)
     if target <= 0:
-        return "—"
-    pow_limit = (1 << 244) - 1
+        return "0"
+    pow_limit = compact_to_big(0x1F0FFFFF)
     return "%.2f" % (pow_limit / target)
-
-
-def meets_target(block_hash: str, bits: int) -> bool:
-    """Proof of work is a target comparison, not a count of leading zeros: the
-    hash read as a big-endian integer must be <= the target."""
-    try:
-        return int(block_hash, 16) <= compact_to_big(bits)
-    except ValueError:
-        return False
-
-
-def sha(s: str) -> str:
-    return hashlib.sha256(s.encode()).hexdigest()
 
 
 def parse_payment_uri(text):
@@ -105,12 +84,15 @@ def parse_payment_uri(text):
 class Api:
     """Thin HTTP client for a node's API (stdlib urllib)."""
 
-    def __init__(self, base: str):
+    def __init__(self, base: str, dnas_bin: str = "dnas"):
         if not base.startswith("http"):
             base = "http://" + base
         self.base = base.rstrip("/")
         # Bearer token for a locked-down node (write endpoints); reads stay open.
         self.token = os.environ.get("DNAS_API_TOKEN", "")
+        # The binary that performs verification (see verify): this client does
+        # not re-implement the consensus rules.
+        self.dnas_bin = dnas_bin
 
     def _get(self, path):
         with urllib.request.urlopen(self.base + path, timeout=2) as r:
@@ -171,19 +153,31 @@ class Api:
         return r.get("mnemonic", ""), r.get("addresses", [])
 
     def verify(self, txh: str) -> str:
-        """Light-client check, done here rather than trusted: recompute the
-        header hash, check it meets the 256-bit target the header commits to,
-        then fold the merkle proof up to the header's root."""
-        pr = self._get("/proof/" + txh)
-        hdr = self._get("/header/%d" % pr["block_index"])
-        pow_ok = sha(header_string(hdr)) == hdr["hash"] and meets_target(hdr["hash"], hdr["bits"])
-        h = txh
-        for step in pr["proof"]:
-            h = sha(h + step["hash"]) if step["right"] else sha(step["hash"] + h)
-        inc = h == hdr["merkle_root"]
-        if pow_ok and inc:
-            return "PROVEN in block %d (%d confirmations)" % (pr["block_index"], pr["confirmations"])
-        return "FAILED (pow=%s inclusion=%s)" % (pow_ok, inc)
+        """Light-client check, DELEGATED to the dnas binary.
+
+        This used to be done here, by recomputing the header hash from a
+        hand-written preimage and comparing it against the target. That
+        preimage was wrong: it read
+        `index|timestamp|prev|merkle|state|base_fee|bits|nonce`, which stopped
+        being the real one when BIP9 signaling put Version at the front. So
+        this method reported FAILED for every valid proof — and it is the
+        SECOND time this file has drifted that way; the docstring it used to
+        carry said as much about the first.
+
+        A wrong signer produces a transaction a node rejects and you find out.
+        A wrong verifier tells you a payment is proven and you do not. So
+        verification goes where the signing already went: to the one
+        implementation, in the binary.
+        """
+        out = subprocess.run(
+            [self.dnas_bin, "spv", "-api", self.base, "-cache", "", "verify", txh],
+            capture_output=True, text=True, timeout=30)
+        # stdout is the result and stderr the log lines; a merged stream has no
+        # reliable last line.
+        line = last_line(out.stdout or "")
+        if out.returncode != 0 or not line:
+            raise RuntimeError(last_line(out.stderr or "") or line or "verification failed")
+        return line
 
     # --- the surfaces the node grew and this client had not caught up with ---
 
@@ -503,7 +497,7 @@ class Main(QWidget):
 
     def _connect(self, addr):
         addr = addr.strip() or "localhost:8080"
-        self.api = Api(addr)
+        self.api = Api(addr, self.dnas_bin)
         self.api_edit.setText(addr)
         self._stop_poller()
         self.poller = Poller(self.api, self.wallet.address if self.wallet.enabled() else "")

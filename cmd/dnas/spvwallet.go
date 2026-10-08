@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -514,7 +516,7 @@ func runSPVWallet(base string, args []string) {
 	case "issue":
 		// Mint a new native asset, signed locally.
 		if *keyFile == "" || len(rest) < 3 {
-			fmt.Println("usage: dnas spv -api URL wallet -key FILE issue <ticker> <supply> [fee]")
+			fmt.Println("usage: dnas spv -api URL wallet -key FILE issue <ticker> <supply> [fee] [-meta HASH | -file PATH]")
 			return
 		}
 		sw.issue(base, *keyFile, rest[1:], func() { saveOr(sw) })
@@ -861,15 +863,32 @@ func (sw *SPVWallet) sendMany(base, keyFile string, args []string, opts sendOpti
 }
 
 // issue mints a new native asset, signed locally with the wallet's key file.
+//
+// With -meta it issues a NON-FUNGIBLE token instead: supply is forced to one
+// and the commitment is bound into the asset id, so neither can be changed
+// afterwards (see core/asset.go).
 func (sw *SPVWallet) issue(base, keyFile string, args []string, save func()) {
 	w, _, err := wallet.LoadOrCreateEncrypted(keyFile, walletPassphrase())
 	if err != nil {
 		fmt.Println("key error:", err)
 		return
 	}
+	meta, args, err := extractMetadata(args)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	if len(args) < 2 {
+		fmt.Println("usage: dnas spv -api URL wallet -key FILE issue <ticker> <supply> [fee] [-meta HASH|-file PATH]")
+		return
+	}
 	supply, err := strconv.ParseUint(args[1], 10, 64)
 	if err != nil {
 		fmt.Println("bad supply:", err)
+		return
+	}
+	if meta != "" && supply != 1 {
+		fmt.Printf("a non-fungible token has a supply of exactly 1 (got %d)\n", supply)
 		return
 	}
 	acc, err := provenAccount(base, w.Address())
@@ -887,7 +906,8 @@ func (sw *SPVWallet) issue(base, keyFile string, args []string, save func()) {
 		fmt.Printf("insufficient coin for fee: have %s, need %s\n", core.FormatAmount(acc.Balance), core.FormatAmount(fee))
 		return
 	}
-	tx := core.Transaction{From: w.Address(), Fee: fee, Nonce: nonce, Issue: &core.AssetIssue{Ticker: args[0], Supply: supply}}
+	issue := &core.AssetIssue{Ticker: args[0], Supply: supply, Metadata: meta}
+	tx := core.Transaction{From: w.Address(), Fee: fee, Nonce: nonce, Issue: issue}
 	if err := tx.Sign(w); err != nil {
 		fmt.Println("sign:", err)
 		return
@@ -899,7 +919,50 @@ func (sw *SPVWallet) issue(base, keyFile string, args []string, save func()) {
 	sw.recordSent(w.Address(), nonce)
 	sw.addAddress(w.Address())
 	save()
-	fmt.Printf("issued %d %s — asset id %s (nonce %d)\n", supply, args[0], core.AssetID(w.Address(), args[0], nonce), nonce)
+	id := core.IssuedAssetID(w.Address(), nonce, issue)
+	if issue.IsNonFungible() {
+		fmt.Printf("issued the unique token %s — asset id %s (nonce %d)\n", args[0], id, nonce)
+		fmt.Printf("  committed to %s\n", meta)
+		fmt.Println("  supply is 1 and permanently fixed: no mint or burn can name this id")
+		return
+	}
+	fmt.Printf("issued %d %s — asset id %s (nonce %d)\n", supply, args[0], id, nonce)
+}
+
+// extractMetadata pulls the non-fungible commitment out of an argument list,
+// from -meta (a digest) or -file (hash this file), and returns the remaining
+// positional arguments.
+//
+// -file is the form worth having: a commitment typed by hand is a commitment
+// nobody checked, and the whole value of the field is that someone can hash
+// the bytes again later and get the same answer.
+func extractMetadata(args []string) (string, []string, error) {
+	var meta string
+	rest := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-meta", "--meta":
+			if i+1 >= len(args) {
+				return "", nil, errors.New("-meta needs a sha256 hex digest")
+			}
+			meta = strings.ToLower(args[i+1])
+			i++
+		case "-file", "--file":
+			if i+1 >= len(args) {
+				return "", nil, errors.New("-file needs a path")
+			}
+			data, err := os.ReadFile(args[i+1])
+			if err != nil {
+				return "", nil, fmt.Errorf("read %s: %w", args[i+1], err)
+			}
+			sum := sha256.Sum256(data)
+			meta = hex.EncodeToString(sum[:])
+			i++
+		default:
+			rest = append(rest, args[i])
+		}
+	}
+	return meta, rest, nil
 }
 
 // assetOp mints or burns units of an asset this wallet issued.

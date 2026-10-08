@@ -83,6 +83,86 @@ const UpgradeUniqueCoinbase = "uniquecoinbase"
 // change to what every holder is trusting, and it gets a flag day like the rest.
 const UpgradeAssetOps = "assetops"
 
+// UpgradeNonFungible, once active, allows an issuance to carry a metadata
+// commitment (AssetIssue.Metadata), which makes the asset non-fungible: its
+// supply is exactly one and no mint or burn may ever change it.
+//
+// Height-activated like the rest because it is a loosening that changes what a
+// block may contain: until it activates, an issuance carrying metadata is
+// rejected, so no node accepts a block the others would refuse. The field is
+// encoded only when present (see codec.go), so scheduling it changes no
+// existing transaction's id and no stored chain's validity.
+//
+// The uniqueness is enforced where it can be: supply one, and permanently
+// fixed. What the token POINTS AT is a hash, and whether those bytes still
+// exist anywhere is not something a chain can promise.
+const UpgradeNonFungible = "nonfungible"
+
+// UpgradeScript, once active, allows script-authorized spends
+// (Transaction.Script): a small, bounded stack language for spending
+// conditions, in place of the hard-coded multisig / HTLC / vault shapes.
+//
+// Height-activated like the rest, and for the strongest version of the usual
+// reason: until it activates, the funds in a script address are spendable by
+// nobody, so turning it on changes what a block may contain in a way every
+// node must agree about at the same height. The field encodes only when
+// present, so no existing transaction's id moves.
+const UpgradeScript = "script"
+
+// UpgradeNameService, once active, allows name-service operations
+// (Transaction.Name): registering, renewing, transferring and releasing
+// human-readable names that resolve to addresses.
+//
+// The records live in the account state, so they are committed by the block's
+// state root and a light client can PROVE both that a name resolves to an
+// address and that a name is unclaimed. That is the point of putting it in
+// consensus: a name service you have to trust a server about is a phishing
+// surface with extra steps.
+//
+// Height-activated like the rest. It is a loosening — a transaction carrying a
+// name operation is rejected until the activation height — so every node
+// starts accepting them at the same block, and an existing chain replays
+// unchanged because the field encodes only when present.
+const UpgradeNameService = "nameservice"
+
+// UpgradeFilterCommit, once active, commits each block's compact-filter header
+// in the block header itself (Header.FilterRoot), and makes the filter's
+// SipHash key derive from the block's PrevHash and MerkleRoot rather than from
+// its own hash.
+//
+// Those two halves are one change because the first is impossible without the
+// second. A BIP158 filter is keyed by the hash of the block it describes; put
+// the filter's commitment inside that same hash and the definition eats itself.
+// Bitcoin resolves the circularity by not committing filters at all, which is
+// why BIP157 non-inclusion rests on asking several peers and hoping. Re-keying
+// on fields that are fixed BEFORE the nonce is searched breaks the cycle, and
+// then the commitment is just another field in the proof-of-work preimage.
+//
+// What it buys: "this address appears in no block between X and Y" becomes a
+// statement backed by the chain's own work, rather than by the honesty of the
+// node that answered. That was the last trust assumption left in the light
+// client (DESIGN §21).
+//
+// The committed chain starts AT the activation height — the parent of the first
+// committed block has no FilterRoot to extend — so a client verifies filters
+// from the activation height forward and falls back to the uncommitted
+// filter-header chain below it.
+const UpgradeFilterCommit = "filtercommit"
+
+// UpgradeHistoryRoot, once active, commits a Merkle Mountain Range over every
+// previous block hash in the header (Header.HistoryRoot).
+//
+// A header chain already proves ancestry, but only by holding all of it: to
+// know that block 10 is an ancestor of block 1,000,000 you need the 999,990
+// headers in between. An MMR is an append-only accumulator whose root commits
+// to the whole history, so the same fact takes a proof logarithmic in the
+// chain's length. See mmr.go.
+//
+// Like the filter commitment, the accumulator starts at the activation height:
+// the range covers block hashes from the activation height forward, so a client
+// anchored on a header at or above it can verify ancestry without the prefix.
+const UpgradeHistoryRoot = "historyroot"
+
 var (
 	upgradesMu sync.RWMutex
 	upgrades   = map[string]uint64{}
@@ -93,7 +173,8 @@ var (
 // rule that silently never activates — which on a network where the others did
 // activate means being forked off it.
 var knownUpgrades = []string{UpgradeDustLimit, UpgradeMultiOutput, UpgradeVault,
-	UpgradeFeeSponsor, UpgradeCheckedAddresses, UpgradeUniqueCoinbase, UpgradeAssetOps}
+	UpgradeFeeSponsor, UpgradeCheckedAddresses, UpgradeUniqueCoinbase, UpgradeAssetOps,
+	UpgradeFilterCommit, UpgradeHistoryRoot, UpgradeNonFungible, UpgradeNameService, UpgradeScript}
 
 // Upgrades lists the upgrade names this build understands.
 func Upgrades() []string { return append([]string(nil), knownUpgrades...) }
@@ -140,4 +221,24 @@ func IsUpgradeActive(name string, blockHeight uint64) bool {
 	defer upgradesMu.RUnlock()
 	h, ok := upgrades[name]
 	return ok && blockHeight >= h
+}
+
+// ScheduledUpgrades returns every upgrade with an activation height, by name.
+//
+// It exists for the clients that must reproduce a header's proof-of-work
+// preimage: the scheduled commitments are part of that preimage from their
+// activation height onward, so a verifier that does not know the schedule
+// computes the wrong hash. A node publishes this (GET /info) and the browser
+// verifier installs it before checking anything.
+//
+// Learning the schedule from a node is not a trust decision. A node that
+// reports the wrong heights only makes its own headers fail to verify.
+func ScheduledUpgrades() map[string]uint64 {
+	upgradesMu.RLock()
+	defer upgradesMu.RUnlock()
+	out := make(map[string]uint64, len(upgrades))
+	for name, height := range upgrades {
+		out[name] = height
+	}
+	return out
 }

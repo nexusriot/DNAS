@@ -32,6 +32,13 @@ type AssetInfo struct {
 	Issued uint64 `json:"issued"`
 	Height uint64 `json:"height"` // the block that issued it
 	TxHash string `json:"tx"`
+	// Metadata is the commitment a non-fungible issuance carries (empty for a
+	// fungible asset). Its presence is also what NonFungible reports, and the
+	// asset's id was derived from it, so the two cannot disagree.
+	Metadata string `json:"metadata,omitempty"`
+	// NonFungible says the supply is one and permanently fixed. It is a
+	// property of how the id was derived, not a flag anyone can set.
+	NonFungible bool `json:"non_fungible,omitempty"`
 }
 
 // indexBlockAssetsLocked records any issuance in b. bc.mu held for writing.
@@ -40,7 +47,7 @@ func (bc *Blockchain) indexBlockAssetsLocked(b Block) {
 		if !tx.IsIssue() {
 			continue
 		}
-		id := AssetID(tx.From, tx.Issue.Ticker, tx.Nonce)
+		id := IssuedAssetID(tx.From, tx.Nonce, tx.Issue)
 		if bc.assets == nil {
 			bc.assets = map[string]AssetInfo{}
 		}
@@ -54,6 +61,7 @@ func (bc *Blockchain) indexBlockAssetsLocked(b Block) {
 			ID: id, Ticker: tx.Issue.Ticker, Issuer: tx.From,
 			Supply: tx.Issue.Supply, Issued: tx.Issue.Supply,
 			Height: b.Index, TxHash: tx.Hash(),
+			Metadata: tx.Issue.Metadata, NonFungible: tx.Issue.IsNonFungible(),
 		}
 	}
 	// Mints and burns move the total the registry reports. Applied after the
@@ -100,7 +108,7 @@ func (bc *Blockchain) unindexBlockAssetsLocked(b Block) {
 		if !tx.IsIssue() {
 			continue
 		}
-		id := AssetID(tx.From, tx.Issue.Ticker, tx.Nonce)
+		id := IssuedAssetID(tx.From, tx.Nonce, tx.Issue)
 		if info, ok := bc.assets[id]; ok && info.Height == b.Index {
 			delete(bc.assets, id)
 		}
@@ -121,14 +129,37 @@ func buildAssetIndex(blocks []Block) map[string]AssetInfo {
 			if !tx.IsIssue() {
 				continue
 			}
-			id := AssetID(tx.From, tx.Issue.Ticker, tx.Nonce)
+			id := IssuedAssetID(tx.From, tx.Nonce, tx.Issue)
 			if _, exists := idx[id]; exists {
 				continue
 			}
 			idx[id] = AssetInfo{
-				ID: id, Ticker: tx.Issue.Ticker, Issuer: tx.From, Supply: tx.Issue.Supply,
+				ID: id, Ticker: tx.Issue.Ticker, Issuer: tx.From,
+				Supply: tx.Issue.Supply, Issued: tx.Issue.Supply,
 				Height: b.Index, TxHash: tx.Hash(),
+				Metadata: tx.Issue.Metadata, NonFungible: tx.Issue.IsNonFungible(),
 			}
+		}
+		// Mints and burns move the total, exactly as the incremental path
+		// applies them. Without this a restored node reported the supply as it
+		// was at issuance and called it current — and reported Issued as zero,
+		// because the field was simply never set here. Both were wrong in
+		// different directions, which is the worst way for a registry to be
+		// wrong: the two numbers disagreed and neither was the truth.
+		for _, tx := range b.Transactions {
+			if !tx.IsAssetOp() {
+				continue
+			}
+			info, ok := idx[tx.AssetID]
+			if !ok {
+				continue
+			}
+			if tx.AssetOp.Op == AssetOpMint {
+				info.Supply += tx.AssetOp.Amount
+			} else if info.Supply >= tx.AssetOp.Amount {
+				info.Supply -= tx.AssetOp.Amount
+			}
+			idx[tx.AssetID] = info
 		}
 	}
 	return idx

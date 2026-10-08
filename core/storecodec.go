@@ -40,6 +40,12 @@ const storeRecordV3 byte = 0x03
 // record would read the operation's bytes as the next field.
 const storeRecordV4 byte = 0x04
 
+// storeRecordV5 is V4 plus the two scheduled header commitments, FilterRoot and
+// HistoryRoot. They are part of the proof-of-work preimage once their upgrades
+// activate, so a record that loses them replays to a different hash — which is
+// why this is a new version rather than an optional tail on V4.
+const storeRecordV5 byte = 0x05
+
 // hexish marks a string that is expected to be lowercase hex. Storing it as raw
 // bytes halves it; anything that does not decode is kept verbatim so a
 // hand-edited or unusual value is never lost.
@@ -222,12 +228,22 @@ func encodeBlockV3(b Block) []byte {
 	return s.b
 }
 
-// encodeBlockV4 writes a block in the current compact store format.
+// encodeBlockV4 writes a block in the pre-commitment format, for the
+// compatibility tests. Nothing writes V4 any more.
 func encodeBlockV4(b Block) []byte {
 	s := &sbuf{}
 	s.byte(storeRecordV4)
 	s.u32(b.Version)
 	encodeBlockBody(s, b, storeRecordV4)
+	return s.b
+}
+
+// encodeBlockV5 writes a block in the current compact store format.
+func encodeBlockV5(b Block) []byte {
+	s := &sbuf{}
+	s.byte(storeRecordV5)
+	s.u32(b.Version)
+	encodeBlockBody(s, b, storeRecordV5)
 	return s.b
 }
 
@@ -243,6 +259,10 @@ func encodeBlockBody(s *sbuf, b Block, version byte) {
 	s.u32(b.Bits)
 	s.u64(b.Nonce)
 	s.str(b.Hash)
+	if version >= storeRecordV5 {
+		s.str(b.FilterRoot)
+		s.str(b.HistoryRoot)
+	}
 	s.u32(uint32(len(b.Transactions)))
 	for _, tx := range b.Transactions {
 		encodeTxV2(s, tx, version)
@@ -333,7 +353,7 @@ func decodeBlockV3(data []byte) (Block, error) {
 	return b, err
 }
 
-// decodeBlockV4 parses the current compact store record.
+// decodeBlockV4 parses a pre-commitment compact store record.
 func decodeBlockV4(data []byte) (Block, error) {
 	r := &srdr{b: data}
 	if tag := r.byte(); tag != storeRecordV4 {
@@ -341,6 +361,18 @@ func decodeBlockV4(data []byte) (Block, error) {
 	}
 	version := r.u32()
 	b, err := decodeBlockBody(r, storeRecordV4)
+	b.Version = version
+	return b, err
+}
+
+// decodeBlockV5 parses the current compact store record.
+func decodeBlockV5(data []byte) (Block, error) {
+	r := &srdr{b: data}
+	if tag := r.byte(); tag != storeRecordV5 {
+		return Block{}, fmt.Errorf("not a v5 store record (tag %#x)", tag)
+	}
+	version := r.u32()
+	b, err := decodeBlockBody(r, storeRecordV5)
 	b.Version = version
 	return b, err
 }
@@ -356,6 +388,10 @@ func decodeBlockBody(r *srdr, version byte) (Block, error) {
 	b.Bits = r.u32()
 	b.Nonce = r.u64()
 	b.Hash = r.str()
+	if version >= storeRecordV5 {
+		b.FilterRoot = r.str()
+		b.HistoryRoot = r.str()
+	}
 
 	n := int(r.u32())
 	if r.err != nil {

@@ -94,9 +94,14 @@ class _Stub(BaseHTTPRequestHandler):
             self._json({"error": "not found"}, 404)
 
 
-# A header whose hash the client must recompute itself, and a one-step merkle
-# proof folding to its root. Built here rather than hardcoded so the fixture
-# cannot drift from the client's own hashing.
+# A header and a one-step merkle proof, for the stub node to serve.
+#
+# The previous version of this fixture computed the header's hash by calling the
+# CLIENT's own header_string — so the fixture and the client agreed with each
+# other and both disagreed with the chain. That is how the GUI's verifier stayed
+# broken through two separate header changes with a passing test. The client no
+# longer hashes anything (see Api.verify), so there is nothing here to agree
+# with: the hash is an opaque value the stub hands over.
 def _make_header_and_proof():
     import hashlib
 
@@ -107,10 +112,8 @@ def _make_header_and_proof():
     sibling = "b" * 64
     root = sha(tx + sibling)  # the sibling is on the right
     hdr = {"index": 3, "timestamp": 1735689600, "prev_hash": "0", "merkle_root": root,
-           "state_root": "s", "base_fee": 10, "bits": STUB_BITS, "nonce": 0}
-    # An easy target (bits with a large exponent) so any hash passes: this test
-    # is about the client's arithmetic, not about mining.
-    hdr["hash"] = sha(dnas_gui.header_string(hdr))
+           "state_root": "s", "base_fee": 10, "bits": STUB_BITS, "nonce": 0,
+           "hash": sha("whatever the chain says")}
     proof = {"block_index": 3, "confirmations": 2, "merkle_root": root,
              "proof": [{"hash": sibling, "right": True}]}
     return hdr, proof, tx
@@ -154,28 +157,25 @@ class ApiTest(unittest.TestCase):
 
 
 class PureHelpersTest(unittest.TestCase):
-    """The client folds proofs and checks proof of work itself, so its copies of
-    the header preimage and the nBits decoding have to match core exactly."""
+    """What remains of this client's own arithmetic is cosmetic: it labels a
+    column. The consensus-critical part moved into the dnas binary when the
+    hand-written copy turned out to be wrong for the second time."""
 
-    def test_header_string_has_every_committed_field(self):
-        hs = dnas_gui.header_string(STUB_HEADER)
-        # Eight fields, pipe-separated, in the order core.Header.headerString
-        # writes them: index, timestamp, prev, merkle, state, base fee, bits, nonce.
-        self.assertEqual(len(hs.split("|")), 8, hs)
-        self.assertIn(STUB_HEADER["state_root"], hs)
-        self.assertIn(str(STUB_HEADER["bits"]), hs)
-
-    def test_compact_to_big_and_meets_target(self):
+    def test_compact_to_big_decodes_nbits(self):
         # 0x03123456 -> mantissa 0x123456 with exponent 3, i.e. the mantissa itself.
         self.assertEqual(dnas_gui.compact_to_big(0x03123456), 0x123456)
-        # A hash below the target passes; one above it does not.
-        self.assertTrue(dnas_gui.meets_target("00" + "f" * 62, 0x20FFFFFF))
-        self.assertFalse(dnas_gui.meets_target("f" * 64, 0x03000001))
-        self.assertFalse(dnas_gui.meets_target("not-hex", 0x20FFFFFF))
+        self.assertGreater(dnas_gui.compact_to_big(0x1F0FFFFF), dnas_gui.compact_to_big(0x1E0FFFFF))
 
     def test_difficulty_of_reads_bits(self):
-        self.assertNotEqual(dnas_gui.difficulty_of(STUB_BITS), "—")
-        self.assertEqual(dnas_gui.difficulty_of(0), "—")
+        self.assertNotEqual(dnas_gui.difficulty_of(STUB_BITS), "0")
+        self.assertEqual(dnas_gui.difficulty_of(0), "0")
+
+    def test_no_consensus_hashing_remains_in_the_client(self):
+        """A guard against this growing back. Any of these reappearing means a
+        second implementation of the consensus rules has been reintroduced."""
+        for gone in ("header_string", "meets_target", "sha"):
+            self.assertFalse(hasattr(dnas_gui, gone),
+                             "%s is back: verification belongs in the dnas binary" % gone)
 
 
 class WidgetTest(unittest.TestCase):
@@ -202,13 +202,47 @@ class WidgetTest(unittest.TestCase):
         w._multisig()
         self.assertIn("dnasms_aa_bb_cc", w.ms_result.text())
 
-    def test_spv_verify_proves_a_payment(self):
-        """This is the regression the GUI most needed: the verifier used the
-        pre-nBits header format and would have thrown on every call."""
-        api = dnas_gui.Api(self.base)
-        self.assertIn("PROVEN", api.verify(STUB_TX))
-        # A transaction that is not the proof's leaf must not verify.
-        self.assertIn("FAILED", api.verify("c" * 64))
+    def test_spv_verify_delegates_to_the_binary(self):
+        """The regression this client most needed. Its verifier used a header
+        preimage without the Version field and reported FAILED for every valid
+        proof; before that it used the pre-nBits format and threw. It now shells
+        out to the one implementation, so this checks the delegation."""
+        import stat
+        import tempfile
+        d = tempfile.mkdtemp()
+        argsfile = os.path.join(d, "args")
+        fake = os.path.join(d, "fake-dnas")
+        with open(fake, "w") as f:
+            f.write("#!/bin/sh\n"
+                    'printf "%s\\n" "$@" > ' + argsfile + "\n"
+                    "echo 'a log line' >&2\n"
+                    "echo 'tx abc is in block 7 with 2 confirmation(s)'\n")
+        os.chmod(fake, os.stat(fake).st_mode | stat.S_IEXEC)
+
+        api = dnas_gui.Api(self.base, fake)
+        out = api.verify(STUB_TX)
+        self.assertIn("is in block 7", out)
+        # stderr must not be read as the outcome.
+        self.assertNotIn("a log line", out)
+
+        with open(argsfile) as f:
+            called = f.read().split()
+        self.assertEqual(called[0], "spv")
+        self.assertIn("verify", called)
+        self.assertIn(STUB_TX, called)
+
+    def test_spv_verify_surfaces_a_failure(self):
+        import stat
+        import tempfile
+        d = tempfile.mkdtemp()
+        fake = os.path.join(d, "fake-dnas")
+        with open(fake, "w") as f:
+            f.write("#!/bin/sh\necho 'error: no such transaction' >&2\nexit 1\n")
+        os.chmod(fake, os.stat(fake).st_mode | stat.S_IEXEC)
+        api = dnas_gui.Api(self.base, fake)
+        with self.assertRaises(RuntimeError) as cm:
+            api.verify("c" * 64)
+        self.assertIn("no such transaction", str(cm.exception))
 
     def test_overview_shows_network_health_and_peers(self):
         w = self._win()

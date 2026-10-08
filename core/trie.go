@@ -64,6 +64,13 @@ type trieKey [sha256.Size]byte
 // addresses exist, so nobody can degrade lookups by choosing addresses that
 // share a long prefix.
 func trieKeyFor(addr string) trieKey {
+	// A name record is hashed under a DIFFERENT domain tag, so no address —
+	// however it is crafted — can ever land on a name's slot. The reserved
+	// prefix on the key is a string check; this is the cryptographic one, and
+	// it is the part that actually holds (see name.go).
+	if isNameKey(addr) {
+		return trieKey(sha256.Sum256([]byte("dnas-trie-name:" + nameFromKey(addr))))
+	}
 	return trieKey(sha256.Sum256([]byte("dnas-trie-key:" + addr)))
 }
 

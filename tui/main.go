@@ -529,6 +529,7 @@ func main() {
 	}
 
 	cl := NewClient(*api)
+	cl.UseBinary(*dnasBin) // verification is delegated to it, like signing
 	m := model{c: cl}
 	if *keyFile != "" {
 		m.wallet = localWallet{keyFile: *keyFile, binPath: *dnasBin, state: *stateFile}

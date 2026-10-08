@@ -213,6 +213,43 @@ Module `github.com/nexusriot/DNAS/core` — the ledger and consensus rules.
   isolating it from the chain.
 - `storecodec.go` — the block store's compact binary record format (local, not
   consensus), with hex fields kept as raw bytes. Reads legacy JSON records too.
+  Records are VERSIONED rather than extended in place, because the transaction
+  encoding is shared by every version and a reader handed a newer record would
+  read the extra bytes as the next field: **V2** (pre-`Version`), **V3** (+ the
+  header's `Version`, from BIP9 signaling), **V4** (+ a transaction's asset
+  mint/burn), **V5** (+ the scheduled header commitments `FilterRoot` and
+  `HistoryRoot`). Writing emits the newest; reading accepts them all, so a
+  store written by an older build still loads and replays to the same hashes.
+- `script.go` / `scriptbuild.go` — the **authorization script VM**: a bounded
+  stack language that decides whether a transaction may spend from an account.
+  No loops, no backward jumps, hard caps on script length, stack depth,
+  operations and signature checks, and no view of the chain beyond the height.
+  `OP_CHECKHEIGHTVERIFY` aborts rather than pushing, so a branch can never
+  depend on WHEN the script ran; the witness is data that is never executed.
+  `scriptbuild.go` writes the four hard-coded shapes in the language, which is
+  the specification by example, plus `DisassembleScript` so a wallet can show
+  what it is about to fund.
+- `name.go` — the **name service**: records in the account map under a reserved
+  NUL-prefixed key that the trie hashes under its own domain tag, so no address
+  can occupy a name's slot. Names are committed in the state root, so a
+  resolution is provable and an unclaimed name is provably absent.
+  Registration is a lease; an expired name is claimable.
+- `mmr.go` — a **Merkle Mountain Range** over block hashes, committed in the
+  header from `UpgradeHistoryRoot`. Makes ancestry provable in O(log n) instead
+  of requiring every header in between. `BuildAncestryProof` /
+  `VerifyAncestryProof`.
+- `package.go` — **package relay and CPFP**: pending credits so a recipient can
+  spend unconfirmed coin, ancestor/descendant/byte limits so the dependency
+  cannot fill the pool with unminable work, and package fee rates so a child
+  can unstick its parent. The ancestor and descendant counts are over OTHER
+  senders only — a sender's own nonce run is bounded by `MaxPerSender`.
+- `statetrie.go` — the **incremental state commitment**: a retained,
+  LRU-bounded `NodeStore` and a committer that updates only the accounts a
+  block touched. The store is a cache, never a source of truth: a miss falls
+  back to the whole-set rebuild, which is also what repopulates it.
+- `wirecodec.go` — exported binary encodings for the block, header and
+  transaction, so the peer wire reuses the store's format rather than inventing
+  a second one.
 - `trie.go` — a content-addressed, path-compressed **sparse Merkle trie** keyed
   by the hash of an address: `Trie`, a pluggable `NodeStore`, and `Prove` /
   `VerifyTrieProof` giving both **membership and absence** proofs. Absence is the

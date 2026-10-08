@@ -2,7 +2,6 @@ package node
 
 import (
 	"bytes"
-	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -16,7 +15,7 @@ import (
 // asserted directly rather than inferred from two nodes converging.
 func fakePeer(caps ...string) (*peer, *bytes.Buffer) {
 	buf := &bytes.Buffer{}
-	p := &peer{enc: json.NewEncoder(buf), caps: map[string]bool{}, addr: "fake"}
+	p := &peer{enc: newMsgWriter(buf), caps: map[string]bool{}, addr: "fake"}
 	for _, c := range caps {
 		p.caps[c] = true
 	}
@@ -27,7 +26,7 @@ func fakePeer(caps ...string) (*peer, *bytes.Buffer) {
 func sent(t *testing.T, buf *bytes.Buffer) []Message {
 	t.Helper()
 	var out []Message
-	dec := json.NewDecoder(bytes.NewReader(buf.Bytes()))
+	dec := newMsgReader(bytes.NewReader(buf.Bytes()))
 	for {
 		var m Message
 		if err := dec.Decode(&m); err != nil {

@@ -41,6 +41,9 @@ documents and some code comments cite them.)
 [8d19. One command that checks everything](#8d19-one-command-that-checks-everything-dnas-doctor) ·
 [8d20. Dashboards and alerts](#8d20-dashboards-and-alerts) ·
 [8d21. Running a mining pool](#8d21-running-a-mining-pool-stratum) ·
+[8d22. Spending conditions as scripts](#8d22-spending-conditions-as-scripts) ·
+[8d23. Names](#8d23-names) ·
+[8d24. A unique token](#8d24-a-unique-token) ·
 [8f. Lock down the API](#8f-lock-down-the-api)
 
 **Money: assets, fees, contracts**
@@ -411,6 +414,12 @@ and identically, on every node:
 
 ```sh
 dnas node -upgrades multioutput:1000,vault:1000,feesponsor:1000,checkedaddresses:1000
+
+# the newer ones. filtercommit and historyroot are HEADER changes: they add a
+# field to the proof-of-work preimage from their activation height, so every
+# node must schedule them identically or they will disagree about block hashes.
+dnas node -upgrades filtercommit:2000,historyroot:2000
+dnas node -upgrades nonfungible:1000,nameservice:1000,script:1000
 ```
 
 `checkedaddresses` is the one worth scheduling on any chain you care about: until
@@ -1059,6 +1068,97 @@ The pool's coinbase pays the NODE's wallet; the addresses above are what it owes
 Paying them out is left to the operator — this tells you what is owed, not how to
 send it.
 
+## 8d22. Spending conditions as scripts
+
+The four built-in shapes — single key, multisig, HTLC, time-delayed vault —
+are now also expressible in a small stack language, and a script address is
+funded and spent like any other address. Schedule it first
+(`-upgrades script:HEIGHT`); until then a script spend is refused, which means
+coin in a script address is spendable by nobody.
+
+```sh
+# build a predicate and see what it says BEFORE funding it
+dnas script new -type timelock -api localhost:8080 \
+    -pubkey "$(dnas wallet pubkey -o alice.json)" -height 1000 -o tl.json
+dnas script inspect -in tl.json
+#   address dnas0c08ce…
+#       PUSH 03e8
+#       CHECKHEIGHTVERIFY
+#       PUSH df1ba923…
+#       CHECKSIG
+
+# fund it like any address
+dnas spv -api localhost:8080 wallet -key funder.json send dnas0c08ce… 10
+
+# spend it. Below the height the node accepts the transaction and holds it in
+# the mempool until the chain reaches it — the command says so rather than
+# letting you wonder.
+dnas script spend -in tl.json -api localhost:8080 -to <addr> -amount 3 -key alice.json
+```
+
+The witness is assembled bottom-of-stack first: signatures (`-key`, repeatable
+as a comma-separated list), then any `-preimage`, then `-branch` on top. Each
+constructor documents the order its predicate consumes; getting it backwards
+makes a perfectly good signature fail as a hash mismatch, which is why
+`script spend` runs the predicate locally and tells you which check failed
+before it broadcasts anything.
+
+Two things worth knowing before you use one for anything. A script address is
+spendable by **whoever can satisfy the predicate** — for a `hashlock` that
+includes whoever sees your witness in the mempool first. And the script file
+records its **network**, because the network id is in the signing preimage: a
+witness signed against the wrong chain fails at submit, with the coin already
+in the address.
+
+## 8d23. Names
+
+A name resolves to an address, and the resolution is *provable* — the record
+lives in the state trie, so a light client checks it against a header whose
+proof of work it verified itself. Schedule with `-upgrades nameservice:HEIGHT`.
+
+```sh
+dnas name register alice-shop -key alice.json -api localhost:8080
+dnas name resolve alice-shop
+#   alice-shop resolves to dnas1f85df… (PROVEN against a proof-of-work-verified header)
+#     lease until block 100011
+
+dnas name list
+dnas name transfer alice-shop -to <addr> -key alice.json
+dnas name renew alice-shop -periods 3 -key alice.json
+```
+
+Registration is a **lease**. An expired name is claimable by anyone, which is
+deliberate — a namespace nobody can reclaim is squatted once and then dead —
+and it means `resolve` distinguishes three answers, not two: UNREGISTERED,
+LAPSED (with the address it used to point at, and a warning not to pay it),
+and held. `-trust` skips the proof and takes the node's word; the default does
+not, because a name service you have to trust a server about is a phishing
+surface with extra steps.
+
+## 8d24. A unique token
+
+An issuance that carries a sha256 commitment is non-fungible: its supply is
+exactly one and no mint or burn can ever change it. Schedule with
+`-upgrades nonfungible:HEIGHT`.
+
+```sh
+dnas spv -api localhost:8080 wallet -key alice.json issue DUCK 1 -file duck.png
+#   issued the unique token DUCK — asset id nft03409fc4…
+#     committed to 5e0347d2…
+#     supply is 1 and permanently fixed: no mint or burn can name this id
+```
+
+`-file` hashes the file for you, which is the form worth using: a commitment
+typed by hand is one nobody checked, and the whole value of the field is that
+someone can hash the bytes again later and get the same answer. What the chain
+can say is that the token is unique, that its supply is permanently one, and
+that it commits to this digest. What it cannot say is whether those bytes still
+exist anywhere.
+
+The immutability needs no registry lookup: a non-fungible id is derived under
+its own domain tag, so a mint or burn naming it cannot reproduce the id and
+fails authority by construction.
+
 ## 8e. Hash-time-locked contracts (atomic swaps)
 
 An HTLC address is spendable two ways: by the recipient revealing a preimage
@@ -1233,6 +1333,10 @@ produce signatures a node rejects.
   its public half, and an address is a hash of a public key (§8d10).
 - `dnas-backup.json` — whatever `dnas backup save` wrote: an encrypted bundle of
   the two above plus the light wallet's state (§8d17).
+- the invoice seed (`dnas invoice new -seed S.json`) — one BIP39 phrase from
+  which every address handed out to a payer is derived. It is written 0600 and
+  the command prints it once, at creation. Lose it and the coin paid to those
+  addresses is gone; the invoices themselves are re-derivable from it.
 
 **Chain and derived state — all of it re-obtainable.**
 

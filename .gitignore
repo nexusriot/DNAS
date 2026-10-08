@@ -100,3 +100,7 @@ Thumbs.db
 .claude/settings.local.json
 .claude/*.local.json
 
+
+# Browser verification bundle, produced by `make wasm` (see api/wasmdist/README.md).
+api/wasmdist/dnas.wasm
+api/wasmdist/wasm_exec.js

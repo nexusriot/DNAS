@@ -393,3 +393,46 @@ func TestStoreReadsPreVersionRecords(t *testing.T) {
 		t.Fatalf("v3 record round-tripped to a different block")
 	}
 }
+
+// A V5 record must round-trip the header commitments, and the older versions
+// must still read — a store written by an earlier build has to keep loading.
+func TestStoreRecordV5RoundTripsCommitments(t *testing.T) {
+	b := Block{
+		Version: 3, Index: 9, Timestamp: 1700000000,
+		PrevHash: "aa11", MerkleRoot: "bb22", StateRoot: "cc33",
+		BaseFee: 10, Bits: 0x1f0fffff, Nonce: 42, Hash: "dd44",
+		FilterRoot: "ee55", HistoryRoot: "ff66",
+		Transactions: []Transaction{NewCoinbase("dnasminer", 50*Coin)},
+	}
+	got, err := decodeStoredBlock(encodeBlockV5(b))
+	if err != nil {
+		t.Fatalf("decode v5: %v", err)
+	}
+	if got.FilterRoot != b.FilterRoot || got.HistoryRoot != b.HistoryRoot {
+		t.Fatalf("commitments lost: filter %q history %q", got.FilterRoot, got.HistoryRoot)
+	}
+	if got.Hash != b.Hash || got.Version != b.Version {
+		t.Fatalf("v5 round trip altered the block: %+v", got)
+	}
+}
+
+// A V4 record predates the commitments, so it decodes with them empty — which
+// is what those blocks were mined with, so they replay to the same hashes.
+func TestStoreRecordV4StillDecodesAfterV5(t *testing.T) {
+	b := Block{
+		Version: 1, Index: 4, Timestamp: 1700000000,
+		PrevHash: "aa", MerkleRoot: "bb", StateRoot: "cc",
+		BaseFee: 1, Bits: 0x1f0fffff, Nonce: 7, Hash: "dd",
+		Transactions: []Transaction{NewCoinbase("dnasminer", 50*Coin)},
+	}
+	got, err := decodeStoredBlock(encodeBlockV4(b))
+	if err != nil {
+		t.Fatalf("decode v4: %v", err)
+	}
+	if got.FilterRoot != "" || got.HistoryRoot != "" {
+		t.Fatal("a v4 record produced non-empty commitments")
+	}
+	if got.Hash != b.Hash {
+		t.Fatal("v4 round trip altered the block")
+	}
+}

@@ -154,6 +154,16 @@ func VerifyOps(tx Transaction) int {
 		// rule must be answerable without the authorization cache, see
 		// Transaction.VaultHotNotReady).
 		ops = 2
+	case tx.IsScript():
+		// A script is priced at its WORST CASE, not at what it happens to cost
+		// on the path the witness takes. A validator has to be able to price a
+		// block before running it, and a cheap-looking script whose other
+		// branch is expensive would otherwise let a block past the budget it
+		// was admitted under. The script runs twice as well — once for
+		// authorization and once to establish its height constraint, which must
+		// be answerable without the authorization cache (ScriptMinHeight), the
+		// same reason a vault costs two.
+		ops = 2 * MaxScriptSigChecks
 	}
 	// A sponsored transaction carries a second signature over the same bytes, so
 	// it costs the block one more verification than its authorization alone.

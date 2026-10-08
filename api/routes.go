@@ -287,6 +287,41 @@ func (s *Server) routes() []route {
 			at("/stateproof/{address}", pathParam("address", "string", "the address to prove")).
 			out(core.AccountProof{}).
 			does(s.stateProof),
+		get("/wasm/", "The browser verification bundle (core compiled to WebAssembly)").
+			describe("Serves dnas.wasm and wasm_exec.js, so the explorer verifies proofs with "+
+				"the SAME code the node runs instead of a JavaScript reimplementation. "+
+				"404 when the binary was built without `make wasm`.").
+			at("/wasm/{file}", pathParam("file", "string", "dnas.wasm or wasm_exec.js")).
+			raw("application/wasm").
+			does(s.wasmAsset),
+		get("/names", "Every name the chain currently holds").
+			out([]core.NameRecord{}).
+			does(s.names),
+		get("/name/", "Resolve a name to the address it points at").
+			describe("The record is committed in the state root, so a client that wants more "+
+				"than this node's word can prove it: GET /stateproof/{key} with the key this "+
+				"returns answers against a header the proof of work covers, and proves a name "+
+				"is UNCLAIMED just as readily as it proves who holds one.").
+			at("/name/{name}", pathParam("name", "string", "the name to resolve")).
+			out(NameResponse{}).
+			does(s.name),
+		get("/nameproof/", "State proof for a name, against the header's state root").
+			describe("A name's state key contains a NUL byte and so cannot travel in a URL "+
+				"path; this takes the NAME and derives the key server-side. A client must "+
+				"still check the returned proof is ABOUT the key it derived itself — "+
+				"otherwise a node could answer about a different name and have it verify.").
+			at("/nameproof/{name}", pathParam("name", "string", "the name to prove")).
+			out(core.AccountProof{}).
+			does(s.nameProof),
+		get("/ancestry", "Proof that a block is an ancestor of a later one").
+			describe("Logarithmic in the chain's length: the later header commits a Merkle "+
+				"Mountain Range over every block below it, so the proof is a path through "+
+				"that accumulator rather than the headers in between. Needs the "+
+				"historyroot upgrade to be active at both heights.").
+			query(queryParam("height", "integer", "the block to prove"),
+				queryParam("as_of", "integer", "the later height whose header commits it (default: the tip)")).
+			out(core.AncestryProof{}).
+			does(s.ancestry),
 		get("/cfilters", "Compact block filters, paged").
 			query(queryParam("from", "integer", "first height"),
 				queryParam("last", "integer", "return the newest N instead"),

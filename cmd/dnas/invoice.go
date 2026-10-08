@@ -52,6 +52,17 @@ type invoiceFile struct {
 	FromHeight    uint64 `json:"from_height"` // payments below this height are not this invoice's
 	ExpiresHeight uint64 `json:"expires_height,omitempty"`
 	Created       string `json:"created"`
+	// Derived records where this invoice's address came from when it was taken
+	// from a seed (-seed). Without it the address is a dead end: the merchant
+	// can see it was paid and cannot work out which key spends it.
+	Derived *invoiceDerivation `json:"derived,omitempty"`
+}
+
+// invoiceDerivation is the SLIP-0010 position of a freshly derived address.
+type invoiceDerivation struct {
+	SeedFile string `json:"seed_file"`
+	Account  uint32 `json:"account"`
+	Index    uint32 `json:"index"`
 }
 
 const invoiceFileVersion = 1
@@ -65,8 +76,11 @@ const invoiceConfirmations = 3
 func runInvoice(args []string) {
 	if len(args) == 0 {
 		fmt.Println(`usage: dnas invoice <new | show | watch | pay> [flags]
-  new   -amount A [-memo TEXT] [-key W.json | -address ADDR] [-expire-in N] [-o FILE]
-        write an invoice and print the dnas: URI to hand to the payer
+  new   -amount A [-memo TEXT] [-seed S.json | -key W.json | -address ADDR]
+        [-expire-in N] [-o FILE]
+        write an invoice and print the dnas: URI to hand to the payer.
+        -seed derives a FRESH address for each invoice from one backup phrase,
+        so two invoices for the same amount are never the same address
   show  -in FILE                       what it asks for, and its URI
   watch -in FILE [-confirmations N] [-wait]
         verify against a PoW chain whether it has been paid; exit 0 when it has
@@ -120,6 +134,7 @@ func invoiceNew(args []string) {
 	memo := fs.String("memo", "", "what the payment is for")
 	address := fs.String("address", "", "address to be paid at")
 	keyFile := fs.String("key", "", "take the address from this key file instead")
+	seedFile := fs.String("seed", "", "derive a FRESH address from this seed file (created if absent); the fix for two invoices being indistinguishable")
 	expireIn := fs.Uint64("expire-in", 0, "stop accepting payment this many blocks from now")
 	out := fs.String("o", "invoice.json", "file to write")
 	_ = fs.Parse(args)
@@ -135,9 +150,22 @@ func invoiceNew(args []string) {
 	adoptNetwork(base)
 
 	addr := *address
+	var derived *invoiceDerivation
+	var seedCreated bool
 	switch {
+	case *seedFile != "" && (addr != "" || *keyFile != ""):
+		log.Fatal("give -seed, -address or -key, not more than one")
 	case addr != "" && *keyFile != "":
 		log.Fatal("give -address or -key, not both")
+	case *seedFile != "":
+		// A fresh address per invoice, so two invoices for the same amount are
+		// never the same address and cannot be confused for one another.
+		a, index, created, err := nextInvoiceAddress(*seedFile, core.NetworkName())
+		if err != nil {
+			log.Fatalf("seed: %v", err)
+		}
+		addr, seedCreated = a, created
+		derived = &invoiceDerivation{SeedFile: *seedFile, Index: index}
 	case *keyFile != "":
 		w, _, err := wallet.LoadOrCreateEncrypted(*keyFile, walletPassphrase())
 		if err != nil {
@@ -161,6 +189,7 @@ func invoiceNew(args []string) {
 		Version: invoiceFileVersion, Network: core.NetworkName(), Address: addr,
 		Amount: amount, Memo: *memo, Reference: newReference(),
 		FromHeight: height + 1, Created: time.Now().UTC().Format(time.RFC3339),
+		Derived: derived,
 	}
 	if *expireIn > 0 {
 		inv.ExpiresHeight = height + *expireIn
@@ -179,8 +208,19 @@ func invoiceNew(args []string) {
 	}
 	fmt.Printf("\n  uri      %s\n", invoiceURI(inv))
 	fmt.Printf("wrote %s. Watch for payment with:\n    dnas invoice watch -in %s -wait\n", *out, *out)
+	if derived != nil {
+		fmt.Printf("address %d derived from %s — every invoice gets its own, so two for the\n", derived.Index, derived.SeedFile)
+		fmt.Println("same amount can never be confused for one another.")
+		if seedCreated {
+			fmt.Println()
+			fmt.Printf("WROTE A NEW SEED to %s (mode 0600). It is the ONLY way to spend what\n", derived.SeedFile)
+			fmt.Println("these addresses are paid. Back it up now; it is not printed again.")
+		}
+		return
+	}
 	fmt.Println("note: an address can be paid more than once, so two invoices for the same")
-	fmt.Println("      amount at the same address cannot be told apart. Use a fresh key per invoice.")
+	fmt.Println("      amount at the same address cannot be told apart. Use -seed for a fresh")
+	fmt.Println("      address per invoice, or a fresh key file per invoice.")
 }
 
 func writeInvoice(path string, inv invoiceFile) error {

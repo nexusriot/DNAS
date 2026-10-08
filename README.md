@@ -51,6 +51,32 @@ each defence assumes, and what is explicitly out of scope, see
   peer the address holding your coin, and undercuts the Dandelion++ origin privacy
   the node already has. The identity is its own file (`nodekey.json`, `-nodekey`),
   created on first run; it holds no coin and needs no backup.
+- **Spending conditions are a language, not a list.** A bounded stack VM
+  ([core/script.go](core/script.go)) decides whether a transaction may spend
+  from an account: no loops, no backward jumps, hard caps on length, stack,
+  operations and signature checks, and no view of the chain beyond the height.
+  The four hard-coded shapes — single key, multisig, HTLC, time-delayed vault —
+  are provided as constructors written in the language, which doubles as the
+  specification. `dnas script new|inspect|spend`. It answers one question and
+  can return only yes or no; it is not a contract system.
+- **Names that resolve with a proof.** Names live in the state trie, so a light
+  client can verify both that a name belongs to an address and that a name is
+  unclaimed, against a header the proof of work covers — a name service you
+  have to trust a server about is a phishing surface with extra steps.
+  Registration is a lease, because a namespace nobody can reclaim is squatted
+  once and then dead. `dnas name resolve|register|renew|transfer|release`.
+- **Non-inclusion and ancestry are backed by work.** The header commits the
+  block's compact-filter header, so "this address appears in no block between
+  X and Y" rests on the chain rather than on the honesty of whoever answered;
+  and it commits a Merkle Mountain Range over every earlier block hash, so
+  proving block 10 is an ancestor of block 1,000,000 costs a logarithmic path
+  instead of the headers in between.
+- **One verifier, compiled once.** Every client that checks a proof runs the
+  SAME code the node runs: the explorer loads `core` compiled to WebAssembly,
+  and the TUI, the PyQt GUI and the demo script delegate to the `dnas` binary.
+  There is deliberately no JavaScript or Python reimplementation to fall out of
+  step — there were four, and all four had silently drifted into hashing
+  something that was never a header.
 - **Separate networks.** A node runs on `mainnet`, `testnet` or `regtest`
   (`-network`), and the network's id is bound into the **genesis block**, the
   **transaction signing preimage** and the **peer handshake**. So the three have
@@ -386,32 +412,45 @@ wallet/             module .../wallet — Ed25519 keys, addresses, signing
 core/               module .../core   — transactions, blocks, chain state, work, mempool   (→ wallet)
 node/               module .../node   — encrypted P2P, discovery, gossip, sync, miner       (→ core, wallet)
 api/                module .../api    — HTTP API                                            (→ core, node)
-cmd/                module .../cmd    — CLI/daemon; main package in cmd/dnas                 (→ all)
+cmd/                module .../cmd    — CLI/daemon in cmd/dnas; cmd/wasmverify builds
+                                        core's verifiers for the browser          (→ all)
 e2e/                module .../e2e    — black-box suite driving the built binary (build tag `e2e`)
 tui/                terminal client — its OWN module, outside go.work (external deps)
 gui/                desktop client — Python / PyQt6
+benchmarks/         the recorded performance baseline (scripts/bench.sh compares against it)
+api/wasmdist/       the browser verification bundle — BUILD ARTIFACTS, gitignored (`make wasm`)
 scripts/            demos: demo.sh (three-node network), htlc-demo.sh, swap-demo.sh
                     packaging: build.sh (cross-compiled tarballs), build-deb.sh
+                    checks: bench.sh (performance), verify-reproducible.sh
                     version.sh (the version a build stamps)
 ```
 
 Dependency direction: `wallet → core → node → api → cmd` (no cycles). Each
 directory above has its own `README.md`. The two clients (`tui/`, `gui/`) import
-no DNAS package — they speak only the HTTP API, and when asked to sign locally
-they run the `dnas` binary rather than re-implementing the transaction encoding.
+no DNAS package — they speak only the HTTP API, and for anything
+consensus-critical, signing *and* verification alike, they run the `dnas`
+binary rather than re-implementing it. The explorer does the same through
+WebAssembly. That rule is not stylistic: all four of the hand-written verifiers
+this project used to carry had silently drifted out of step with the header
+format, and every one of them reported failure for valid proofs.
 
 ## Build & test
 
 The quickest path is the **Makefile**:
 
 ```sh
-make build          # compile dnas + dnas-tui into bin/ (version stamped from git)
+make build          # compile the wasm bundle + dnas + dnas-tui into bin/
+make wasm           # just the browser verification bundle (api/wasmdist/)
 make test           # go tests (all modules + tui) + the GUI tests
 make test-race      # the same under the race detector
+make bench          # performance benchmarks for the consensus hot paths
+make bench-check    # fail if one regressed past the recorded baseline
+make bench-update   # re-record the baseline (do this deliberately)
 make e2e            # black-box end-to-end suite: drives the real binary (see e2e/)
 make e2e-docker     # the same suite, hermetically, in a container (needs only Docker)
 make dist           # cross-compiled release tarballs (linux/amd64 + arm64) → dist/
 make deb            # .deb packages (amd64 + arm64) → dist/
+make verify-reproducible   # build the release twice and check the artifacts match
 make install        # install dnas + dnas-tui to /usr/local/bin (PREFIX overridable)
 make help           # list all targets
 ```
@@ -451,7 +490,7 @@ VERSION=1.2.3 ./scripts/build.sh
 **Versioning.** The release number is in the [VERSION](VERSION) file and
 `scripts/version.sh` turns it into what a build stamps — the bare number on a
 clean tree at the release commit, otherwise with the commit and dirty state
-appended (`0.3.0+g1a2b3c4.dirty`). Keeping it in the tree rather than in a git
+appended (`0.4.0+g1a2b3c4.dirty`). Keeping it in the tree rather than in a git
 tag means the version survives where git does not: the e2e container excludes
 `.git`, and so does a source tarball. `make version` prints it, `dnas version`
 reports what a binary was stamped with, and [CHANGELOG.md](CHANGELOG.md) says
@@ -523,7 +562,8 @@ free.
 | `-printconfig` | —            | print the effective configuration (flags over `-config`) and exit |
 | `-dandelion` | on             | relay new transactions via Dandelion++ stem/fluff (origin privacy) |
 | `-checkpoints` | —            | finality checkpoints, comma-separated `height:hash` pairs |
-| `-upgrades`  | —              | consensus upgrade activations, comma-separated `name:height` pairs (known: `dustlimit`, `multioutput`, `vault`, `feesponsor`, `checkedaddresses`) |
+| `-emptyinterval` | `0`          | seconds the miner idles before minting an EMPTY block (0 = one target block time, currently 60s) |
+| `-upgrades`  | —              | consensus upgrade activations, comma-separated `name:height` pairs (known: `dustlimit`, `multioutput`, `vault`, `feesponsor`, `checkedaddresses`, `uniquecoinbase`, `assetops`, `filtercommit`, `historyroot`, `nonfungible`, `nameservice`, `script`) |
 | `-config`    | —              | JSON config file (flags override its values)   |
 
 A node shuts down cleanly on `SIGINT`/`SIGTERM` (stops mining, closes peers,
@@ -591,11 +631,16 @@ go run ./cmd/dnas node -listen :3001 -api :8081 -peers localhost:3000 -mine \
 | GET    | `/proof/{txhash}` | transaction-inclusion merkle proof (SPV)                      |
 | GET    | `/stateproof/{addr}` | proof of an address's balance/nonce vs the header state root — or, for an address with no account, a proof that it holds **nothing** (`found:false`, still verifiable) |
 | GET    | `/snapshot/{height}` | full account state at a height (fast-sync; `/snapshot/latest`) |
+| GET    | `/ancestry`       | `?height=N&as_of=M` → proof that block N is an ancestor of M, logarithmic in the distance (needs `historyroot`) |
+| GET    | `/name/{name}`    | resolve a name; `held:false` with no owner means unregistered, with an owner means LAPSED |
+| GET    | `/names`          | every name currently held                                     |
+| GET    | `/nameproof/{name}` | state proof for a name (a name's state key holds a NUL byte, so it cannot ride `/stateproof`) |
+| GET    | `/wasm/{file}`    | the browser verification bundle: `dnas.wasm`, `wasm_exec.js`; **404** when built without `make wasm` |
 | GET    | `/cfilters`       | compact block filters, paged (light-client scan)              |
 | GET    | `/cfilter/{index}`| one block's compact filter; **410** when the body is pruned (an empty filter would falsely prove absence) |
 | GET    | `/cfheaders`      | the filter-header chain, paged (BIP157-style); **410** below a fast-synced node's snapshot |
 | GET    | `/events`         | Server-Sent Events stream of new blocks / reorgs / mempool txs |
-| GET    | `/metrics`        | Prometheus-format node metrics: height, difficulty, mempool depth/bytes, peers, fees, plus reorgs, orphans, ban scores, hashrate, block intervals, supply, tip age, webhook delivery, and the address manager's eclipse-resistance signals (45 series) |
+| GET    | `/metrics`        | Prometheus-format node metrics: height, difficulty, mempool depth/bytes, peers, fees, plus reorgs, orphans, ban scores, hashrate, block intervals, supply, tip age, webhook delivery, and the address manager's eclipse-resistance signals (55 series) |
 | GET    | `/webhooks`       | webhook delivery counters (sent / failed / dropped / queued)  |
 | POST   | `/send` 🔒        | `{"to","amount","fee","expiry"?,"lock_until"?,"memo"?,"nonce"?}` — signed by the node wallet |
 | POST   | `/tx` 🔒          | submit a fully-signed transaction (plain / multisig / HTLC / vault / fee-sponsored) |
@@ -681,6 +726,29 @@ dnas channel fund -in channel.json -key alice.json
 dnas channel pay  -in channel.json -key alice.json -add 0.5      # repeat, off chain
 dnas channel accept -in bob-channel.json -settlement settlement.json
 dnas channel close  -in bob-channel.json -key bob.json           # the only on-chain tx
+
+# spending conditions, as scripts rather than hard-coded shapes
+dnas script new -type timelock -api localhost:8080 -pubkey PUB -height 1000 -o tl.json
+dnas script new -type htlc -secret "the secret" -recipient R -sender S -height 900
+dnas script inspect -in tl.json                # disassemble before you fund it
+dnas script spend -in tl.json -to <addr> -amount 3 -key alice.json
+# the witness is assembled bottom-of-stack first: signatures, then any
+# -preimage, then -branch on top. The constructors document the order each
+# predicate expects; getting it backwards makes a good signature look like a
+# hash mismatch.
+
+# names, resolved with a proof rather than taken on a node's word
+dnas name register alice-shop -key alice.json -api localhost:8080
+dnas name resolve alice-shop                   # PROVEN against a verified header
+dnas name resolve alice-shop -trust            # ...or just ask, if you must
+dnas name transfer alice-shop -to <addr> -key alice.json
+dnas name list
+
+# a unique token: the supply is 1 and no mint or burn can ever name its id
+dnas spv -api URL wallet -key alice.json issue DUCK 1 -file duck.png
+
+# a fresh address per invoice, so two invoices for the same amount differ
+dnas invoice new -amount 2.5 -seed merchant-seed.json
 
 # operational checks, with what to do about each
 dnas doctor -api localhost:8080
@@ -882,13 +950,17 @@ asset.
   transaction count rather than block weight.
 - State-root proofs prove membership AND absence: the root is a trie root, so a
   key's position is fixed by the key and arriving at an empty slot is itself the
-  proof that nothing is there. What the trie does not yet buy is a disk-backed
-  ledger — state is still a resident map, so memory bounds it — or an incremental
-  root, which is rebuilt from the whole account set per call.
-- Merkle SPV proves *inclusion*; compact filters add *non-inclusion*, but the
-  filters aren't committed in the PoW header, so (like BIP157/158) their
-  correctness rests on the honest-node / multi-peer assumption rather than being
-  trustless. Committing a filter root in the header would be a consensus change.
+  proof that nothing is there. The root is computed incrementally against a
+  retained node store, so committing a block costs the accounts it touched
+  rather than the whole ledger. What the trie does not yet buy is a disk-backed
+  ledger — state is still a resident map, so memory bounds it.
+- Merkle SPV proves *inclusion*; compact filters add *non-inclusion*, and from
+  the `filtercommit` upgrade that is backed by the chain's work rather than (as
+  in BIP157/158) by an honest-node / multi-peer assumption: the filter's header
+  is a field in the proof-of-work preimage. It needed the filter to be re-keyed
+  off `PrevHash` and `MerkleRoot`, because a filter keyed by the hash of its own
+  block cannot be committed inside that hash. Below the activation height
+  filters are keyed and trusted as before.
 - Proof-of-work difficulty is unbounded (it tracks hashpower); a devnet/regtest
   pins it to the easy genesis floor (`NoRetarget`) so a laptop mines instantly.
 - Consensus rules change either at a height set at startup (`core/upgrade.go`,
@@ -896,10 +968,13 @@ asset.
   (`core/versionbits.go`, `-deployments`, `-signalbits`). A locked-in deployment
   simply installs its activation height in the same table, so validation never
   learns which route set the number.
-- Mempool admission measures a sender against its *confirmed* state, so a
-  recipient cannot queue a spend of coin that is still unconfirmed. That is the
-  account-model norm, and it is what makes a pool slot cost real balance; package
-  relay would lift it.
+- Mempool admission counts a sender's confirmed balance plus what the pool is
+  already paying it, so a recipient can spend coin that is still unconfirmed,
+  and a parent is priced by the best package it heads so a child's fee can
+  unstick it. Bounded by ancestor, descendant and package-byte limits — over
+  OTHER senders only, since a sender's own nonce run is already bounded by
+  `MaxPerSender`. There is no package *submission*: the parent must still
+  arrive first.
 - The address index (`-addrindex`) lives in memory and is rebuilt at every
   startup, and its size grows with an address's usage rather than with the chain.
 - Mining shares are node-local accounting: nothing is stored on chain, and

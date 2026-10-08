@@ -19,6 +19,23 @@ consensus rule** rather than a report, rule changes can be put to a **BIP9 miner
 vote** instead of a hand-configured flag day, transactions are **announced and
 pulled** rather than pushed to every peer, blocks relay **compactly**, and the
 chain has a **Stratum-shaped pool** with per-miner difficulty and PPLNS payouts.
+Since then: spending conditions are a **bounded script language** rather than
+four hard-coded shapes, **compact filters and a history accumulator are
+committed in the header** (so non-inclusion and ancestry are backed by the
+chain's work rather than by a node's honesty), names resolve to addresses with
+a **proof**, the **peer wire is binary**, the mempool does **package relay and
+child-pays-for-parent**, and the state root is computed **incrementally**
+rather than rebuilt over the whole ledger per block.
+
+One structural thing changed about how the clients work, and it is worth
+stating here because it was a real defect rather than a feature: every SPV
+verifier outside `core` — the explorer's JavaScript, the TUI's Go, the GUI's
+Python, the demo's Python — had drifted into computing a header preimage that
+was never a header, and all four had been reporting failure for valid proofs.
+They are gone. The explorer calls `core` compiled to WebAssembly; the others
+delegate to the `dnas` binary. There is one implementation of these rules and
+there is no second place for one to rot.
+
 What remains is the long tail that turns a correct toy into something you could
 defend on a live network.
 
@@ -43,14 +60,25 @@ sections matter most for "toy → real".
   "holds NOTHING, proven absent". That closes the light-client hole where a
   prover could omit a leaf and be indistinguishable from the truth.
 
-  Two of the three original benefits are still open, and both need the same
-  change: `applyBlock` reads and writes a resident `map[string]Account`, so
-  **memory still bounds the ledger**, and the root is rebuilt from the whole
-  account set per call rather than updated incrementally. Threading a state
+  The incremental half is now done too ([core/statetrie.go](core/statetrie.go)).
+  The root was rebuilt from the whole account set on every call — measured at
+  2.25s for a 100k-account ledger, paid once per block validated, once per
+  block mined, and once per `/stateproof` served, which made an
+  unauthenticated read endpoint the most expensive thing a node does. A
+  content-addressed trie does not need that: an update rewrites only the path
+  from the changed leaf, and the undo log already names the accounts a block
+  touched. At 10,000 accounts, committing a block went from 157ms to 19µs and
+  a state proof from 157ms to 5µs, and both curves are logarithmic rather than
+  linear. The node store is a bounded CACHE — a miss falls back to the full
+  rebuild, so correctness never depends on it being warm.
+
+  **What remains is the memory bound**, which is the hard part and the reason
+  this item is still open: `applyBlock` reads and writes a resident
+  `map[string]Account`, so the ledger must fit in RAM. Threading a state
   accessor through the application path (~10 functions, ~44 sites) plus a
-  disk-backed `NodeStore` gets both. It is a big, careful refactor of the
-  consensus core and is deliberately not bundled into the fork that landed the
-  root change.
+  disk-backed `NodeStore` is the remaining work. It is a careful refactor of
+  the consensus core and is deliberately not bundled with the commitment
+  change.
 - ~~**`[M]` Prune the STORE, not just memory.**~~ **Done.** `-prune` bounded a
   node's resident size while the file kept every original record, so a pruning
   node still paid full disk for history it had discarded and still replayed all
@@ -174,10 +202,21 @@ sections matter most for "toy → real".
 
 ## 2. Networking hardening & reach
 
-- **`[M]` Binary P2P wire format.** Consensus is binary, but the peer envelope
-  ([node/protocol.go](node/protocol.go)) is still JSON. A binary framing on the hot
-  path cuts bandwidth and parse CPU, and removes the last consensus-adjacent use of
-  a text codec.
+- ~~**`[M]` Binary P2P wire format.**~~ **Done.** Every relayed block was
+  serialized to text, parsed back into structs, and then re-encoded to binary
+  to be hashed — three passes to move it one hop. Frames are now
+  self-describing ([node/wire.go](node/wire.go)): a format byte, a length, a
+  payload, so a connection carries a JSON handshake and binary blocks
+  afterwards without a flag day or a second port. The block, header and
+  transaction encodings are EXPORTED from core
+  ([core/wirecodec.go](core/wirecodec.go)) rather than reimplemented — a second
+  binary format for a block would be a second thing to keep in step with the
+  first, which is the mistake this repo has already made in three languages.
+
+  The measured saving on a batch of 50 transactions is ~18%, which is less than
+  it sounds and is worth stating: the payload is still mostly hex strings,
+  because `Transaction` stores hashes and signatures as hex. Storing them as
+  bytes is the next increment and is a change to core's types, not to the wire.
 - ~~**`[M]` Compact block relay (BIP152).**~~ **Done.** A block was announced as a
   hash and pulled in full, so every peer downloaded every transaction twice —
   once into the mempool, once inside the block — at exactly the moment latency
@@ -242,14 +281,26 @@ sections matter most for "toy → real".
 
 ## 3. Programmability
 
-- **`[L]` Authorization script VM.** Multisig, HTLC and now the time-delayed
-  vault ([§5.2 in DESIGN.md](DESIGN.md)) are hand-rolled special cases in
-  consensus — the vault is the cheap version of exactly what a VM would express
-  generically, and it is the third of them, which is the argument for the VM
-  rather than a fourth. A small, deterministic, gas/opcount-metered predicate
-  language would unify them behind one verifier and unlock covenants, richer
-  vault policies, and arbitrary spend conditions — the single highest-leverage
-  expressiveness change.
+- ~~**`[L]` Authorization script VM.**~~ **Done.**
+  ([core/script.go](core/script.go), `-upgrades script:HEIGHT`.) A bounded
+  stack language: no loops, no backward jumps, hard caps on script length,
+  stack depth, operation count and signature checks, and no access to chain
+  state beyond the height. The four hard-coded shapes are provided as
+  constructors written in the language
+  ([core/scriptbuild.go](core/scriptbuild.go)), which doubles as the
+  specification by example. `dnas script new|inspect|spend`.
+
+  Two decisions carry the safety argument. `OP_CHECKHEIGHTVERIFY` aborts
+  rather than pushing a result, so a branch can never depend on WHEN the
+  script ran — otherwise a transaction's authorization would change meaning
+  between the mempool and the block. And the witness is data that is never
+  executed, so a spender cannot rewrite the predicate it must satisfy.
+
+  What it deliberately is NOT: a contract system. It answers one question —
+  may this transaction spend from this account — and the only thing it can
+  return is yes or no. The hard-coded shapes remain in consensus; a chain
+  with the upgrade active has two ways to express a vault, and retiring the
+  old one is a migration nobody has asked for yet.
 - **`[M]` Asset freeze authority + optional per-asset fees.** *Mint and burn are
   done; these two are not.* An asset's supply was fixed at issuance forever. An
   issuer can now mint more of it or burn units it holds, under
@@ -275,13 +326,27 @@ sections matter most for "toy → real".
 
 ## 4. Mempool & fee policy
 
-- **`[M]` Package relay + CPFP + ancestor/descendant limits.** RBF, a per-byte
-  relay floor, rate-based eviction, and per-sender nonce-contiguity/affordability
-  admission all exist. What is missing is *dependency* tracking: because admission
-  measures a sender against its confirmed state, a recipient cannot queue a spend
-  of coin that is still unconfirmed (DESIGN §21), and a stuck low-fee parent cannot
-  be bumped by its child. Ancestor/descendant accounting would restore both and
-  close pinning attacks.
+- ~~**`[M]` Package relay + CPFP + ancestor/descendant limits.**~~ **Done.**
+  ([core/package.go](core/package.go).) A recipient can now spend coin a queued
+  transaction is paying them, and a parent is priced by the best package it
+  heads, so a child's fee unsticks it. Bounded by ancestors, descendants and
+  package bytes — the bounds are what make the dependency safe rather than
+  merely permitted.
+
+  One sharp edge worth recording: the ancestor and descendant counts apply to
+  OTHER senders only. A sender's own nonce run is a chain of ancestors too, and
+  counting it would have silently lowered `MaxPerSender` from 64 to 25 — which
+  is exactly what the first implementation did, caught by the per-sender cap
+  test.
+
+  It costs something: pricing every entry by its best package is a pass over
+  the pool per block template, and `BenchmarkSelect` on 2,000 transactions
+  went from ~28ms to ~35ms. Fine at a 60-second block time; a much larger pool
+  would want per-sender suffix sums rather than a set built per transaction.
+
+  Still missing: package SUBMISSION. A parent and child arrive separately and
+  the parent must arrive first; accepting an orphan child and holding it is a
+  different feature with its own denial-of-service surface.
 - ~~**`[M]` Announce transactions by hash (inv/getdata for `MsgTx`).**~~ **Done.**
   Every transaction was pushed in full to every peer, so on a well-connected node
   the same body went out eight times, seven of them to peers that already had it.
@@ -344,12 +409,13 @@ sections matter most for "toy → real".
   owner — coin sent to `dnas1…` would sit in a different account from coin sent
   to `dnas…` — which is the kind of split that strands money. The error detection
   is worth having where typos happen; that is not.
-- **`[S]` Fresh addresses per invoice.** *Now unblocked: SLIP-0010 landed above.*
-  `dnas invoice` matches a payment by
-  (address, amount, height), so two invoices for the same amount at the same
-  address are indistinguishable — the file says so, which is not the same as
-  fixing it. An HD-derived address per invoice would, and needs the standard
-  derivation above to be worth exporting.
+- ~~**`[S]` Fresh addresses per invoice.**~~ **Done.** `dnas invoice new -seed
+  S.json` derives the next unused SLIP-0010 address, so two invoices for the
+  same amount are never the same address. The index counter is persisted beside
+  the seed and advanced BEFORE the address is handed out: a crash burns an
+  index rather than re-using one, because a gap costs nothing and a repeat is
+  the bug being fixed. The seed file is the only thing that can spend what
+  those addresses receive, and the command says so once, at creation.
 - ~~**`[M]` A watch-only daemon around `invoice watch`.**~~ **Done.**
   `invoice watch` was a foreground poll over one file; when the terminal closed,
   the watching stopped. `dnas invoice serve`
@@ -435,7 +501,7 @@ sections matter most for "toy → real".
   consensus codec: these records are local, never hashed and never sent to a
   peer.
 - ~~**`[S]` A Grafana dashboard for the Prometheus metrics.**~~ **Done, with the
-  half that was missing from the request.** `/metrics` now exports 53 series, and
+  half that was missing from the request.** `/metrics` now exports 55 series, and
   a dashboard with fifty series and no alerting is a dashboard nobody opens. So
   [scripts/monitoring/](scripts/monitoring/) ships both: a 27-panel dashboard and
   15 Prometheus alert rules, grouped by what has gone wrong. The rules are the
@@ -518,10 +584,11 @@ sections matter most for "toy → real".
   stopped mid-stream. What remains on this axis is the P2P half: an inbound frame
   has only the coarse 64 MiB `maxFrame` cap, which is the per-message-type item
   in §2.
-- **`[S]` Expose the empty-block interval to operators.** The miner's idle throttle
-  is a `node.Config` field (`EmptyBlockInterval`, default one `TargetBlockTime`),
-  reachable only in Go — there is no `-emptyinterval` flag or `node.json` key, so a
-  devnet that wants faster empty blocks has to use `-regtest`/`/generate` instead.
+- ~~**`[S]` Expose the empty-block interval to operators.**~~ **Done.**
+  `-emptyinterval N` (and the matching `node.json` key). This was not only a
+  convenience: `scripts/demo.sh` had been failing silently since the target
+  block time went from 5s to 60s, because it waited 12 seconds for blocks the
+  miner only minted every 60. The demo now sets it, and produces a chain again.
 
 ## 7. Assurance & testing
 
@@ -535,6 +602,23 @@ sections matter most for "toy → real".
   an insertion-order dependence shows up), a block-by-block subsidy sum, and a
   full state rebuild compared against what the undo log produced after a real
   reorg.
+- ~~**`[M]` Performance regression tests.**~~ **Done.** There were a few
+  benchmarks in core, but nothing ever compared two runs, so a regression could
+  only be noticed by someone who happened to remember the old number — which is
+  how a state root costing a full fold over the ledger survived for months.
+  `make bench` / `make bench-check` record and compare against
+  [benchmarks/baseline.txt](benchmarks/baseline.txt), and the suite is
+  parameterised by LEDGER SIZE so a cost that scales with the wrong thing shows
+  up as a shape rather than a number ([core/bench_test.go](core/bench_test.go)).
+
+- ~~**`[S]` Reproducible builds and signed releases.**~~ **Done.**
+  `make verify-reproducible` builds the release twice into two different
+  directories and compares every artifact, because the build path is the usual
+  thing that leaks into a binary and a check that built twice in one directory
+  would not catch it. Releases carry a `SHA256SUMS`, signed when
+  `DNAS_SIGN_KEY` is set and reported as UNSIGNED when it is not — a checksum
+  file anyone can rewrite proves nothing about who built the release.
+
 - **`[M]` Long-running adversarial testnet.** The in-process `simnet` harness proves
   convergence in seconds; a real multi-node testnet with churn, partitions, and a
   rogue miner running for days catches what a unit test cannot.

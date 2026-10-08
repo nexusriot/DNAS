@@ -21,6 +21,7 @@ func selectReference(m *Mempool, bc *Blockchain, max int) []Transaction {
 	all := m.All()
 	mineHeight := bc.Height() + 1
 	baseFee := bc.NextBaseFee()
+	rates := m.effectiveRates()
 
 	balance := map[string]uint64{}
 	nonce := map[string]uint64{}
@@ -41,6 +42,7 @@ func selectReference(m *Mempool, bc *Blockchain, max int) []Transaction {
 
 	var selected []Transaction
 	used := map[string]bool{}
+	claimedNames := map[string]bool{}
 	weight, ops := 0, 0
 	for len(selected) < max {
 		var cands []Transaction
@@ -73,6 +75,9 @@ func selectReference(m *Mempool, bc *Blockchain, max int) []Transaction {
 			default:
 				ok = balance[tx.From] >= txCoinCost(tx)
 			}
+			if tx.IsNameOp() && claimedNames[tx.Name.Name] {
+				continue
+			}
 			if ok {
 				cands = append(cands, tx)
 			}
@@ -80,10 +85,17 @@ func selectReference(m *Mempool, bc *Blockchain, max int) []Transaction {
 		if len(cands) == 0 {
 			break
 		}
-		// Same tie-break as Select, so the comparison is meaningful rather than
-		// a coin flip on map order.
+		// Same ordering as Select, so the comparison is meaningful rather than a
+		// coin flip on map order.
+		//
+		// The package rates come from the production implementation on purpose.
+		// This oracle exists to check the SELECTION LOOP — nonce ordering, the
+		// affordability simulation, the byte and op budgets, the tie-break — and
+		// an input it shares with the real thing does not weaken that. The
+		// pricing itself is checked directly, against hand-built packages, in
+		// package_test.go.
 		sort.Slice(cands, func(i, j int) bool {
-			ri, rj := txRate(cands[i]), txRate(cands[j])
+			ri, rj := rates[cands[i].Hash()], rates[cands[j].Hash()]
 			if ri != rj {
 				return ri > rj
 			}
@@ -91,8 +103,13 @@ func selectReference(m *Mempool, bc *Blockchain, max int) []Transaction {
 		})
 		pick := cands[0]
 
+		if pick.IsNameOp() {
+			claimedNames[pick.Name.Name] = true
+		}
 		nonce[pick.From]++
 		switch {
+		case pick.IsNameOp():
+			balance[pick.From] -= senderFee(pick)
 		case pick.IsIssue():
 			balance[pick.From] -= senderFee(pick)
 			assets[pick.From][AssetID(pick.From, pick.Issue.Ticker, pick.Nonce)] += pick.Issue.Supply

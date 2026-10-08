@@ -4,8 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,13 +18,25 @@ import (
 type Client struct {
 	base string
 	http *http.Client
+	// bin is the dnas binary this client delegates verification to (see
+	// VerifyTx). It defaults to "dnas" on PATH and is overridden by the -dnas
+	// flag, the same binary -spawn and -key already use.
+	bin string
 }
 
 func NewClient(base string) *Client {
 	if !strings.HasPrefix(base, "http") {
 		base = "http://" + base
 	}
-	return &Client{base: strings.TrimRight(base, "/"), http: &http.Client{Timeout: 4 * time.Second}}
+	return &Client{base: strings.TrimRight(base, "/"), http: &http.Client{Timeout: 4 * time.Second}, bin: "dnas"}
+}
+
+// UseBinary points the client at a particular dnas binary for the operations
+// it delegates.
+func (c *Client) UseBinary(path string) {
+	if path != "" {
+		c.bin = path
+	}
 }
 
 // Info mirrors GET /info.
@@ -289,76 +299,64 @@ func (c *Client) Send(to string, amount, fee uint64, memo string) (string, error
 	return h, nil
 }
 
-// VerifyTx performs a light-client (SPV) check: fetch the proof and the header
-// it commits to, verify the header's proof-of-work, and fold the merkle proof.
+// VerifyTx performs a light-client (SPV) check by DELEGATING to the `dnas`
+// binary, which holds the one implementation of the verification rules.
+//
+// It used to do the check here, with a hand-written copy of the header
+// preimage and the compact-target comparison. That copy was wrong. It hashed
+// `index|timestamp|prev|merkle|state|base_fee|bits|nonce`, which stopped being
+// the real preimage when BIP9 signaling put Version at the front — so this
+// client had been answering FAILED for every valid proof, and would have
+// answered it just as confidently for an invalid one. Three other copies in
+// this repo had drifted in exactly the same way at exactly the same moment.
+//
+// The same reasoning that put signing behind the binary (selfcustody.go)
+// applies with more force to verification: a signer that is wrong produces a
+// transaction a node rejects, and you find out. A verifier that is wrong tells
+// you a payment is proven, and you do not.
 func (c *Client) VerifyTx(txHash string) (string, error) {
-	var pr proof
-	if err := c.getJSON("/proof/"+txHash, &pr); err != nil {
-		return "", err
+	bin := c.bin
+	if bin == "" {
+		bin = "dnas"
 	}
-	var hdr header
-	if err := c.getJSON(fmt.Sprintf("/header/%d", pr.BlockIndex), &hdr); err != nil {
-		return "", err
-	}
-	hs := fmt.Sprintf("%d|%d|%s|%s|%s|%d|%d|%d", hdr.Index, hdr.Timestamp, hdr.PrevHash, hdr.MerkleRoot, hdr.StateRoot, hdr.BaseFee, hdr.Bits, hdr.Nonce)
-	powOK := sha(hs) == hdr.Hash && meetsTarget(hdr.Hash, hdr.Bits)
-	h := txHash
-	for _, s := range pr.Proof {
-		if s.Right {
-			h = sha(h + s.Hash)
-		} else {
-			h = sha(s.Hash + h)
+	out, errOut, err := run(bin, "spv", "-api", c.base, "-cache", "", "verify", txHash)
+	if err != nil {
+		if msg := lastLine(errOut); msg != "" {
+			return "", fmt.Errorf("%s", msg)
 		}
+		return "", fmt.Errorf("%s spv verify: %w", bin, err)
 	}
-	if powOK && h == hdr.MerkleRoot {
-		return fmt.Sprintf("PROVEN in block %d (%d confirmations)", pr.BlockIndex, pr.Confirmations), nil
+	// stdout carries the result and stderr the log lines, so the last line of
+	// stdout is the verdict. The CLI reports a refusal it handled itself with
+	// exit status 0, so the outcome has to be read from the text.
+	line := lastLine(out)
+	if line == "" {
+		return "", fmt.Errorf("%s spv verify said nothing", bin)
 	}
-	return fmt.Sprintf("FAILED (pow=%v inclusion=%v)", powOK, h == hdr.MerkleRoot), nil
+	return line, nil
 }
 
-// powLimit is the easiest proof-of-work target, mirroring core.PowLimit (the
-// compact 0x1f0fffff ≈ 2^244). It is used to verify header PoW and to render a
-// human difficulty without importing the core module.
-var powLimit = compactToBig(0x1f0fffff)
-
-// compactToBig decodes a compact "bits" target (Bitcoin-style nBits), mirroring
-// core.CompactToBig, so the light client can check PoW against the real target.
-func compactToBig(bits uint32) *big.Int {
+// difficultyOf renders a compact target as a difficulty ratio.
+//
+// This is the one piece of target arithmetic the client still does, and it is
+// kept because it is COSMETIC: it labels a row in a list. Nothing is believed
+// on the strength of it, so a drift here misdraws a number rather than
+// asserting that a payment happened. Everything load-bearing goes through the
+// binary (VerifyTx) — see the note there for what happened when this file
+// tried to be clever about proof of work.
+func difficultyOf(bits uint32) float64 {
 	mantissa := bits & 0x007fffff
 	exponent := bits >> 24
-	out := new(big.Int).SetUint64(uint64(mantissa))
+	target := new(big.Int).SetUint64(uint64(mantissa))
 	if exponent <= 3 {
-		out.Rsh(out, 8*(3-uint(exponent)))
+		target.Rsh(target, 8*(3-uint(exponent)))
 	} else {
-		out.Lsh(out, 8*(uint(exponent)-3))
+		target.Lsh(target, 8*(uint(exponent)-3))
 	}
-	return out
-}
-
-// meetsTarget reports whether a hex hash is ≤ the target encoded by bits.
-func meetsTarget(hash string, bits uint32) bool {
-	raw, err := hex.DecodeString(hash)
-	if err != nil {
-		return false
-	}
-	target := compactToBig(bits)
-	if target.Sign() <= 0 || target.Cmp(powLimit) > 0 {
-		return false
-	}
-	return new(big.Int).SetBytes(raw).Cmp(target) <= 0
-}
-
-// difficultyOf renders a compact target as a difficulty ratio (powLimit/target).
-func difficultyOf(bits uint32) float64 {
-	target := compactToBig(bits)
 	if target.Sign() <= 0 {
 		return 0
 	}
+	powLimit := new(big.Int).Lsh(big.NewInt(0x0fffff), 8*(0x1f-3))
 	f, _ := new(big.Rat).SetFrac(powLimit, target).Float64()
 	return f
-}
-
-func sha(s string) string {
-	h := sha256.Sum256([]byte(s))
-	return hex.EncodeToString(h[:])
 }

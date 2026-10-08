@@ -25,6 +25,8 @@ func mineOn(t testing.TB, bc *Blockchain, minerAddr string, txs []Transaction) B
 		BaseFee:      baseFee,
 		Bits:         bc.NextBits(),
 	}
+	block.MerkleRoot = MerkleRoot(block.Transactions) // the filter root is keyed on it
+	block.FilterRoot, block.HistoryRoot, _ = bc.NextCommitments(block)
 	block.StateRoot, _ = bc.NextStateRoot(block) // commit post-block state (err ignored: invalid blocks are meant to be rejected)
 	mined, ok := Mine(block, nil)
 	if !ok {
@@ -51,6 +53,7 @@ func mineVersioned(t testing.TB, bc *Blockchain, minerAddr string, version uint3
 		Bits:         bc.NextBits(),
 	}
 	block.MerkleRoot = MerkleRoot(block.Transactions)
+	block.FilterRoot, block.HistoryRoot, _ = bc.NextCommitments(block)
 	block.StateRoot, _ = bc.NextStateRoot(block)
 	mined, ok := Mine(block, nil)
 	if !ok {

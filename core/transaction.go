@@ -47,6 +47,11 @@ type Transaction struct {
 	// the issuance preimage, so only the issuer can use it (see asset.go).
 	AssetOp *AssetOp `json:"asset_op,omitempty"`
 
+	// Name carries a name-service operation: register, renew, transfer or
+	// release (see name.go). Encoded only when present, so a transaction
+	// without one keeps the txid it always had.
+	Name *NameOp `json:"name,omitempty"`
+
 	// Single-signature authorization.
 	PubKey    string `json:"pubkey,omitempty"`
 	Signature string `json:"signature,omitempty"`
@@ -54,6 +59,11 @@ type Transaction struct {
 	// M-of-N multisig authorization (mutually exclusive with PubKey/Signature).
 	Multisig   *MultisigScript `json:"multisig,omitempty"`
 	Signatures []string        `json:"signatures,omitempty"`
+
+	// Script authorization: when set, From is the address derived from the
+	// predicate, and the witness must satisfy it (see script.go). This is the
+	// general form of the four hard-coded shapes around it.
+	Script *ScriptAuth `json:"script,omitempty"`
 
 	// Hash-time-locked contract authorization: when set, From is the hash of this
 	// script and the spend is either a claim (Preimage revealed + recipient's
@@ -202,6 +212,41 @@ func CheckTxSanity(tx Transaction) error {
 	if len(tx.FeePayer) > MaxAddressBytes {
 		return fmt.Errorf("fee payer address too long (%d > %d)", len(tx.FeePayer), MaxAddressBytes)
 	}
+	// No address may occupy a NAME RECORD's state key.
+	//
+	// Name records live in the same account map as balances, under a reserved
+	// NUL-prefixed key, and the trie hashes such a key under its own domain tag
+	// (see name.go, trieKeyFor). That domain separation is what stops an
+	// address colliding with a name's slot — but only if an address can never
+	// BE such a key in the first place, because a transfer to one would write a
+	// balance into the name's trie position.
+	//
+	// This is a tightening rather than a height-activated rule. It is safe
+	// because no chain can have exercised it: the addresses it forbids contain
+	// a NUL byte, which no wallet in this repo can produce and which the
+	// recipient checksum rejects. A rule that cannot change any existing
+	// block's validity does not need a flag day.
+	for _, addr := range []string{tx.From, tx.To, tx.FeePayer} {
+		if isNameKey(addr) {
+			return errors.New("an address may not occupy a name record's state key")
+		}
+	}
+	for _, o := range tx.Outputs {
+		if isNameKey(o.To) {
+			return errors.New("an address may not occupy a name record's state key")
+		}
+	}
+	if tx.IsNameOp() {
+		if err := tx.Name.Validate(); err != nil {
+			return err
+		}
+		// A name operation moves no coin and carries no asset: those would be
+		// two effects in one transaction, each with its own rules, and the
+		// combination has no meaning anyone asked for.
+		if tx.Amount != 0 || tx.AssetID != "" || tx.Issue != nil || tx.AssetOp != nil || len(tx.Outputs) > 0 {
+			return errors.New("a name operation cannot also move coin or assets")
+		}
+	}
 	if err := tx.checkAuthShape(); err != nil {
 		return err
 	}
@@ -235,6 +280,10 @@ func CheckTxSanity(tx Transaction) error {
 		if err := tx.AssetOp.Validate(); err != nil {
 			return err
 		}
+	case tx.IsNameOp():
+		// A name operation names no recipient: its effect is on the name
+		// record, and its shape was checked above. The transfer fields must
+		// stay unused, which is also enforced above.
 	case tx.IsAssetTransfer():
 		if tx.To == "" {
 			return errors.New("asset transfer has no recipient")
@@ -299,7 +348,7 @@ func checkOutputs(tx Transaction) error {
 // transaction meant to take.
 func (t Transaction) checkAuthShape() error {
 	scripts := 0
-	for _, present := range []bool{t.IsMultisig(), t.IsHTLC(), t.IsVault()} {
+	for _, present := range []bool{t.IsMultisig(), t.IsHTLC(), t.IsVault(), t.IsScript()} {
 		if present {
 			scripts++
 		}
@@ -321,6 +370,19 @@ func (t Transaction) checkAuthShape() error {
 		}
 		if len(t.Signatures) > 0 {
 			return errors.New("htlc transaction must not carry multisig signatures")
+		}
+	case t.IsScript():
+		// The witness carries every key and signature the predicate needs, so
+		// the single-key and multisig fields must be empty — two places to put
+		// an authorization is two places for them to disagree.
+		if t.PubKey != "" || t.Signature != "" {
+			return errors.New("script transaction must not carry a single-key signature")
+		}
+		if len(t.Signatures) > 0 {
+			return errors.New("script transaction must not carry multisig signatures")
+		}
+		if t.Preimage != "" {
+			return errors.New("script transaction must not carry a preimage (put it in the witness)")
 		}
 	case t.IsVault():
 		if t.PubKey != "" {
@@ -512,6 +574,9 @@ func (t Transaction) verifySender() error {
 	}
 	if t.IsVault() {
 		return t.verifyVault()
+	}
+	if t.IsScript() {
+		return t.verifyScript()
 	}
 	derived, err := wallet.AddressFromPubKeyHex(t.PubKey)
 	if err != nil {

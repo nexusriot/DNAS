@@ -40,6 +40,8 @@ dnas escrow new|show|release|refund                                        2-of-
 dnas anchor hash|add|verify -file F                                        timestamp a file's hash on the chain
 dnas invoice new|show|watch|pay                                            ask to be paid, and verify that you were
 dnas assets [show ID] [-ticker T]                                          what assets exist, and who holds them
+dnas script new|inspect|spend                                              spending conditions as scripts (core/script.go)
+dnas name resolve|list|register|renew|transfer|release                     names that resolve to addresses, with a proof
 dnas tx inspect|verify -in FILE | -hash HASH                               decode and check a transaction
 dnas wallet sign|verify                                                    prove control of an address, off-chain
 dnas wallet passphrase [-remove]                                           re-encrypt a key file under a new passphrase

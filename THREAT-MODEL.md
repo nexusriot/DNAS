@@ -50,8 +50,8 @@ DNAS is a learning project. Do not point it at the internet.
 | Replaying a transaction | Per-account nonce, consumed exactly once | — |
 | Replaying across networks | Network id bound into the signing preimage (§5.1) | Operators run the right `-network` |
 | Malleability (same transfer, different txid) | Every field, including the fee payer, is inside the txid preimage | — |
-| Inflation | Subsidy is a function of height; the base-fee portion of every fee is burned | Supply conservation is *reported*, not yet a consensus rule (ROADMAP §1) |
-| Spending an orphaned reward | `CoinbaseMaturity` (3 blocks) | Reorgs stay shallower than 3 blocks — thin at 5s blocks |
+| Inflation | Subsidy is a function of height; the base-fee portion of every fee is burned; **supply conservation is a consensus RULE** — applying a block must move the coin held by accounts by exactly its subsidy minus what its transactions burned ([core/conservation.go](core/conservation.go)) | The per-block identity is the right one; a block that would inflate is rejected rather than noticed afterwards |
+| Spending an orphaned reward | `CoinbaseMaturity` (3 blocks) | Reorgs stay shallower than 3 blocks. Thin, though less so since the target block time became 60s |
 | Deep history rewrite | `MaxReorgDepth` (100) + operator checkpoints | See §5: this is also a liveness hazard. A refusal is now counted, logged and surfaced by `/health` rather than silent |
 | Oversized/expensive blocks | `MaxBlockBytes`, `MaxBlockTxs`, `MaxBlockVerifyOps`, `MaxCoinbaseBytes` | The verification-cost model matches real cost |
 | Timestamp manipulation | Median-time-past, `MaxFutureDrift` (120s), plus a bounded median-of-peers clock offset ([core/nettime.go](core/nettime.go)) | Peers are majority-honest. The offset is capped at `MaxTimeOffset` (70 min), so a hostile peer set moves the clock at most that far |
@@ -87,7 +87,10 @@ DNAS is a learning project. Do not point it at the internet.
 |---|---|---|
 | Fake payment | Merkle inclusion proof against a PoW-verified header | Client verifies the header chain itself |
 | Fake balance | State proof against the header's state root | — |
-| **"You were never paid"** | An **absence proof** against the header's trie state root ([core/state.go](core/state.go)); compact filters additionally give probabilistic block-level non-inclusion | The state answer is now trustless. The FILTER answer still is not: filters are not header-committed, so block-level non-inclusion still rests on honest-node/multi-peer |
+| **"You were never paid"** | An **absence proof** against the header's trie state root ([core/state.go](core/state.go)); compact filters additionally give probabilistic block-level non-inclusion | Both answers are trustless once `filtercommit` is active: the filter's header is in the proof-of-work preimage, so a forged filter does not fold to the committed value. Below that height the filter answer still rests on honest-node/multi-peer |
+| Being lied to about which address a name points at | The name record is in the state trie, so a resolution — and the absence of a registration — is provable against a PoW-verified header ([core/name.go](core/name.go)) | The client actually checks, rather than reading `/name/{name}`. `dnas name resolve` proves by default; `-trust` opts out |
+| Being shown a block that is not in the chain | An ancestry proof against the Merkle Mountain Range the later header commits ([core/mmr.go](core/mmr.go)) | `historyroot` is active at both heights; below it, ancestry still means holding every header in between |
+| A client's own verifier being wrong | Every client runs the SAME code the node runs: WebAssembly in the browser, the `dnas` binary everywhere else | `make wasm` was run for the browser path; otherwise the explorer says its verifier is unavailable rather than guessing |
 | Being served a minority chain | Most-work rule + checkpoints | Client talks to more than one node |
 
 ## 4. Trust boundaries
@@ -139,19 +142,26 @@ unstated exclusion reads as a claim.
    but is not implemented.
 3. **Local clock trusted for timestamp rules.** A node with a skewed clock can be
    fooled on MTP and future-drift checks.
-4. **Block-level non-inclusion is still not trustless.** *Account* absence now
-   is: the header commits a trie root, so a client can be shown that an address
-   holds nothing and verify it against proof of work. What remains is the
-   compact-filter answer to "was this address in THIS block" — filters are not
-   header-committed, so that still rests on the honest-node/multi-peer
-   assumption.
+4. **Scheduled protections are inert until an operator schedules them.** The
+   filter commitment, the history accumulator, the script VM, the name service
+   and non-fungible assets are all height-activated, and every node on a
+   network must set the SAME activation height. Until one is scheduled the old
+   behaviour stands — block-level non-inclusion rests on honest-node/multi-peer
+   without `filtercommit`, and coin sent to a script address is spendable by
+   nobody without `script`. Two of them (`filtercommit`, `historyroot`) add a
+   field to the proof-of-work preimage, so operators who disagree about the
+   height disagree about block hashes.
 5. **Recipient addresses are consensus-checked only once the upgrade is
    scheduled.** The `checkedaddresses` upgrade closes the burn-to-a-typo hole,
    but like every upgrade here it is inert until an operator sets an activation
    height — and every node on the network must set the same one. Until then the
    old behaviour stands.
-6. **Supply conservation is reported, not enforced.** An accounting bug would be
-   visible rather than rejected.
+6. **The script VM is new, and it is the newest attack surface here.** It is
+   bounded by construction — no loops, no backward jumps, caps on length,
+   stack, operations and signature checks, a witness that is never executed —
+   but a predicate language is the kind of thing whose bugs are found by
+   someone trying, not by the person who wrote it. It is the first thing an
+   outside reviewer should attack (§7).
 7. **One shared API token.** No per-user auth, no scopes, no revocation.
 8. **Wallets are unencrypted unless the operator opts in.**
 9. **Mining shares are unauthenticated node-local accounting.** Fine between
@@ -163,26 +173,50 @@ unstated exclusion reads as a claim.
 
 Ordered by where the author's confidence most exceeds the evidence:
 
-1. **The canonical codec.** Every optional block is appended only when present
+1. **The script VM** ([core/script.go](core/script.go)). It is the newest and
+   least-exercised consensus code here. Find a witness that satisfies a
+   predicate it should not; make the branch taken depend on the height
+   (`OP_CHECKHEIGHTVERIFY` aborts rather than pushing precisely to stop that,
+   so look for a way around it); get a witness item executed as an opcode;
+   exceed a bound without tripping one of the caps; or find a script whose
+   `VerifyOps` price is below what it actually costs a validator.
+2. **The name key space.** Name records live in the same account map as
+   balances under a NUL-prefixed key, and the trie hashes such a key under a
+   different domain tag. Find a way to land an address on a name's trie slot,
+   or a name on an address's.
+3. **The canonical codec.** Every optional block is appended only when present
    and distinguished by a leading tag byte. Find two distinct transactions with
    the same canonical bytes, or a field value that can be mistaken for a tag.
    [core/testdata/consensus_vectors.json](core/testdata/consensus_vectors.json)
    pins the current behaviour; it does not prove no collision exists.
-2. **Reorg and undo.** `applyUndo` reverses an undo log rather than recomputing
+4. **Reorg and undo.** `applyUndo` reverses an undo log rather than recomputing
    state. Find a transaction shape whose undo is not exact — asset transfers,
-   issuance and sponsorship all touch several accounts.
-3. **The script special cases.** Multisig, HTLC and vault are three hand-rolled
-   verifiers. Find a spend that satisfies one verifier's check while the address
-   hash committed to something else.
-4. **Mempool admission vs block validity.** Anything the pool admits that a block
-   must reject is a way to make a miner build invalid candidates.
-5. **The trie's proof verifier.** Both directions: forge a membership proof, and
+   issuance, sponsorship and now name records all touch several accounts, and a
+   released name is DELETED from state rather than zeroed.
+5. **The incremental state commitment.** The retained node store is a cache and
+   a miss is supposed to fall back to a full rebuild. Find a sequence where the
+   incremental root and the rebuild disagree, or where eviction changes an
+   answer rather than only its cost.
+6. **The hand-rolled authorization shapes.** Multisig, HTLC and vault are three
+   hand-rolled verifiers that still exist alongside the VM. Find a spend that
+   satisfies one verifier's check while the address hash committed to something
+   else — including one that crosses between a hard-coded shape and the script
+   equivalent of it.
+7. **Mempool admission vs block validity.** Anything the pool admits that a block
+   must reject is a way to make a miner build invalid candidates. Package relay
+   widened this: admission now lends against coin that is only in the pool, and
+   `Select` must still never emit a child before its parent or two claims of
+   one name.
+8. **The trie's proof verifier.** Both directions: forge a membership proof, and
    forge an absence proof for a key that exists.
-6. **Sync and the finality guards.** Make two honest nodes permanently disagree
-   using only legal messages — §5 says this is possible via partition, so find
-   the cheaper versions.
+9. **The binary peer wire** ([node/wire.go](node/wire.go)). Every length is
+   checked against the bytes remaining before it is used to allocate. Find one
+   that is not, or a frame that makes a decoder panic rather than error.
+10. **Sync and the finality guards.** Make two honest nodes permanently disagree
+    using only legal messages — §5 says this is possible via partition, so find
+    the cheaper versions.
 
 ---
 
-*Written 2026-09-08 against the working tree at the time. If the code has moved,
-this has not.*
+*Written 2026-09-08 and revised 2026-10-08 against the working tree at the
+time. If the code has moved, this has not.*

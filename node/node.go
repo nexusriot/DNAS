@@ -5,7 +5,6 @@
 package node
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -126,7 +125,7 @@ type Config struct {
 
 type peer struct {
 	conn         *secureConn
-	enc          *json.Encoder
+	enc          *msgWriter
 	mu           sync.Mutex      // serializes writes to enc
 	addr         string          // peer's advertised address (from hello)
 	id           string          // peer's authenticated identity public key
@@ -695,8 +694,8 @@ func (n *Node) handleConn(rawConn net.Conn, inbound bool, dialed string) {
 		return
 	}
 
-	p := &peer{conn: sc, enc: json.NewEncoder(sc), ip: ip, inbound: inbound, since: time.Now()}
-	dec := json.NewDecoder(sc)
+	p := &peer{conn: sc, enc: newMsgWriter(sc), ip: ip, inbound: inbound, since: time.Now()}
+	dec := newMsgReader(sc)
 
 	// Authenticated identity exchange: each side proves it holds its identity
 	// key by signing the session id, binding the identity to this session.
@@ -777,6 +776,13 @@ func (n *Node) handleConn(rawConn net.Conn, inbound bool, dialed string) {
 	for _, c := range vm.Caps {
 		p.caps[c] = true
 	}
+	// The handshake is the first point at which the peer has said what it can
+	// read, so it is the first point at which the writer may stop sending JSON.
+	// The reader accepts both formats either way, so the two directions can
+	// switch independently and neither has to wait for the other.
+	p.mu.Lock()
+	p.enc.useBinary(p.version)
+	p.mu.Unlock()
 
 	n.addPeer(p)
 	defer n.removePeer(p)
@@ -1309,6 +1315,16 @@ const maxBuildAttempts = 4
 func (n *Node) buildBlockFor(minerAddr string) (core.Block, []core.Transaction) {
 	for attempt := 0; ; attempt++ {
 		candidate, txs := n.assembleBlock(minerAddr)
+		// The scheduled header commitments are filled before the state root
+		// because the filter root is keyed on the merkle root, which assembly
+		// has already fixed — and because a candidate missing one would be
+		// mined and then rejected by its own node.
+		filterRoot, historyRoot, cerr := n.chain.NextCommitments(candidate)
+		if cerr != nil {
+			Errorf("cannot compute the header commitments for a candidate block", "err", cerr)
+			return candidate, txs
+		}
+		candidate.FilterRoot, candidate.HistoryRoot = filterRoot, historyRoot
 		root, err := n.chain.NextStateRoot(candidate)
 		if err == nil {
 			candidate.StateRoot = root

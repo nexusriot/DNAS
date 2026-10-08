@@ -106,7 +106,15 @@ Module `github.com/nexusriot/DNAS/node` — the peer-to-peer daemon.
   peer replies from the last common block, and only the divergent suffix is
   pulled and applied via `ReorgFrom`. `getchain`/`chain` remains a deep-fork /
   bootstrap fallback.
-- `protocol.go` — the JSON message envelope and message types: `identity`,
+- `wire.go` / `wirebuf.go` — the **framed peer wire**. A frame is a format
+  byte, a length and a payload, so a reader accepts both JSON and binary and a
+  connection can carry a JSON handshake followed by binary blocks without a
+  flag day. The writer switches once the peer's version says it can read
+  binary. Block, header and transaction bytes come from `core` rather than
+  being re-encoded here. Every length is checked against the bytes remaining
+  before it is used to allocate — these are bytes from a peer that has proved
+  nothing.
+- `protocol.go` — the message envelope and message types: `identity`,
   `version` (protocol version + capability negotiation), `hello`,
   `getpeers`/`peers`, `tx` (with a Dandelion++ `stem` flag),
   `inv`/`getdata`/`block`, `getheaders`/`headers` (+locator),

@@ -6,6 +6,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -137,38 +140,73 @@ func TestClientHDWallet(t *testing.T) {
 	}
 }
 
-func TestClientVerifyTx(t *testing.T) {
-	// A single-transaction block: the proof is empty and the merkle root is the
-	// leaf itself. Mine the header (vary the nonce) until its hash meets the
-	// easiest target, so the real target-based PoW check passes.
-	txh := "abc123"
-	const bits = 0x1f0fffff // PowLimit, the easiest allowed target
-	// Header fields in the PoW-committed order: index|ts|prev|merkle|state|basefee|bits|nonce.
-	var nonce uint64
-	var hdrHash string
-	for {
-		hdrHash = sha(fmt.Sprintf("%d|%d|%s|%s|%s|%d|%d|%d", 1, 0, "p", txh, "", 0, bits, nonce))
-		if meetsTarget(hdrHash, bits) {
-			break
-		}
-		nonce++
+// VerifyTx delegates to the dnas binary, so the test drives a stand-in binary
+// and checks the delegation itself: the right subcommand, the right node, and
+// the binary's verdict surfaced verbatim.
+//
+// It deliberately does NOT re-derive a header hash here. The previous version
+// of this test did, with the same wrong preimage the client used, so the two
+// agreed with each other and both disagreed with the chain — which is how a
+// verifier stays broken for months with a passing test.
+func TestClientVerifyTxDelegatesToTheBinary(t *testing.T) {
+	dir := t.TempDir()
+	argsFile := filepath.Join(dir, "args")
+	fake := filepath.Join(dir, "fake-dnas")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + argsFile + "\n" +
+		"echo 'a log line on stderr' >&2\n" +
+		"echo '\u2713 tx abc123 is in block 7 with 2 confirmation(s)'\n"
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/proof/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, `{"found":true,"block_index":1,"confirmations":2,"merkle_root":%q,"proof":[]}`, txh)
-	})
-	mux.HandleFunc("/header/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, `{"index":1,"timestamp":0,"prev_hash":"p","merkle_root":%q,"state_root":"","base_fee":0,"bits":%d,"nonce":%d,"hash":%q}`, txh, bits, nonce, hdrHash)
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	res, err := NewClient(srv.URL).VerifyTx(txh)
+	c := NewClient("localhost:19098")
+	c.UseBinary(fake)
+	res, err := c.VerifyTx("abc123")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(res) < 6 || res[:6] != "PROVEN" {
-		t.Fatalf("VerifyTx = %q, want it to start with PROVEN", res)
+	// The verdict comes from stdout's last line; the stderr log must not leak
+	// into it, which is the trap a merged stream sets.
+	if !strings.Contains(res, "is in block 7") {
+		t.Fatalf("VerifyTx = %q, want the binary's verdict", res)
+	}
+	if strings.Contains(res, "a log line") {
+		t.Fatalf("VerifyTx = %q: stderr leaked into the result", res)
+	}
+
+	raw, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Fields(string(raw))
+	want := []string{"spv", "-api", "http://localhost:19098", "-cache", "", "verify", "abc123"}
+	// The empty -cache argument does not survive Fields, so compare what does.
+	wantNonEmpty := []string{}
+	for _, w := range want {
+		if w != "" {
+			wantNonEmpty = append(wantNonEmpty, w)
+		}
+	}
+	if len(got) != len(wantNonEmpty) {
+		t.Fatalf("called with %v, want %v", got, wantNonEmpty)
+	}
+	for i := range got {
+		if got[i] != wantNonEmpty[i] {
+			t.Fatalf("called with %v, want %v", got, wantNonEmpty)
+		}
+	}
+}
+
+// A binary that fails must surface its message rather than a bare exit status.
+func TestClientVerifyTxSurfacesBinaryFailure(t *testing.T) {
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "fake-dnas")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\necho 'error: no such transaction' >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := NewClient("localhost:19098")
+	c.UseBinary(fake)
+	if _, err := c.VerifyTx("nope"); err == nil || !strings.Contains(err.Error(), "no such transaction") {
+		t.Fatalf("err = %v, want the binary's message", err)
 	}
 }

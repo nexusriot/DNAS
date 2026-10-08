@@ -20,6 +20,20 @@ exceeded. It keys on the client IP and deliberately ignores `X-Forwarded-For`: a
 client-set header would hand out a fresh bucket per request. `/events` is exempt,
 being one long-lived request that then sends many messages.
 
+The bucket is **cost-weighted**: an endpoint debits tokens in proportion to
+what it costs the node, rather than one each. It used to be flat, which priced
+`/info` and `/stateproof` identically — and a state proof on a large ledger
+cost several orders of magnitude more than an `/info`, so the nominal limit
+and the actual CPU a client could demand were not the same number. The file's
+own comment had named the expensive endpoints and then charged them like the
+cheap ones.
+
+The browser verification bundle is served from `/wasm/` (`dnas.wasm`,
+`wasm_exec.js`), embedded from `wasmdist/`. It is a build artifact: a binary
+built without `make wasm` answers 404 and the explorer reports that its
+verifier is unavailable. There is deliberately no JavaScript fallback — the
+fallback is the bug class the bundle exists to remove.
+
 Read endpoints: `/info` (includes the `network` this node runs on,
 `next_bits`/`next_difficulty`, `min_relay_fee`, the current dynamic fee floor, the
 consensus `base_fee` — both per byte — and whether the address index and faucet
@@ -38,7 +52,7 @@ anyone may issue "GOLD"), `/asset/{id}` (one asset plus its holders and the held
 total, which must equal the issued supply), `/webhooks` (delivery counters),
 `/peers`, `/address`, `/estimatefee?blocks=N`
 (recommended per-byte fee = base fee + estimated tip, never below the relay
-floor), `/metrics` (Prometheus format: 45 series covering the chain, the mempool
+floor), `/metrics` (Prometheus format: 55 series covering the chain, the mempool
 by count *and* bytes, peers and their ban scores, reorg totals and depth, orphan
 count, hashrate and block intervals, supply, tip age, blocks-behind, the share
 ledger and webhook delivery — most of these were previously reachable only as

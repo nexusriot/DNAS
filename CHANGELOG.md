@@ -9,7 +9,150 @@ rather than written at the time.
 
 It is still a learning project, not money. Do not point it at the internet.
 
-## 0.3.0 — unreleased
+## 0.4.0 — unreleased
+
+### Added
+
+- **An authorization script VM** ([core/script.go](core/script.go)). Multisig,
+  HTLC and the time-delayed vault were each a hard-coded shape: a struct, a
+  branch in `verifySender`, an address derivation, a codec block, a CLI command
+  and an upgrade. The fifth condition cost the same again, which in practice
+  meant the fifth never got written. A bounded stack language replaces the
+  shapes: no loops, no backward jumps, a hard cap on script length, stack
+  depth, operation count and signature checks, and no access to chain state
+  beyond the height. `dnas script new|inspect|spend` builds, disassembles and
+  spends; constructors for the four existing shapes are provided, written in
+  the language, as the specification by example. Scheduled with
+  `-upgrades script:HEIGHT`.
+
+  Two decisions are load-bearing. `OP_CHECKHEIGHTVERIFY` aborts rather than
+  pushing a result, so a branch can never depend on *when* a script ran — a
+  predicate that verified in the mempool and failed in the block would be a
+  transaction whose authorization changes meaning in transit. And the witness
+  is data that is never executed, so a spender cannot rewrite the predicate it
+  is supposed to satisfy.
+
+- **A name service, committed in the state root** ([core/name.go](core/name.go)).
+  Names resolve to addresses, and the resolution is *provable*: the records
+  live in the state trie, so a light client can verify both that a name
+  belongs to an address and that a name is unclaimed, against a header the
+  proof of work covers. A name service you have to trust a server about is a
+  phishing surface with extra steps. Registration is a lease — a namespace
+  nobody can reclaim is squatted once and then dead. `dnas name
+  resolve|list|register|renew|transfer|release`, `GET /name/{name}`,
+  `/names`, `/nameproof/{name}`. Scheduled with `-upgrades nameservice:HEIGHT`.
+
+- **Non-fungible assets** ([core/asset.go](core/asset.go)). An issuance may
+  carry a sha256 commitment to what it represents, which forces supply to one
+  and makes the token permanently unique. The immutability needs no lookup and
+  no committed per-asset state: an NFT's id is derived under its own domain
+  tag, so a mint or burn naming it cannot reproduce the id and fails authority
+  by construction. `dnas spv wallet ... issue TICKER 1 -file PATH` hashes the
+  file, because a commitment typed by hand is one nobody checked. Scheduled
+  with `-upgrades nonfungible:HEIGHT`.
+
+- **Compact filters are committed in the header** (`UpgradeFilterCommit`).
+  Non-inclusion rested on asking several peers and hoping; it now rests on the
+  chain's work. The two halves are one change because the first is impossible
+  without the second: a BIP158 filter is keyed by the hash of the block it
+  describes, so the filter's commitment cannot also be inside that hash.
+  Re-keying on `PrevHash` and `MerkleRoot` — fixed before the nonce search —
+  breaks the cycle.
+
+- **A Merkle Mountain Range over block hashes in the header**
+  ([core/mmr.go](core/mmr.go), `UpgradeHistoryRoot`). A header chain proves
+  ancestry only by holding all of it; the accumulator makes "block 10 is an
+  ancestor of block 1,000,000" a proof logarithmic in the distance.
+  `GET /ancestry?height=N&as_of=M`.
+
+- **Package relay and child-pays-for-parent** ([core/package.go](core/package.go)).
+  Admission measured a sender against its *confirmed* balance, so a recipient
+  could not spend coin a queued transaction was paying them — even though the
+  miner two lines over was ready to put both in one block. The dependency is
+  now allowed and bounded (ancestors, descendants, package bytes), and a
+  parent is priced by the best package it heads, so a child's fee can unstick
+  it. The limits count *foreign* ancestors only: a sender's own nonce run is
+  already bounded by `MaxPerSender`, and counting it would have silently
+  lowered that from 64 to 25.
+
+- **A binary peer wire format** ([node/wire.go](node/wire.go)). Consensus and
+  the block store were binary; the envelope was still JSON, so every relayed
+  block was serialized to text, parsed back, and re-encoded to be hashed.
+  Frames are self-describing, so a connection carries a JSON handshake and
+  binary blocks afterwards without a flag day. The block, header and
+  transaction encodings are *exported from core*, not reimplemented.
+
+- **A browser verification bundle**: `core` compiled to WebAssembly
+  ([cmd/wasmverify](cmd/wasmverify)), served at `/wasm/`, and used by the
+  explorer. `make wasm`.
+
+- **A benchmark suite with a recorded baseline** ([scripts/bench.sh](scripts/bench.sh)):
+  `make bench`, `make bench-update`, `make bench-check`.
+
+- **Reproducible release builds**, verified by building twice into two
+  directories and comparing ([scripts/verify-reproducible.sh](scripts/verify-reproducible.sh)):
+  `make verify-reproducible`. Releases carry a `SHA256SUMS`, signed when
+  `DNAS_SIGN_KEY` is set and said to be unsigned when it is not.
+
+- **A fresh address per invoice** (`dnas invoice new -seed S.json`). Two
+  invoices for the same amount at the same address could not be told apart;
+  SLIP-0010 derivation gives each invoice its own address from one backup
+  phrase.
+
+- **`-emptyinterval`**, so an operator can set how long the miner idles before
+  minting an empty block. It defaults to one target block time, which is right
+  for a network and far too slow for a demo.
+
+### Changed
+
+- **The state root is computed incrementally** ([core/statetrie.go](core/statetrie.go)).
+  Every root was built by inserting the whole account set into a throwaway
+  store — measured at 2.25s for a 100k-account ledger, paid once per block
+  validated, once per block mined, and once per `/stateproof` served, which
+  made an unauthenticated read endpoint the most expensive thing a node does.
+  The trie is content-addressed, so an update rewrites only the path from the
+  changed leaf, and the undo log already names the accounts a block touched.
+  At 10,000 accounts: committing a block went from 157ms to 19µs and a state
+  proof from 157ms to 5µs, and both curves are now logarithmic rather than
+  linear. The node store is a bounded *cache* — a miss falls back to the full
+  rebuild, so correctness never depends on it being warm.
+
+- **The API rate limiter is cost-weighted.** It was a flat per-client bucket in
+  which `/info` and `/stateproof` cost the same token, which at the default 20
+  requests per second let one address demand far more CPU than the limit
+  suggests.
+
+### Fixed
+
+- **Every SPV verifier outside `core` was broken.** The explorer's JavaScript,
+  the TUI's Go, the PyQt GUI's Python and `scripts/demo.sh`'s Python each
+  computed the header preimage starting at `index` — none had been given the
+  `Version` field that BIP9 signaling added. All four therefore hashed
+  something that was never a header, and reported `VERIFICATION FAILED` for
+  valid proofs. The GUI's test built its fixture from the GUI's own hashing, so
+  the two agreed with each other and both disagreed with the chain; nothing
+  compiles a template literal, so nothing else noticed either. All four copies
+  are gone: the explorer calls into `core` compiled to WebAssembly, and the
+  TUI, the GUI and the demo delegate to the `dnas` binary, which is the same
+  thing the TUI and GUI already did for *signing*.
+
+- **`scripts/demo.sh` had been failing silently** since the target block time
+  went from 5s to 60s: it waited 12 seconds for blocks the miner only mints
+  every 60, so the chain stayed at height 0 and every subsequent step reported
+  an empty wallet. It now runs the miner with `-emptyinterval 2`.
+
+- **`buildAssetIndex` reported a stale supply after a snapshot restore.** The
+  rebuild path never applied mints or burns and never set `Issued` at all, so a
+  restored node reported the supply as it was at issuance and the issued amount
+  as zero — two numbers that disagreed, neither of them right.
+
+## 0.3.0 — never tagged
+
+The release number reached 0.3.0 in [VERSION](VERSION) but no commit was ever
+tagged for it (the newest tag is `0.2`), so nothing below shipped under that
+number. It is kept as its own section rather than folded into 0.4.0 because
+the work is distinct, and labelled honestly rather than described as a
+release.
 
 ### Fixed
 

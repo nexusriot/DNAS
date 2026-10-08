@@ -49,6 +49,26 @@ type InfoResponse struct {
 	Store        core.StoreStats `json:"store"`
 	PruneKeep    uint64          `json:"prune_keep"`
 	PrunedBodies uint64          `json:"pruned_bodies"`
+
+	// FilterRoot and HistoryRoot are the tip's scheduled header commitments.
+	// Empty when the corresponding upgrade is not active, which is also how a
+	// client learns whether it may rely on them: a committed filter makes
+	// non-inclusion trustless, and a history root makes ancestry provable.
+	FilterRoot  string `json:"filter_root,omitempty"`
+	HistoryRoot string `json:"history_root,omitempty"`
+	// TrieCache is how many account-trie nodes the chain is retaining, so an
+	// operator can see the commitment cache's memory (see core/statetrie.go).
+	TrieCache int `json:"trie_cache"`
+
+	// Upgrades is every scheduled consensus upgrade and the height it activates
+	// at. A client that verifies headers MUST install these before hashing one:
+	// the scheduled commitments are in the proof-of-work preimage from their
+	// activation height, so a verifier working from the wrong schedule computes
+	// the wrong hash (see core.ScheduledUpgrades).
+	Upgrades map[string]uint64 `json:"upgrades,omitempty"`
+	// Verifier reports whether this binary carries the browser verification
+	// bundle, so the explorer can say "not built" rather than failing oddly.
+	Verifier bool `json:"verifier"`
 }
 
 // BalanceResponse is GET /balance/{address}.
@@ -299,4 +319,19 @@ type walletHDRequest struct {
 	Mnemonic   string `json:"mnemonic"`
 	Passphrase string `json:"passphrase"`
 	Count      int    `json:"count"`
+}
+
+// NameResponse is GET /name/{name}.
+type NameResponse struct {
+	Name  string `json:"name"`
+	Owner string `json:"owner,omitempty"`
+	// Held says the lease is in force at the current tip. A record that exists
+	// but is not held has LAPSED, which is a different thing from never having
+	// been registered — a payer who used this name last month needs to be told
+	// which it is.
+	Held    bool   `json:"held"`
+	Expires uint64 `json:"expires,omitempty"`
+	// StateKey is what to pass to /stateproof to verify this answer against the
+	// header's state root rather than trusting it.
+	StateKey string `json:"state_key"`
 }

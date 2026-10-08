@@ -29,6 +29,42 @@ const MaxAssetSupply uint64 = 1 << 62
 type AssetIssue struct {
 	Ticker string `json:"ticker"`
 	Supply uint64 `json:"supply"`
+	// Metadata is a commitment to what this asset REPRESENTS: the hex sha256 of
+	// a document, an image, a certificate — whatever is being tokenised. Empty
+	// for an ordinary fungible issuance.
+	//
+	// It is a hash and not a URL on purpose. A URL is a promise about a server;
+	// a hash is a statement about content, and it is the only part of a
+	// non-fungible asset a chain can actually keep. Where the bytes live, and
+	// whether they are still there, is not something consensus can speak to,
+	// and pretending otherwise is most of what is wrong with the genre.
+	//
+	// A non-empty Metadata makes the issuance NON-FUNGIBLE: supply is forced to
+	// 1 and no mint or burn may ever change it (see validateIssue).
+	Metadata string `json:"metadata,omitempty"`
+}
+
+// IsNonFungible reports whether this issuance creates a unique token.
+func (a *AssetIssue) IsNonFungible() bool { return a != nil && a.Metadata != "" }
+
+// MetadataHashLen is the hex length of the commitment a non-fungible issuance
+// carries: a sha256 digest. Fixing the length rather than accepting any string
+// keeps the field from becoming a cheap place to store arbitrary data in the
+// state root, which every holder of every asset then pays to keep.
+const MetadataHashLen = 64
+
+// validMetadata checks a non-fungible asset's commitment.
+func validMetadata(meta string) error {
+	if len(meta) != MetadataHashLen {
+		return fmt.Errorf("asset metadata must be a %d-character sha256 hex digest, got %d", MetadataHashLen, len(meta))
+	}
+	for i := 0; i < len(meta); i++ {
+		c := meta[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return errors.New("asset metadata must be lowercase hex")
+		}
+	}
+	return nil
 }
 
 // AssetID deterministically derives a new asset's id from its issuer, ticker and
@@ -37,6 +73,42 @@ func AssetID(issuer, ticker string, nonce uint64) string {
 	h := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%d", issuer, ticker, nonce)))
 	return "tok" + hex.EncodeToString(h[:16])
 }
+
+// NonFungibleAssetID derives the id of a unique token. It commits to the
+// metadata as well as the issuer, ticker and nonce, under a distinct domain
+// prefix.
+//
+// The separate derivation is what makes a non-fungible asset PERMANENTLY
+// non-fungible, and it does so without any committed per-asset state.
+//
+// Mint and burn prove authority by reproducing AssetID from the issuer and the
+// operation's stated ticker and issuing nonce (see AssetOp.AuthorizedBy) — a
+// deliberate design, because the asset registry is derived state no header
+// commits, so a rule that read it would depend on nothing. An id derived the
+// other way can never be reproduced by that check, so a mint or burn naming a
+// non-fungible asset fails authority by construction. There is no lookup, no
+// extra rule, and nothing an issuer can do later to inflate a token they sold
+// as unique.
+//
+// It also means the id commits to WHAT the token represents: change the
+// metadata and it is a different asset, not the same one pointing somewhere
+// else.
+func NonFungibleAssetID(issuer, ticker string, nonce uint64, metadata string) string {
+	h := sha256.Sum256([]byte(fmt.Sprintf("nft|%s|%s|%d|%s", issuer, ticker, nonce, metadata)))
+	return "nft" + hex.EncodeToString(h[:16])
+}
+
+// IssuedAssetID is the id an issuance creates, fungible or not.
+func IssuedAssetID(issuer string, nonce uint64, issue *AssetIssue) string {
+	if issue.IsNonFungible() {
+		return NonFungibleAssetID(issuer, issue.Ticker, nonce, issue.Metadata)
+	}
+	return AssetID(issuer, issue.Ticker, nonce)
+}
+
+// IsNonFungibleID reports whether an id names a unique token, which a client
+// can tell from the id alone.
+func IsNonFungibleID(id string) bool { return len(id) == 35 && id[:3] == "nft" }
 
 // validTicker reports whether a ticker is a short alphanumeric string (so it is
 // human-readable and cannot contain the '|' signing-bytes delimiter).

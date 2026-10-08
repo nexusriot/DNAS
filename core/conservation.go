@@ -109,7 +109,7 @@ func checkConservation(state map[string]Account, undo []undoEntry, txs []Transac
 		tx := txs[i]
 		switch {
 		case tx.Issue != nil:
-			wantAssets[AssetID(tx.From, tx.Issue.Ticker, tx.Nonce)] += int64(tx.Issue.Supply)
+			wantAssets[IssuedAssetID(tx.From, tx.Nonce, tx.Issue)] += int64(tx.Issue.Supply)
 		case tx.AssetOp != nil:
 			switch tx.AssetOp.Op {
 			case AssetOpMint:

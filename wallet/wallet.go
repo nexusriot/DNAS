@@ -383,3 +383,29 @@ func LoadOrCreateEncrypted(path, passphrase string) (*Wallet, bool, error) {
 	}
 	return w, true, nil
 }
+
+// ScriptAddress derives the account address a script-authorization predicate
+// controls: the same address format and checksum as every other kind, under
+// its own domain tag so a script can never collide with a multisig, an HTLC or
+// a vault that happens to hash the same bytes.
+//
+// It lives here rather than in core because every address derivation in this
+// project does, and because the clients that must show a script address must
+// be able to compute it without importing consensus.
+func ScriptAddress(scriptHex string) (string, error) {
+	raw, err := hex.DecodeString(scriptHex)
+	if err != nil {
+		return "", errors.New("script is not hex")
+	}
+	if len(raw) == 0 {
+		return "", errors.New("empty script")
+	}
+	h := sha256.New()
+	h.Write([]byte("dnas-script-v1"))
+	h.Write(raw)
+	body := h.Sum(nil)[:20]
+	payload := make([]byte, 0, 20+addressChecksumLen)
+	payload = append(payload, body...)
+	payload = append(payload, addressChecksum(body)...)
+	return AddressPrefix + hex.EncodeToString(payload), nil
+}

@@ -31,7 +31,9 @@ Section 5 has the transaction sub-forms:
 [5.2 Time-delayed vaults](#52-time-delayed-vaults) ·
 [5.3 Fee sponsorship](#53-fee-sponsorship) ·
 [5.4 Spending from a multisig account](#54-spending-from-a-multisig-account-and-escrow-on-top-of-it) ·
-[5.5 The memo](#55-the-memo-and-what-it-made-possible)
+[5.5 The memo](#55-the-memo-and-what-it-made-possible) ·
+[5.6 Script-authorized spends](#56-script-authorized-spends) ·
+[5.7 Names](#57-names)
 
 ---
 
@@ -92,11 +94,11 @@ wallet → core → node → api → cmd        (dependency direction, no cycles
 
 | Module   | Responsibility                                                        |
 |----------|-----------------------------------------------------------------------|
-| `wallet` | Ed25519 keys, checksummed addresses, at-rest encryption, BIP39/HD, and the script-bound address kinds (multisig, HTLC, vault) |
-| `core`   | Networks, transactions, blocks, headers, Merkle, chain state, work, reorgs, mempool, persistence, params, share targets, store tooling |
+| `wallet` | Ed25519 keys, checksummed addresses, at-rest encryption, BIP39/SLIP-0010 HD, and the address kinds derived from a spending condition (multisig, HTLC, vault, script) |
+| `core`   | Networks, transactions, blocks, headers, Merkle, the state trie and its incremental commitment, work, reorgs, mempool and package relay, the authorization script VM, names, assets, persistence, params, share targets, store tooling |
 | `node`   | Encrypted/authenticated P2P, peer identity, ban scoring, discovery, sync, mempool reconciliation, the miner, the share ledger, the faucet |
 | `api`    | HTTP interface + embedded web explorer                                |
-| `cmd`    | The `dnas` CLI/daemon (`cmd/dnas`)                                     |
+| `cmd`    | The `dnas` CLI/daemon (`cmd/dnas`), and `cmd/wasmverify` — `core`'s verification primitives compiled to WebAssembly for the browser |
 
 Two clients live **outside** the Go workspace and talk only to the HTTP API:
 
@@ -104,8 +106,16 @@ Two clients live **outside** the Go workspace and talk only to the HTTP API:
   `tui/go.work`, deliberately excluded from the root workspace: it pulls in
   external deps (bubbletea/lipgloss) whose `go.sum` verification would otherwise
   be forced onto the internal `v0.0.0` modules. It imports no DNAS module and
-  reimplements only the little it needs (SHA-256 for SPV folding).
+  **cannot**: adding `use ../core` to its workspace still sends Go to the proxy
+  for `wallet`, because the module path looks like a sub-module of a repo and
+  resolution wants a `wallet/v0.0.0` tag that does not exist.
 - `gui/` — a PyQt6 desktop client (Python standard library + PyQt6 only).
+
+Neither re-implements a consensus rule. Both shell out to the `dnas` binary for
+signing *and* for verification, and the explorer served by `api` calls into
+`core` compiled to WebAssembly. They used to carry their own transcriptions of
+the header preimage, and every one of those transcriptions had silently drifted
+out of step with it (§21).
 
 Because the root isn't a module, build/test with directory paths
 (`go build ./core/... ./node/...`), not a bare `./...`. The
@@ -489,11 +499,120 @@ whoever built it what is wrong.
 
 ---
 
+### 5.6 Script-authorized spends
+
+Multisig, HTLC and the time-delayed vault are each a hard-coded shape: a struct
+on `Transaction`, a branch in `verifySender`, an address derivation, a codec
+block, a CLI command and a consensus upgrade. The fifth spending condition
+costs the same again, which in practice means the fifth never gets written and
+somebody contorts one of the existing four instead.
+
+`UpgradeScript` replaces the shapes with a language
+([core/script.go](core/script.go)). The sender publishes a predicate, the
+spender supplies a witness, consensus runs the predicate, and the spend is
+allowed if it ends with exactly one truthy value on the stack. `From` is the
+address derived from the script under its own domain tag, so publishing the
+script is what creates the account and nobody can attach a different predicate
+to an address afterwards.
+
+**What it is not.** It has no loops, no backward jumps, no memory beyond a
+bounded stack, and no access to chain state beyond the current height. It
+decides one question — may this transaction spend from this account — and the
+only thing it can return is yes or no. A language that could also say "and pay
+Bob 5 coin" is a different project with a different safety argument.
+
+Three decisions carry the safety, and each closes a hole a naive stack machine
+leaves open:
+
+1. **Execution is priced before it runs, not watched while it runs.** Script
+   length, stack depth, operation count and signature checks all have hard
+   caps, and `VerifyOps` charges a script its WORST CASE rather than what the
+   taken path happened to cost — otherwise a cheap-looking script with an
+   expensive other branch would slip past the budget it was admitted under.
+
+2. **The height opcode cannot be branched on.** `OP_CHECKHEIGHTVERIFY` aborts
+   rather than pushing a result, exactly as Bitcoin's CLTV does. If height
+   could push a boolean into `OP_IF`, the branch taken would depend on when the
+   script ran, so a transaction's authorization would mean one thing in the
+   mempool and another in the block — it would verify in one place and fail in
+   the other. Aborting makes the height a constraint on WHEN, never an input to
+   WHAT. The requirement it records is enforced in `checkTxAtHeight`, the same
+   split the HTLC and the vault already use.
+
+3. **The witness is data and is never executed.** A witness that could carry
+   operations would let the spender rewrite the predicate it is supposed to
+   satisfy.
+
+The signature opcodes verify over `canonicalSigningBytes` — the same preimage
+every other authorization shape signs — so one wallet signs for all of them and
+there is no second signing format to drift. The witness itself cannot be
+covered by a signature inside it, so it is covered by the txid instead, which
+the block's merkle root commits once mined.
+
+[core/scriptbuild.go](core/scriptbuild.go) writes the four hard-coded shapes in
+the language. That is the specification by example, and it is also where the
+witness ORDER for each is documented: the stack is filled bottom-first, so an
+HTLC claim puts the preimage above the signature because `OP_SHA256` takes the
+top. Getting that backwards makes a perfectly good signature fail as a hash
+mismatch, which is why `dnas script spend` runs the predicate locally and names
+the failing check before it broadcasts anything.
+
+The hard-coded shapes remain in consensus. A chain with the upgrade active has
+two ways to express a vault; retiring the old ones would invalidate every
+funded address using them, which is a migration nobody has needed.
+
+---
+
+### 5.7 Names
+
+`UpgradeNameService` adds human-readable names that resolve to addresses
+([core/name.go](core/name.go)). The reason it is in consensus rather than
+beside it is the only reason that matters: a name service you have to trust a
+server about is a phishing surface with extra steps. The records live in the
+state trie, so a light client can verify both that a name belongs to an address
+and that a name is **unclaimed**, against a header the proof of work covers.
+`dnas name resolve` proves by default and `-trust` opts out, which is the right
+way round.
+
+**Where they live.** Names are entries in the same account map as balances,
+under a key prefixed with a NUL byte. Two independent things keep the key
+spaces apart, and both are needed:
+
+- No address may contain the prefix — `CheckTxSanity` rejects one. This is a
+  string comparison.
+- The trie hashes a name key under a **different domain tag** than an address
+  (`trieKeyFor`). This is the cryptographic one, and it is what actually holds:
+  even a crafted address string cannot land on a name's slot.
+
+Without the second, a transfer to a carefully chosen `To` would write a balance
+into a name's trie position.
+
+**A lease, not a freehold.** A registration expires and an expired name is
+claimable by anyone. A namespace nobody can reclaim is squatted once and then
+dead, and there is no authority here to appeal to. Renewal extends from the
+current expiry rather than from now, so renewing early never costs time, and
+`resolve` distinguishes three answers rather than two: UNREGISTERED, LAPSED
+(with the address it used to point at, and a warning not to pay it), and held.
+
+A released name is **deleted** from state rather than stored empty, so a chain
+where a name was claimed and given up commits the same state root as one where
+it never existed. An empty record left behind would be permanent state
+committing to nothing.
+
+Two registrations of one name both look valid against the chain and the second
+fails when the block is applied, which would invalidate the whole candidate —
+so `Mempool.Select` tracks the names it has already placed, the same way it
+simulates balances and asset holdings.
+
+---
+
 ## 6. Blocks, headers, and Merkle proofs
 
 ```go
-type Block  struct { Index, Timestamp, Nonce; PrevHash; MerkleRoot; StateRoot; BaseFee; Bits; Transactions; Hash }
-type Header struct { Index, Timestamp, Nonce; PrevHash; MerkleRoot; StateRoot; BaseFee; Bits; Hash }
+type Block  struct { Version, Index, Timestamp, Nonce; PrevHash; MerkleRoot; StateRoot;
+                     BaseFee; Bits; FilterRoot; HistoryRoot; Transactions; Hash }
+type Header struct { Version, Index, Timestamp, Nonce; PrevHash; MerkleRoot; StateRoot;
+                     BaseFee; Bits; FilterRoot; HistoryRoot; Hash }
 ```
 
 A block hash commits to header fields **plus two merkle roots** — a `MerkleRoot`
@@ -503,6 +622,21 @@ client holding only headers can verify proof-of-work, the hash chain, that a
 transaction is included (via `MerkleRoot`), and that an account holds a given
 balance (via `StateRoot`) — all without block bodies. This is what makes SPV
 (§14) possible.
+
+**Two of those fields are SCHEDULED, and that is how genesis survived them.**
+`FilterRoot` and `HistoryRoot` enter the proof-of-work preimage only from the
+activation height of `UpgradeFilterCommit` and `UpgradeHistoryRoot`
+respectively — `appendPreimagePrefix` asks `IsUpgradeActive(name, h.Index)`,
+and a header's own `Index` is the height the rule is asked about, which is what
+lets the preimage be height-aware with no chain in hand. Below the activation
+height the bytes hashed are exactly what they always were, so **genesis and
+every block under it keep their hashes**. Every previous header change here
+moved genesis; this one did not. A header carrying either field before its
+upgrade activates is rejected, because a field nobody validates is a field
+anyone may stuff, and it would change the hash the moment the rule turned on.
+
+The two commitments are what make non-inclusion and ancestry trustless rather
+than a matter of trusting whoever answered; see §14.
 
 `core/merkle.go` builds the shared merkle fold (`MerkleProof`, `VerifyMerkleProof`);
 an odd level duplicates its last node (Bitcoin's rule), and proof and root use the
@@ -716,6 +850,38 @@ trustworthy as the balances themselves.
   pool full by bytes stops quoting the floor fee.
 - **Replace-by-fee.** A conflicting `(From, Nonce)` may be replaced only by a
   strictly higher fee.
+- **Package relay and child-pays-for-parent** ([core/package.go](core/package.go)).
+  Admission used to measure a sender against its CONFIRMED balance, so a
+  recipient could not queue a spend of coin a queued transaction was paying
+  them — even though `Select` simulates credits as it goes and would have put
+  both in one block. The pool was refusing transactions the miner two lines
+  over was ready to mine. Admission now counts the confirmed balance plus what
+  the pool is already paying the sender.
+
+  That reintroduces exactly the risk the old rule existed to prevent — a queue
+  entry that can never be mined, holding a nonce and never paying its fee —
+  because the parent might be replaced or evicted and take the child's
+  mineability with it. So the dependency is BOUNDED: `MaxPackageAncestors`,
+  `MaxPackageDescendants` and `MaxPackageBytes`. The descendant limit is the
+  anti-pinning one: without it an attacker attaches a large cheap tree to a
+  transaction and makes replacing it mean out-bidding the whole tree.
+
+  The ancestor and descendant COUNTS are over other senders only. A sender's
+  own nonce run is a chain of ancestors too, but it is already bounded by
+  `MaxPerSender` and the sender controls every entry, so counting it would
+  silently lower that limit from 64 to 25.
+
+  Once the pool knows what depends on what, a parent's worth to a miner is no
+  longer its own rate but the best rate of any package it heads, so a child's
+  fee can unstick a parent the sender cannot bump — and the receiver, who is
+  the one actually waiting, usually cannot bump it either. Pricing costs a pass
+  over the pool per block template (~28ms → ~35ms on 2,000 transactions, after
+  caching sizes).
+
+  What this is NOT is package SUBMISSION: a parent and child still arrive
+  separately and the parent must arrive first. Accepting an orphan child and
+  holding it for a parent that may never come is a different feature with its
+  own denial-of-service surface.
 - **An unmineable transaction cannot hold a nonce hostage.** Replace-by-fee
   normally requires a strictly higher fee, with one exception: a queued
   transaction that the height rules would reject for the NEXT block (expired, not
@@ -860,7 +1026,16 @@ eclipse, so configure more than one.
 
 **Secure transport (`secureConn`, `secureHandshake`) — permissionless by
 default.** Every connection begins with an X25519 ECDH key exchange; traffic is
-then AES-256-GCM encrypted, length-framed, with a JSON encoder/decoder over it.
+then AES-256-GCM encrypted and length-framed, with the **peer wire format**
+([node/wire.go](node/wire.go)) over it: a format byte, a length, and a payload
+that is either JSON or the binary encoding. Frames are self-describing so a
+reader accepts both, which is what let the wire change without a flag day — a
+connection carries a JSON handshake and binary blocks afterwards, and the
+writer switches as soon as the peer's version says it can read them. Block,
+header and transaction bytes come from `core` ([core/wirecodec.go](core/wirecodec.go)),
+which is the store's encoding; a second binary format for a block would be a
+second thing to keep in step with the first. Every length a peer announces is
+checked against the bytes remaining before it is used to allocate.
 Whether it is *authenticated* depends on the network key: with **no `-netkey`
 (the default) the network is open/permissionless** — anyone may connect (the
 handshake is anonymous but encrypted), which is what an actual cryptocurrency
@@ -1217,8 +1392,7 @@ and the web explorer does the same fold in-browser with the Web Crypto API.
 transaction *is* in a block; it says nothing about a block a client didn't ask
 about. To let a wallet learn which blocks concern it — and prove which do *not* —
 each block also has a **Golomb-Coded Set** filter (`core/cfilter.go`) over the
-addresses it touches. Items are placed with SipHash-2-4 (keyed by the block hash,
-so the filter is bound to a PoW-verifiable block) and delta-encoded with
+addresses it touches. Items are placed with SipHash-2-4 and delta-encoded with
 Golomb-Rice coding (P=19, M=784931). Testing the filter for an address gives no
 false negatives: a non-match is a **proof of non-inclusion** for that block; a
 match is "probably present, download to confirm" (≈1/M false positives). The API
@@ -1227,10 +1401,38 @@ serves `/cfilter/{index}`, `/cfilters`, and a BIP157-style filter-header chain a
 is bound to its header and consistent with the filter-header chain, then reports
 matches and how many blocks the address is provably absent from.
 
-Because the filters are not committed in the PoW header (that would be a
-consensus change), their correctness rests on the honest-node / multi-peer
-assumption, exactly as in BIP157/158 — a client cross-checks peers or falls back
-to downloading the block.
+**The filter key, and why it had to move.** Below `UpgradeFilterCommit` the
+SipHash key is the block's own hash, as BIP158 does it, and the filter's
+correctness rests on the honest-node / multi-peer assumption — a client
+cross-checks peers or falls back to downloading the block.
+
+From the activation height the header commits the block's filter header in
+`FilterRoot`, so a forged filter does not fold to the committed value and
+non-inclusion is backed by the chain's work instead of by the honesty of
+whoever answered. The two halves of that change are inseparable: a filter keyed
+by the hash of the block it describes cannot have its commitment placed inside
+that same hash. So above the activation height the key is derived from
+`PrevHash` and `MerkleRoot` instead — both fixed before the nonce search
+begins, which is what makes the filter computable before the header exists.
+Both inputs are needed: a merkle root alone repeats across two blocks with
+identical transaction sets, and a prev-hash alone repeats across siblings at
+one height.
+
+The committed chain starts AT the activation height, because the parent of the
+first committed block carries no root to extend. A client verifies filters
+against the commitment from there forward and falls back to the uncommitted
+filter-header chain below it. `core.VerifyCommittedFilter` is the check.
+
+**Ancestry proofs.** A header chain proves ancestry only by holding all of it:
+knowing block 10 is an ancestor of block 1,000,000 means having the 999,990
+headers in between. From `UpgradeHistoryRoot` the header commits a **Merkle
+Mountain Range** over every block hash below it ([core/mmr.go](core/mmr.go)),
+so the same fact is a path through an accumulator — logarithmic in the chain's
+length, independent of the distance. `GET /ancestry?height=N&as_of=M` serves
+one and `core.VerifyAncestryProof` checks it against a root the client takes
+from a header whose proof of work it verified. The verifier recomputes
+everything the proof asserts and ignores the proof's own `Root` field, because
+a prover that could choose it could prove anything.
 
 **State proofs (balances).** Inclusion and non-inclusion are about
 *transactions*; the header's `StateRoot` (§6, §9) lets a client prove *state*.
@@ -1342,7 +1544,7 @@ with `httptest`). Highlights:
   confirmation instead of guessing which to ask), `/supply` (minted, burned,
   circulating and the conservation check, §9), `/peers`, `/address`,
   `/estimatefee?blocks=N` (recommended fee = base fee + estimated tip),
-  `/metrics` (Prometheus text — 45 series: chain, mempool count *and bytes*, peers
+  `/metrics` (Prometheus text — 55 series: chain, mempool count *and bytes*, peers
   and their ban scores, reorg totals and depth, orphan count, hashrate and block
   intervals, supply, tip age, blocks-behind, shares, and webhook delivery. Most of
   those numbers existed already but only as JSON on five different endpoints,
@@ -1538,6 +1740,24 @@ status: readiness answers **503** with the reasons, and treating that as a
 transport error would drop the readiness line on exactly the nodes that are not
 ready.
 
+**Verification runs in WebAssembly, and there is no fallback.** The page's SPV
+check calls into `core` itself, compiled for the browser
+([cmd/wasmverify](cmd/wasmverify)) and served from `/wasm/`. It used to be
+JavaScript, and that JavaScript was wrong: it hashed a preimage that had never
+gained the header's `Version` field, so every "verification FAILED" the page
+produced was the page's own bug, for months, because nothing compiles a
+template literal (§21). The bundle is a build artifact — `make wasm` — and a
+binary built without it answers 404, at which point the page says its verifier
+is unavailable. That is deliberate: a JavaScript fallback is the bug class
+being removed, not a safety net.
+
+Before verifying anything the page installs the node's scheduled upgrades from
+`/info`, because the scheduled header commitments are part of the
+proof-of-work preimage from their activation height and a verifier working
+from the wrong schedule computes the wrong hash. That is configuration
+arriving from the server, not a trust decision: a node that reports the wrong
+heights only makes its own headers fail to verify.
+
 ---
 
 ## 16. Clients
@@ -1571,6 +1791,18 @@ against a shared one it spends somebody else's coin. Given `-key`/`--key` they
 sign locally instead — by running `dnas spv wallet -key … send`, not by
 implementing the transaction encoding a second and third time.
 
+**Verification goes the same way, and did not used to.** `SPV verify` in both
+clients now runs `dnas spv verify` rather than recomputing the header hash
+locally. The local versions were wrong — both of them, along with the
+explorer's and the demo script's, all four having missed the `Version` field
+BIP9 signaling added — so each reported failure for valid proofs (§21). The
+asymmetry is the argument: a signer that is wrong produces a transaction a
+node rejects and you find out, while a verifier that is wrong tells you a
+payment is proven and you do not. What remains local in each client is
+cosmetic only, labelled as such: the TUI and the GUI still decode an nBits
+target to render a difficulty column, where a drift misdraws a number instead
+of asserting that money arrived.
+
 That delegation is the deliberate part. The canonical encoding is what
 signatures cover; a hand-written copy of it in a UI is how a client comes to
 produce signatures a node rejects, or to verify one incorrectly. This project has
@@ -1598,7 +1830,10 @@ govern — the proof-of-work targets and `lwmaWindow` in
 [core/prune.go](core/prune.go), the address-manager and DNS-seed bounds in
 [node/addrman.go](node/addrman.go) and [node/dnsseed.go](node/dnsseed.go),
 `MaxMultisigKeys` in
-[wallet/wallet.go](wallet/wallet.go), `ProtocolVersion` in
+[wallet/wallet.go](wallet/wallet.go), the script bounds in
+[core/script.go](core/script.go), the name bounds in
+[core/name.go](core/name.go), the package bounds in
+[core/package.go](core/package.go), `ProtocolVersion` in
 [node/protocol.go](node/protocol.go), the rate-limit defaults in
 [api/ratelimit.go](api/ratelimit.go), and the network ids in
 [core/network.go](core/network.go). Every node must agree on the consensus ones.
@@ -1657,6 +1892,17 @@ govern — the proof-of-work targets and `lwmaWindow` in
 | `dnsSeedThreshold`    | 8                | known addresses below which DNS seeds are consulted ([node/dnsseed.go](node/dnsseed.go)) |
 | `maxAddrsPerSeed`     | 32               | addresses one DNS seed may contribute per round |
 | `dnsSeedTimeout`      | 10 s             | bound on one round of seed resolution |
+| `MaxScriptBytes` / `MaxScriptOps` / `MaxScriptStack` | 1024 B / 256 / 64 | script VM bounds, checked before execution rather than during ([core/script.go](core/script.go)) |
+| `MaxScriptItemBytes` / `MaxScriptWitness` | 520 B / 32 | one stack item, and how many witness items a spender may supply |
+| `MaxScriptSigChecks`  | 20               | signature verifications one script may perform; `VerifyOps` charges a script this many twice, its worst case |
+| `MinNameLen` / `MaxNameLen` | 3 / 32     | name length bounds ([core/name.go](core/name.go)) |
+| `NameLeasePeriod`     | 100 000          | blocks one registration or renewal lasts |
+| `MaxNameLeases`       | 10               | lease periods buyable in one operation |
+| `MetadataHashLen`     | 64               | hex length of a non-fungible asset's sha256 commitment ([core/asset.go](core/asset.go)) |
+| `MaxPackageAncestors` / `MaxPackageDescendants` | 25 / 25 | unconfirmed dependants, **over other senders only** (policy, [core/package.go](core/package.go)) |
+| `MaxPackageBytes`     | 101 000          | total size of one dependency package (policy) |
+| `DefaultTrieCacheNodes` | 250 000        | retained account-trie nodes; a bounded cache, so a miss costs a rebuild and never a wrong root (policy, [core/statetrie.go](core/statetrie.go)) |
+| `wireMinBinaryVersion` | 2               | peer protocol version from which binary frames are sent ([node/wire.go](node/wire.go)) |
 
 ---
 
@@ -1706,11 +1952,16 @@ govern — the proof-of-work targets and `lwmaWindow` in
 | /health separate from /info, exiting non-zero in the CLI | A supervisor can tell "running" from "usable"; /info answers 200 while syncing, un-peered or stale | Another endpoint, and a readiness policy (stale-tip window) that is a judgement call |
 | Log levels + optional JSON, wrapping the stdlib logger | A node's output can be quietened, turned up, or counted | Two output formats to keep readable; call sites carry key/value fields |
 | Checksums client-side only | Avoids a consensus validation cascade | A malicious client can still burn its own coins |
-| HMAC-SHA512 HD, not SLIP-0010 | Small and self-contained | Not interoperable with standard wallets |
-| TUI as its own module | Keeps external deps' `go.sum` off the internal v0.0.0 modules | It can't import `wallet`; multisig/HD go through API helpers |
+| SLIP-0010 HD derivation | A mnemonic written down here restores in a standard wallet, which is what made a fresh address per invoice worth exporting | The pre-SLIP-0010 scheme still has to be derivable (`DeriveLegacy`) for keys made before the change |
+| TUI as its own module | Keeps external deps' `go.sum` off the internal v0.0.0 modules | It cannot import `core` or `wallet` at all — a workspace `use ../core` still resolves `wallet` through the proxy, because the module path looks like a sub-module and Go wants a `wallet/v0.0.0` tag. Multisig/HD go through API helpers, and verification and signing shell out to the binary |
 | Static (CGO-free) binaries | One binary runs on any matching kernel | lintian flags "statically-linked" (acknowledged via an overrides file) |
 | HTLC as a script-bound address (not a new UTXO type) | Reuses the multisig pattern; account model unchanged | The claim/refund timeout is enforced at apply-time, not in signature checks |
-| Compact filters *not* committed in the header | Non-inclusion without a consensus change | Trust rests on honest-node / multi-peer, not proof-of-work (BIP157/158 model) |
+| Compact filters committed in the header, behind an upgrade | Non-inclusion backed by proof of work instead of by the honesty of whoever answered | It forced the filter to be re-keyed off `PrevHash`+`MerkleRoot`: a filter keyed by its own block hash cannot be committed inside that hash. Below the activation height the old keying and the old trust assumption stand |
+| Both new header commitments gated inside the preimage, not bolted on | `filtercommit` and `historyroot` add a field to the proof-of-work preimage only from their activation height, so **genesis and every block below it hash exactly as before** — the first header change here that did not move genesis | Two nodes that disagree about the activation height disagree about block hashes, which is a louder failure than a soft-forked rule |
+| A script VM alongside the hand-rolled shapes, not replacing them | Spending conditions become a language without invalidating any funded multisig, HTLC or vault | A chain with `script` active has two ways to express a vault; retiring the old ones is a migration nobody has needed |
+| Names in the account map under a NUL-prefixed key | They are committed by the state root for free, so a resolution is provable and an unclaimed name is provably absent | The key space has to be kept apart from addresses in two independent ways (a reserved prefix AND a separate trie domain tag), and `CheckTxSanity` must reject addresses that look like one |
+| A non-fungible asset id derived under its own domain tag | Supply-one immutability is proven by construction: a mint cannot reproduce the id, so no registry lookup and no committed per-asset state is needed | An NFT and a fungible asset with the same issuer, ticker and nonce are different ids, which is correct and still surprising |
+| Package limits count foreign ancestors only | A sender's own nonce run is already bounded by `MaxPerSender`; counting it would silently lower that from 64 to 25 | Two different notions of "ancestor" in one file — the pricing set includes a sender's own run, the limit set does not |
 | SSE for the event stream, not WebSockets | One-directional, plain HTTP, zero deps, native `EventSource` | No client→server messaging over it (not needed) |
 | API auth as relay-style policy (token on writes only) | Locks spending/mining without breaking public reads or the explorer | Not per-user auth; a shared bearer token, reads unauthenticated |
 | Soft state persisted, chain authoritative | Warm restart (bans/peers/mempool survive) without trusting them | A hard kill can lose the latest soft state (re-synced from peers) |
@@ -1795,10 +2046,27 @@ govern — the proof-of-work targets and `lwmaWindow` in
   needing a deeper chain (pruning's 132-body floor, for instance) belongs in the
   unit suites, where the chain is built directly, rather than in `e2e/`.
 
+- **Performance benchmarks with a recorded baseline**
+  ([core/bench_test.go](core/bench_test.go), [scripts/bench.sh](scripts/bench.sh)).
+  There were already a few benchmarks here, but nothing ever compared two runs,
+  so a regression could only be caught by someone who happened to remember the
+  old number — which is how a state root that cost a full fold over the whole
+  ledger survived for months. Correctness tests use tiny chains, so a term that
+  grows with the LEDGER never shows up in one; the benchmarks are therefore
+  parameterised by ledger size, so a cost scaling with the wrong thing appears
+  as a shape rather than a number. `make bench-check` fails past a loose
+  threshold — loose because this runs on developer machines, where the signal
+  worth catching is "several times slower", not "ten percent slower".
+- **A guard against the client verifiers growing back.** `gui/test_dnas_gui.py`
+  asserts that `header_string`, `meets_target` and `sha` are *absent* from the
+  module. A comment saying "do not re-implement this" did not work — the file
+  carried one, describing the first time it had drifted, while it was drifting
+  again.
+
 `make test` runs the Go suites plus the GUI tests (skipped if PyQt6 is absent);
 `make test-race` runs the Go suites under the race detector; `make e2e` /
 `make e2e-docker` run the end-to-end suite, which the tagged build keeps out of
-the default runs.
+the default runs; `make bench` / `make bench-check` measure and compare.
 
 ---
 
@@ -1839,10 +2107,32 @@ it drivable by a script and testable at all.
 
 ## 20. Build and release
 
-- **[Makefile](Makefile)** is the entry point: `build`, `test`, `test-race`,
-  `vet`, `fmt`, `dist`, `deb`, `install`, `demo`.
+- **[Makefile](Makefile)** is the entry point: `build`, `wasm`, `test`,
+  `test-race`, `bench`, `vet`, `fmt`, `dist`, `deb`, `install`, `demo`.
+- **`make wasm`** compiles [cmd/wasmverify](cmd/wasmverify) for `js/wasm` into
+  `api/wasmdist/`, alongside the `wasm_exec.js` shim copied from the toolchain
+  that built it (the two must match). Both are gitignored build artifacts; the
+  directory is embedded with `//go:embed all:wasmdist` so a plain `go build`
+  still works without them, and `build` depends on `wasm` so a locally built
+  binary serves a working explorer.
 - **`scripts/build.sh`** cross-compiles static binaries (`CGO_ENABLED=0`,
   `-trimpath`) for `linux/amd64` + `linux/arm64` and tarballs them.
+- **Releases are reproducible**, and that is checked rather than asserted:
+  `make verify-reproducible` builds the whole release twice, into two
+  *different* directories, and compares every artifact. Two directories is the
+  point — the build path is the usual thing that leaks into a binary, and a
+  check that built twice in one place would not catch it. Getting there needed
+  `-buildid=` cleared (Go derives it from inputs that include toolchain paths),
+  every file in the tarball given the same mtime from `SOURCE_DATE_EPOCH`
+  (defaulting to the commit date, which is a property of the source and
+  therefore the same for everyone), sorted tar entries with numeric owners, and
+  `gzip -n`. Without reproducibility a published checksum attests only to
+  whatever the release machine happened to produce, which is exactly the thing
+  a reader cannot check.
+- **`SHA256SUMS`** covers every artifact, so one signature covers the release.
+  It is signed when `DNAS_SIGN_KEY` names a GPG key and the build says
+  **UNSIGNED** out loud when it does not — a checksum file anyone can rewrite
+  proves nothing about who built it.
 - **`scripts/build-deb.sh`** builds lintian-clean `.deb` packages (amd64/arm64)
   with `dpkg-deb --root-owner-group`.
 - The build **version is stamped** via `-ldflags "-X main.version=…"` and
@@ -1853,7 +2143,7 @@ it drivable by a script and testable at all.
   drops it) and neither does a source tarball, so both silently fell back to a
   hard-coded `0.1.0` or reported `dev`. Now the file is the source of truth and
   git only adds the detail it alone knows — which commit, and whether the tree
-  is dirty: `0.3.0`, `0.3.0+g1a2b3c4`, `0.3.0+g1a2b3c4.dirty`. `VERSION=1.2.3`
+  is dirty: `0.4.0`, `0.4.0+g1a2b3c4`, `0.4.0+g1a2b3c4.dirty`. `VERSION=1.2.3`
   in the environment overrides the lot, and [CHANGELOG.md](CHANGELOG.md) records
   what each release contains (a test fails if the two disagree).
 - **CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs two jobs on
@@ -1893,12 +2183,27 @@ See [scripts/README.md](scripts/README.md) for the script details.
 - The fee market is a burned, **per-byte** EIP-1559 base fee (consensus) plus
   rate-based eviction, replace-by-fee, and a per-byte relay-policy floor; its
   congestion signal is transaction count, not weight (§9).
-- Mempool admission measures a sender against its **confirmed** state (§10), so a
-  recipient cannot queue a spend of coin that is still unconfirmed — even though
-  `Select` would happily put both in one block. This is the account-model norm
-  (Ethereum behaves the same way), and it is what makes occupying the pool cost
-  real balance; lifting it properly means package/ancestor tracking, which is the
-  package-relay item in the ROADMAP. Chained spends still work within a *single
+- Mempool admission counts a sender's **confirmed** balance plus what the pool
+  is already paying it, so a recipient can spend coin that is still unconfirmed
+  (§10, [core/package.go](core/package.go)). The dependency is bounded by
+  ancestor, descendant and package-byte limits, which is what keeps it from
+  being a way to fill the pool with work that can never be mined. A parent is
+  priced by the best package it heads, so a child's fee can unstick it.
+
+  It is not free. Pricing every queued transaction by the best package it heads
+  costs a pass over the pool per block template: `BenchmarkSelect` on a
+  2,000-transaction pool went from ~28ms to ~35ms, after caching transaction
+  sizes (each `Size()` is a full canonical re-encode, and the naive version
+  read one per package member, which cost nearly 2x rather than 1.25x). At a
+  60-second block time that is not a problem; on a much larger pool it would
+  want per-sender suffix sums instead of a set per transaction.
+
+  Two honest limits. The ancestor and descendant counts apply to OTHER senders
+  only — a sender's own nonce run is already bounded by `MaxPerSender`, and
+  counting it would silently lower that from 64 to 25. And there is no package
+  SUBMISSION: a parent and child arrive separately and the parent must arrive
+  first, because accepting an orphan child and holding it for a parent that may
+  never come is a different feature with its own denial-of-service surface. Chained spends still work within a *single
   sender's* nonce run, and for a recipient whose funds have confirmed.
 - Transactions are announced by hash and pulled (`MsgTxInv`/`MsgGetTx`/`MsgTxs`,
   gated on the `txinv` capability), so a body crosses each link once rather than
@@ -1908,16 +2213,27 @@ See [scripts/README.md](scripts/README.md) for the script details.
   what it lacks. The short ids are keyed by the block hash, and a reconstruction
   that does not reproduce the committed merkle root falls back to a full fetch —
   so a collision costs a round trip, never a wrong chain.
-- Merkle SPV proves inclusion trustlessly; compact filters add non-inclusion but
-  under the honest-node/multi-peer assumption (they aren't header-committed).
+- Merkle SPV proves inclusion trustlessly. Compact filters add non-inclusion,
+  and from `UpgradeFilterCommit` that is backed by the chain's work rather than
+  by the honest-node/multi-peer assumption: the filter's header is a field in
+  the proof-of-work preimage. The two halves of that change are inseparable — a
+  BIP158 filter is keyed by the hash of the block it describes, so the filter's
+  commitment cannot also live inside that hash. Above the activation height the
+  key is derived from `PrevHash` and `MerkleRoot` instead, which are fixed
+  before the nonce search. Below it, filters are keyed and trusted as before.
   State proofs prove account membership AND absence against the header's trie
   state root ([core/trie.go](core/trie.go), [core/state.go](core/state.go)), so
   "this address holds nothing" is verifiable rather than taken on a node's word:
   a key's position in the trie is fixed by the key, so arriving at an empty slot
-  is itself the proof. What the trie does NOT yet buy is the other two things it
-  could: the state is still a resident map, so memory bounds the ledger, and the
-  root is rebuilt from the whole account set per call rather than updated
-  incrementally (ROADMAP §1).
+  is itself the proof. The root is now computed INCREMENTALLY against a
+  retained node store ([core/statetrie.go](core/statetrie.go)): an update
+  rewrites only the path from the accounts a block touched, so committing a
+  block and serving a state proof both cost the block rather than the ledger
+  (at 10,000 accounts, 157ms to 19µs and 157ms to 5µs respectively). The store
+  is a bounded cache and a miss falls back to the full rebuild, so correctness
+  never depends on it being warm. What the trie still does NOT buy is the last
+  thing it could: the state is a resident map, so memory bounds the ledger
+  (ROADMAP §1).
 - A coinbase transaction commits only its recipient and amount **until
   `UpgradeUniqueCoinbase` activates**, so before that height two blocks paying
   the same miner the same subsidy share a **txid** (Bitcoin's pre-BIP34 problem)
@@ -1972,19 +2288,37 @@ See [scripts/README.md](scripts/README.md) for the script details.
 - A message signature is domain-separated from a transaction signature, so
   neither can be replayed as the other — but it proves only control of a key at
   the moment it was made. There is no revocation and no expiry on one.
-- The TUI and the GUI sign by shelling out to the `dnas` binary rather than
-  re-implementing the canonical encoding. That keeps one copy of the
-  consensus-critical part; it costs a process launch per payment and a dependency
-  on the binary being on the machine.
+- No client re-implements a consensus rule, and this is the strongest statement
+  in this document because it was bought with a real defect. There were four
+  hand-written SPV verifiers outside `core` — the explorer's JavaScript, the
+  TUI's Go, the PyQt GUI's Python and `scripts/demo.sh`'s Python — and every
+  one of them computed a header preimage starting at `index`, having never been
+  given the `Version` field that BIP9 signaling added. All four were hashing
+  something that was never a header, and all four reported failure for valid
+  proofs. The GUI's test built its fixture from the GUI's own hashing, so the
+  two agreed with each other and both disagreed with the chain.
+
+  They are gone. The explorer loads `core` compiled to WebAssembly
+  ([cmd/wasmverify](cmd/wasmverify), served at `/wasm/`) and there is
+  deliberately NO JavaScript fallback — a page that says its verifier is
+  unavailable is strictly better than one quietly running a second
+  implementation. The TUI, the GUI and the demo script delegate to the `dnas`
+  binary, which is what the TUI and GUI already did for signing. The cost is a
+  process launch per operation, a dependency on the binary being present, and
+  `make wasm` in the build. The alternative cost was a verifier that said
+  "PROVEN" about arithmetic nobody had checked.
 - The asset registry describes what the chain issued, but a fast-synced node
   cannot recover the issuances below its snapshot: the balances are in the
   snapshot's state and the descriptions are not, and they only appear if the
   chain is walked from a full peer.
 - Dandelion++ hides a transaction's origin along the stem, but on a tiny devnet
   with few peers the anonymity set is small; it is a demonstration of the scheme.
-- Native assets are balances committed in the state root; fees are always paid in
-  coin (no per-asset fee market), and there is no scripting/contract layer — asset
-  logic is limited to issue and transfer.
+- Native assets are balances committed in the state root and fees are always
+  paid in coin (no per-asset fee market). Asset logic is issue, transfer, mint,
+  burn, and — under `nonfungible` — a supply-one token committing a digest.
+  There is a script VM for AUTHORIZATION (§5.6), but no contract layer: a
+  script decides whether a spend is allowed and cannot cause an effect of its
+  own, so "transfer this asset when X" is not expressible.
 - Regtest and testnet now have their **own genesis** and their own signing
   preimage (§5.1), so they are separate chains rather than the same chain behind a
   different pre-shared key. Still point each at its own data directory: a store
@@ -2025,6 +2359,39 @@ See [scripts/README.md](scripts/README.md) for the script details.
   client holding its own verified prefix (the SPV header cache) pays neither.
 - `/health`'s stale-tip window is a fixed multiple of `TargetBlockTime`, not
   something the operator can tune.
+
+- The script VM ([core/script.go](core/script.go)) decides one question — may
+  this transaction spend from this account — and can return only yes or no. It
+  has no loops, no backward jumps, no state beyond a bounded stack, and no view
+  of the chain beyond the height. It is not a contract system and cannot become
+  one without a different safety argument. The four hard-coded authorization
+  shapes also remain in consensus, so a chain with the upgrade active has two
+  ways to express a vault; retiring the old ones is a migration nobody has
+  needed yet. `OP_CHECKSENDERVERIFY` is reserved and rejected rather than
+  ignored, so a script using it cannot be funded and then found unspendable.
+
+- A name is a LEASE and an expired name is claimable by anyone. That is
+  deliberate — a namespace nobody can reclaim is squatted once and then dead —
+  but it means a payer who cached a resolution must re-check it, and
+  `dnas name resolve` distinguishes UNREGISTERED from LAPSED for exactly that
+  reason. There is no renewal reminder, no grace period, and no dispute
+  process, because there is no authority here to appeal to.
+
+- A non-fungible asset commits a sha256 of what it represents and nothing more.
+  Where those bytes live, and whether they are still there, is not something
+  consensus can speak to. The chain can say this token is unique, that its
+  supply is permanently one, and that it commits to this digest; it cannot say
+  the digest still resolves to anything.
+
+- The binary wire format saves about 18% on a batch of transactions, which is
+  less than the change sounds. The payload is still mostly hex strings, because
+  `Transaction` stores hashes and signatures as hex; storing them as bytes is a
+  change to core's types rather than to the wire, and is the next increment.
+
+- The browser verifier is a 4 MB WebAssembly binary that must be built
+  (`make wasm`) and is gitignored. A binary built without it serves no
+  verifier, and the explorer says so rather than falling back to JavaScript.
+  That is the intended behaviour: the fallback IS the bug class being removed.
 
 Each limitation is a chosen stopping point. [ROADMAP.md](ROADMAP.md) turns this
 list into a prioritized plan (on-disk state trie, second implementation, script

@@ -36,7 +36,7 @@ Prints the version a build stamps. The release number lives in the
 what only git can tell you — which commit, and whether the tree is dirty.
 
 ```sh
-./scripts/version.sh          # 0.3.0, 0.3.0+g1a2b3c4, or 0.3.0+g1a2b3c4.dirty
+./scripts/version.sh          # 0.4.0, 0.4.0+g1a2b3c4, or 0.4.0+g1a2b3c4.dirty
 VERSION=1.2.3 ./scripts/version.sh   # an override wins outright
 ```
 

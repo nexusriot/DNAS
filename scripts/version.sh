@@ -10,10 +10,10 @@
 # Git still contributes what only git knows: whether this build is the released
 # commit or something after it. So:
 #
-#   0.3.0                    a clean tree at the commit tagged for that release
-#   0.3.0+g1a2b3c4           built from some other commit
-#   0.3.0+g1a2b3c4.dirty     ...with uncommitted changes
-#   0.3.0                    no git at all (tarball, container)
+#   0.4.0                    a clean tree at the commit tagged for that release
+#   0.4.0+g1a2b3c4           built from some other commit
+#   0.4.0+g1a2b3c4.dirty     ...with uncommitted changes
+#   0.4.0                    no git at all (tarball, container)
 #
 # Override the whole thing with VERSION=1.2.3 in the environment.
 set -euo pipefail

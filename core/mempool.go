@@ -75,6 +75,11 @@ type Mempool struct {
 	// queued transaction is mineable into the NEXT block (see unmineableLocked).
 	// Bound alongside accounts; nil in an isolated pool.
 	chainHeight func() uint64
+	// creditedBy indexes recipient -> the queued transactions paying them, which
+	// is what lets a sender spend coin that is still in the pool (package relay,
+	// see package.go). Without the index, finding a transaction's ancestors
+	// would be a scan of the whole pool per admission.
+	creditedBy map[string][]string
 }
 
 // NewMempool returns an empty mempool with the default size limit and no fee
@@ -105,6 +110,7 @@ func NewMempoolWithLimits(max, maxBytes int, minRelayFee uint64) *Mempool {
 		txs:         map[string]Transaction{},
 		bySender:    map[string]map[uint64]string{},
 		sponsored:   map[string]uint64{},
+		creditedBy:  map[string][]string{},
 		max:         max,
 		maxBytes:    maxBytes,
 		minRelayFee: minRelayFee,
@@ -187,6 +193,7 @@ func (m *Mempool) insertLocked(h string, tx Transaction) {
 	if tx.IsSponsored() {
 		m.sponsored[tx.FeePayer] += tx.Fee
 	}
+	m.indexCreditsLocked(h, tx)
 }
 
 // deleteLocked removes the transaction stored under h from both indexes. m.mu held.
@@ -196,6 +203,7 @@ func (m *Mempool) deleteLocked(h string) {
 		return
 	}
 	delete(m.txs, h)
+	m.unindexCreditsLocked(h, tx)
 	if m.bytes -= tx.Size(); m.bytes < 0 {
 		m.bytes = 0 // defensive: the total is derived, never authoritative
 	}
@@ -271,7 +279,18 @@ func (m *Mempool) admissibleLocked(tx Transaction, replacing string) error {
 	// Affordability across the sender's whole queue. Overflow is impossible here:
 	// CheckTxSanity has already rejected an amount+fee that wraps, and the running
 	// total is compared against a balance every step, so it cannot exceed it.
+	// Confirmed balance PLUS what the pool is already paying this sender. The
+	// credit is what makes a chain of unconfirmed payments possible at all; the
+	// package limits below are what keep it from being a way to fill the pool
+	// with work that can never be mined (see package.go).
 	spendable := m.accounts.SpendableBalance(tx.From)
+	if credit := m.pendingCreditLocked(tx.From); credit > 0 {
+		if spendable+credit < spendable {
+			spendable = ^uint64(0) // saturate rather than wrap
+		} else {
+			spendable += credit
+		}
+	}
 	total := txCoinCost(tx)
 	for _, h := range queued {
 		if h == replacing {
@@ -283,7 +302,11 @@ func (m *Mempool) admissibleLocked(tx Transaction, replacing string) error {
 		}
 	}
 	if total > spendable {
-		return fmt.Errorf("sender cannot afford its queued transactions: %d needed, %d spendable", total, spendable)
+		return fmt.Errorf("sender cannot afford its queued transactions: %d needed, %d spendable "+
+			"(including %d pending from the mempool)", total, spendable, m.pendingCreditLocked(tx.From))
+	}
+	if _, err := m.packageLimitsLocked(tx); err != nil {
+		return err
 	}
 	return m.sponsorAffordableLocked(tx, replacing)
 }
@@ -788,6 +811,12 @@ func (m *Mempool) Select(bc *Blockchain, max int) []Transaction {
 	mineHeight := bc.Height() + 1 // the block we're selecting for
 	baseFee := bc.NextBaseFee()   // the next block's base fee (per byte); txs must cover it
 
+	// Package rates, so a parent is judged by the best package it heads rather
+	// than by its own fee: a low-tip transaction at the front of a sender's run
+	// is otherwise a wall in front of everything behind it, however well those
+	// pay (child-pays-for-parent; see package.go).
+	effective := m.effectiveRates()
+
 	// One pass over the pool: drop anything that can never go into this block,
 	// and cache what the loop below would otherwise recompute.
 	bySender := map[string][]selCandidate{}
@@ -804,8 +833,15 @@ func (m *Mempool) Select(bc *Blockchain, max int) []Transaction {
 		if CheckTxSanity(tx) != nil || checkTxAtHeight(tx, mineHeight) != nil {
 			continue
 		}
+		hash := tx.Hash()
+		// The package rate never drops below the transaction's own, so a
+		// transaction with no descendants is ordered exactly as before.
+		rate := txRate(tx)
+		if r, ok := effective[hash]; ok && r > rate {
+			rate = r
+		}
 		bySender[tx.From] = append(bySender[tx.From], selCandidate{
-			tx: tx, hash: tx.Hash(), size: size, ops: VerifyOps(tx), rate: txRate(tx),
+			tx: tx, hash: hash, size: size, ops: VerifyOps(tx), rate: rate,
 		})
 	}
 	if len(bySender) == 0 {
@@ -829,6 +865,13 @@ func (m *Mempool) Select(bc *Blockchain, max int) []Transaction {
 		assets  map[string]uint64
 	}
 	cache := map[string]sim{}
+	// Names claimed by transactions already selected into this block. Two
+	// registrations of the same name both look valid against the CHAIN, and the
+	// second fails when the block is applied — which does not just waste a slot,
+	// it invalidates the whole candidate, so the miner would hash and lose block
+	// after block while both sat in the queue. The same reasoning as the asset
+	// and balance simulation above.
+	claimedNames := map[string]bool{}
 	get := func(addr string) sim {
 		if s, ok := cache[addr]; ok {
 			return s
@@ -904,6 +947,9 @@ func (m *Mempool) Select(bc *Blockchain, max int) []Transaction {
 			if !affordable(c.tx) {
 				continue
 			}
+			if c.tx.IsNameOp() && claimedNames[c.tx.Name.Name] {
+				continue // another selected transaction already acts on this name
+			}
 			if best == nil || c.rate > best.rate || (c.rate == best.rate && c.hash < best.hash) {
 				best = c
 			}
@@ -913,12 +959,21 @@ func (m *Mempool) Select(bc *Blockchain, max int) []Transaction {
 		}
 		pick := best.tx
 
+		if pick.IsNameOp() {
+			claimedNames[pick.Name.Name] = true
+		}
+
 		s := get(pick.From)
 		s.nonce++
 		switch {
+		case pick.IsNameOp():
+			// A name operation moves no coin; it costs its fee like any other.
+			s.balance -= senderFee(pick)
+			cache[pick.From] = s
+			debitSponsor(pick)
 		case pick.IsIssue():
 			s.balance -= senderFee(pick)
-			s.assets[AssetID(pick.From, pick.Issue.Ticker, pick.Nonce)] += pick.Issue.Supply
+			s.assets[IssuedAssetID(pick.From, pick.Nonce, pick.Issue)] += pick.Issue.Supply
 			cache[pick.From] = s
 			debitSponsor(pick)
 		case pick.IsAssetTransfer():

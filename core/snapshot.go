@@ -111,10 +111,17 @@ func NewFromSnapshot(s Snapshot, headers []Header) (*Blockchain, error) {
 		filterBase:    s.Height + 1,
 		filterHeaders: nil,
 		sigCache:      NewValidationCache(DefaultValidationCacheSize),
+		nodes:         NewBoundedNodeStore(DefaultTrieCacheNodes),
+		history:       &MMR{},
 	}
 	// The snapshot's headers carry the votes that were cast below it, so a
 	// deployment that locked in before the snapshot stays locked in after it.
 	bc.refreshDeploymentsLocked()
+	// The accumulator is over block HASHES, which the header-only placeholders
+	// carry — so a fast-synced node rebuilds it in full even though it never saw
+	// the bodies. Ancestry stays provable below the snapshot; only the bodies,
+	// and what is derived from them, are missing.
+	bc.history = bc.historyUpTo(len(bc.blocks) - 1)
 	return bc, nil
 }
 

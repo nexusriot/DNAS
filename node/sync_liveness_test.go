@@ -1,7 +1,6 @@
 package node
 
 import (
-	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -212,10 +211,10 @@ func recordingPeer(t *testing.T) (*peer, chan Message) {
 	t.Helper()
 	pr, pw := io.Pipe()
 	t.Cleanup(func() { _ = pw.Close() })
-	p := &peer{enc: json.NewEncoder(pw), caps: map[string]bool{}}
+	p := &peer{enc: newMsgWriter(pw), caps: map[string]bool{}}
 	out := make(chan Message, 16)
 	go func() {
-		dec := json.NewDecoder(pr)
+		dec := newMsgReader(pr)
 		for {
 			var m Message
 			if err := dec.Decode(&m); err != nil {
