@@ -85,7 +85,7 @@ func TestMempoolAndConsensusAgreeOnInvalidTxs(t *testing.T) {
 // on.
 func TestSelectHonoursHeightActivatedDustLimit(t *testing.T) {
 	ClearUpgrades()
-	defer ClearUpgrades()
+	defer restoreUpgrades()
 
 	bc := NewBlockchain()
 	alice, _ := wallet.New()

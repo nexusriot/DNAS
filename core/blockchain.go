@@ -32,7 +32,7 @@ type Account struct {
 type Blockchain struct {
 	mu        sync.RWMutex
 	blocks    []Block
-	state     map[string]Account
+	state     StateDB
 	work      *big.Int      // cumulative proof-of-work of blocks
 	undos     [][]undoEntry // undos[i] reverts blocks[i]'s state changes (undos[0] is nil)
 	store     *blockStore   // append-only persistence (nil = in-memory only)
@@ -108,7 +108,7 @@ func GenesisBlock() Block {
 		Bits:      GenesisBits,
 	}
 	b.MerkleRoot = MerkleRoot(b.Transactions)
-	b.StateRoot = stateRoot(map[string]Account{}) // empty state at genesis
+	b.StateRoot = stateRoot(NewMemState()) // empty state at genesis
 	b.BaseFee = InitialBaseFee
 	b.Hash = b.ComputeHash()
 	return b
@@ -120,7 +120,7 @@ func NewBlockchain() *Blockchain {
 	bc := &Blockchain{
 		filterHeaders: FilterHeaderChain([]BlockFilter{BuildBlockFilter(genesis)}),
 		blocks:        []Block{genesis},
-		state:         map[string]Account{},
+		state:         NewMemState(),
 		work:          BlockWork(genesis.Bits),
 		undos:         [][]undoEntry{nil}, // genesis has no undo (it is never rolled back)
 		txIndex:       map[string]TxLoc{}, // genesis carries no transactions
@@ -163,7 +163,7 @@ func (bc *Blockchain) Blocks() []Block {
 func (bc *Blockchain) Account(addr string) Account {
 	bc.mu.RLock()
 	defer bc.mu.RUnlock()
-	return bc.state[addr]
+	return bc.state.Get(addr)
 }
 
 func (bc *Blockchain) Balance(addr string) uint64 { return bc.Account(addr).Balance }
@@ -173,7 +173,7 @@ func (bc *Blockchain) Balance(addr string) uint64 { return bc.Account(addr).Bala
 func (bc *Blockchain) SpendableBalance(addr string) uint64 {
 	bc.mu.RLock()
 	defer bc.mu.RUnlock()
-	bal := bc.state[addr].Balance
+	bal := bc.state.Get(addr).Balance
 	imm := immatureCoinbase(bc.blocks, uint64(len(bc.blocks)), addr)
 	if imm >= bal {
 		return 0
@@ -911,7 +911,7 @@ func medianTimePast(blocks []Block) int64 {
 // On any error the state is rolled back so it is left exactly as it was. It also
 // verifies the committed state root: the post-block account state must hash to
 // block.StateRoot.
-func applyBlock(state map[string]Account, blocks []Block, block Block, cache *ValidationCache, cc *commitCtx) ([]undoEntry, error) {
+func applyBlock(state StateDB, blocks []Block, block Block, cache *ValidationCache, cc *commitCtx) ([]undoEntry, error) {
 	if err := validateBlockStructure(blocks, block, cc); err != nil {
 		return nil, err
 	}
@@ -1135,7 +1135,7 @@ func checkTxAtHeight(tx Transaction, height uint64) error {
 // state-dependent checks (nonces, balances, coinbase amount) but NOT the
 // structural ones (see validateBlockStructure) — so it can also be run on a
 // state copy to compute a candidate block's resulting state root before mining.
-func applyTxsAndCoinbase(state map[string]Account, blocks []Block, block Block, cache *ValidationCache) ([]undoEntry, error) {
+func applyTxsAndCoinbase(state StateDB, blocks []Block, block Block, cache *ValidationCache) ([]undoEntry, error) {
 	height := block.Index
 	coinbase := block.Transactions[0]
 
@@ -1143,7 +1143,7 @@ func applyTxsAndCoinbase(state map[string]Account, blocks []Block, block Block, 
 	// (applied in reverse) restores the exact pre-block state.
 	var undo []undoEntry
 	set := func(addr string, acc Account) {
-		prevAcc, existed := state[addr]
+		prevAcc, existed := state.Lookup(addr)
 		undo = append(undo, undoEntry{addr: addr, prev: prevAcc, existed: existed})
 		// A released NAME is removed rather than stored empty, so a chain where
 		// a name was claimed and given up commits the same state root as one
@@ -1156,10 +1156,10 @@ func applyTxsAndCoinbase(state map[string]Account, blocks []Block, block Block, 
 		// has one. The undo log records existence either way, so a reorg
 		// restores whichever it was.
 		if isNameKey(addr) && acc.isEmpty() {
-			delete(state, addr)
+			state.Delete(addr)
 			return
 		}
-		state[addr] = acc
+		state.Put(addr, acc)
 	}
 	fail := func(err error) ([]undoEntry, error) {
 		applyUndo(state, undo)
@@ -1211,7 +1211,7 @@ func applyTxsAndCoinbase(state map[string]Account, blocks []Block, block Block, 
 		return fail(fmt.Errorf("bad coinbase amount: got %d, want %d (reward %d + tips %d)",
 			coinbase.Amount, reward+tips, reward, tips))
 	}
-	acc := state[coinbase.To]
+	acc := state.Get(coinbase.To)
 	if acc.Balance+coinbase.Amount < acc.Balance {
 		return fail(errors.New("coinbase amount overflow"))
 	}
@@ -1252,7 +1252,7 @@ func (bc *Blockchain) NextStateRoot(candidate Block) (string, error) {
 // applyTxTo validates a single signed transfer against state and applies it via
 // set (which records undo information). reserve is the sender's immature
 // coinbase amount that must remain unspent (coinbase maturity).
-func applyTxTo(state map[string]Account, tx Transaction, height, reserve, payerReserve uint64, set func(string, Account), cache *ValidationCache) error {
+func applyTxTo(state StateDB, tx Transaction, height, reserve, payerReserve uint64, set func(string, Account), cache *ValidationCache) error {
 	if err := cache.Verify(tx); err != nil {
 		return err
 	}
@@ -1279,7 +1279,7 @@ func applyTxTo(state map[string]Account, tx Transaction, height, reserve, payerR
 	if total < out {
 		return errors.New("amount+fee overflow")
 	}
-	sender := state[tx.From]
+	sender := state.Get(tx.From)
 	if tx.Nonce != sender.Nonce {
 		return fmt.Errorf("bad nonce for %s: got %d, want %d", tx.From, tx.Nonce, sender.Nonce)
 	}
@@ -1300,7 +1300,7 @@ func applyTxTo(state map[string]Account, tx Transaction, height, reserve, payerR
 	// Credit each recipient in turn, reading state back every time so a repeated
 	// recipient accumulates and a transaction paying its own sender nets correctly.
 	for _, o := range tx.outputs() {
-		recip := state[o.To]
+		recip := state.Get(o.To)
 		if recip.Balance+o.Amount < recip.Balance {
 			return errors.New("recipient balance overflow")
 		}
@@ -1313,7 +1313,7 @@ func applyTxTo(state map[string]Account, tx Transaction, height, reserve, payerR
 // applyIssue mints a new asset to the sender: it pays the coin fee (respecting
 // coinbase maturity via reserve) and is credited Supply units of a fresh asset
 // whose id is bound to (issuer, ticker, nonce).
-func applyIssue(state map[string]Account, tx Transaction, reserve, payerReserve uint64, set func(string, Account)) error {
+func applyIssue(state StateDB, tx Transaction, reserve, payerReserve uint64, set func(string, Account)) error {
 	if err := validTicker(tx.Issue.Ticker); err != nil {
 		return err
 	}
@@ -1328,7 +1328,7 @@ func applyIssue(state map[string]Account, tx Transaction, reserve, payerReserve 
 			return fmt.Errorf("a non-fungible asset has a supply of exactly 1, got %d", tx.Issue.Supply)
 		}
 	}
-	sender := state[tx.From]
+	sender := state.Get(tx.From)
 	if tx.Nonce != sender.Nonce {
 		return fmt.Errorf("bad nonce for %s: got %d, want %d", tx.From, tx.Nonce, sender.Nonce)
 	}
@@ -1354,7 +1354,7 @@ func applyIssue(state map[string]Account, tx Transaction, reserve, payerReserve 
 // been produced by that issuer (see asset.go). Nothing is looked up, so this is
 // a pure function of the transaction and the sender's account, exactly like
 // every other rule here.
-func applyAssetOp(state map[string]Account, tx Transaction, reserve, payerReserve uint64, set func(string, Account)) error {
+func applyAssetOp(state StateDB, tx Transaction, reserve, payerReserve uint64, set func(string, Account)) error {
 	op := tx.AssetOp
 	if err := op.Validate(); err != nil {
 		return err
@@ -1363,7 +1363,7 @@ func applyAssetOp(state map[string]Account, tx Transaction, reserve, payerReserv
 		return fmt.Errorf("%s did not issue asset %s (the stated ticker and nonce do not derive it)", tx.From, tx.AssetID)
 	}
 
-	sender := state[tx.From]
+	sender := state.Get(tx.From)
 	if tx.Nonce != sender.Nonce {
 		return fmt.Errorf("bad nonce for %s: got %d, want %d", tx.From, tx.Nonce, sender.Nonce)
 	}
@@ -1409,11 +1409,11 @@ func applyAssetOp(state map[string]Account, tx Transaction, reserve, payerReserv
 // recipient. The fee is paid in coin (respecting coinbase maturity); the asset
 // amount is checked against the sender's asset balance. Supplies are capped
 // (MaxAssetSupply) so the arithmetic can't overflow.
-func applyAssetTransfer(state map[string]Account, tx Transaction, reserve, payerReserve uint64, set func(string, Account)) error {
+func applyAssetTransfer(state StateDB, tx Transaction, reserve, payerReserve uint64, set func(string, Account)) error {
 	if tx.Amount == 0 {
 		return errors.New("empty asset transfer")
 	}
-	sender := state[tx.From]
+	sender := state.Get(tx.From)
 	if tx.Nonce != sender.Nonce {
 		return fmt.Errorf("bad nonce for %s: got %d, want %d", tx.From, tx.Nonce, sender.Nonce)
 	}
@@ -1436,7 +1436,7 @@ func applyAssetTransfer(state map[string]Account, tx Transaction, reserve, payer
 		return err
 	}
 
-	recip := state[tx.To] // reflects the sender update when From == To
+	recip := state.Get(tx.To) // reflects the sender update when From == To
 	recip = recip.withAssetDelta(tx.AssetID, int64(tx.Amount))
 	set(tx.To, recip)
 	return nil
@@ -1463,11 +1463,11 @@ func senderFee(tx Transaction) uint64 {
 // once — so a sponsorship is spent along with the transfer it paid for. Leaving
 // the nonce alone also means sponsoring does not disturb transactions the payer
 // has of its own in flight.
-func chargeSponsor(state map[string]Account, tx Transaction, reserve uint64, set func(string, Account)) error {
+func chargeSponsor(state StateDB, tx Transaction, reserve uint64, set func(string, Account)) error {
 	if !tx.IsSponsored() {
 		return nil
 	}
-	payer := state[tx.FeePayer]
+	payer := state.Get(tx.FeePayer)
 	need := tx.Fee + reserve
 	if need < tx.Fee {
 		return errors.New("fee+reserve overflow")
@@ -1483,24 +1483,21 @@ func chargeSponsor(state map[string]Account, tx Transaction, reserve uint64, set
 
 // applyUndo reverses a block's state changes by restoring recorded prior values
 // in reverse order.
-func applyUndo(state map[string]Account, undo []undoEntry) {
+func applyUndo(state StateDB, undo []undoEntry) {
 	for i := len(undo) - 1; i >= 0; i-- {
 		u := undo[i]
 		if u.existed {
-			state[u.addr] = u.prev
+			state.Put(u.addr, u.prev)
 		} else {
-			delete(state, u.addr)
+			state.Delete(u.addr)
 		}
 	}
 }
 
-func cloneState(s map[string]Account) map[string]Account {
-	c := make(map[string]Account, len(s))
-	for k, v := range s {
-		c[k] = v
-	}
-	return c
-}
+// cloneState is an independent copy of the ledger, for applying a block
+// speculatively (a candidate's state root, a reorg checked before it is
+// committed) without touching the live one.
+func cloneState(s StateDB) StateDB { return s.Snapshot() }
 
 // checkCommitments validates the two header commitments that are scheduled
 // rather than always-on: the compact-filter root and the history accumulator.
@@ -1596,7 +1593,12 @@ func (bc *Blockchain) ProveAncestry(height, asOf uint64) (AncestryProof, error) 
 	if !IsUpgradeActive(UpgradeHistoryRoot, asOf) {
 		return AncestryProof{}, errors.New("the history accumulator is not active at that height")
 	}
-	if !IsUpgradeActive(UpgradeHistoryRoot, height) {
+	if !inHistory(height) {
+		// Genesis is not a leaf (see inHistory): it is the chain's axiom, already
+		// known to every node, so there is nothing for a proof to establish.
+		if height == 0 {
+			return AncestryProof{}, errors.New("genesis is not in the accumulator: every node has it already")
+		}
 		return AncestryProof{}, errors.New("that block is below the accumulator's activation height")
 	}
 	// The range the header at asOf commits covers the activated blocks strictly
@@ -1606,7 +1608,7 @@ func (bc *Blockchain) ProveAncestry(height, asOf uint64) (AncestryProof, error) 
 	found := false
 	for i := uint64(0); i < asOf; i++ {
 		b := bc.blocks[i]
-		if !IsUpgradeActive(UpgradeHistoryRoot, b.Index) {
+		if !inHistory(b.Index) {
 			continue
 		}
 		if b.Index == height {

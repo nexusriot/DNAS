@@ -45,6 +45,8 @@ type replCmd struct {
 var replCommands = []replCmd{
 	{"send", "send <to> <amount> [fee=A] [expiry=N|+N] [lock=N|+N] [memo=TEXT]",
 		"pay from this node's wallet", replSend},
+	{"sendmany", "sendmany <addr:amount> [addr:amount ...] [fee=A] [memo=TEXT]",
+		"pay several addresses in one transaction", replSendMany},
 	{"balance", "balance [address]", "coin, assets and nonce of an account", replBalance},
 	{"address", "address", "this node's wallet address", replAddress},
 	{"info", "info", "height, difficulty, tip, mempool, peers", replInfo},
@@ -254,6 +256,64 @@ func replSend(n *node.Node, out io.Writer, args []string) {
 	}
 	fmt.Fprintf(out, "submitted %s  %s to %s (fee %s, nonce %d)\n",
 		short(tx.Hash()), core.FormatAmount(amount), short(pos[0]), core.FormatAmount(fee), tx.Nonce)
+	if lock != 0 || expiry != 0 {
+		fmt.Fprintf(out, "  valid in heights %s\n", describeWindow(lock, expiry))
+	}
+}
+
+// replSendMany pays several addresses from one transaction.
+//
+// It is the console's half of what `dnas spv wallet sendmany` already does
+// self-custodially: one fee, one nonce and one signature instead of N of each,
+// which is the whole reason multi-output transfers are in consensus. The
+// console had only the single-recipient form, so an operator paying a handful
+// of addresses from the node's own wallet paid several times over for it.
+func replSendMany(n *node.Node, out io.Writer, args []string) {
+	pos, opts := parseConsoleOpts(args)
+	if len(pos) == 0 {
+		fmt.Fprintln(out, "usage: sendmany <addr:amount> [addr:amount ...] [fee=A] [memo=TEXT]")
+		return
+	}
+	outputs, total, err := parseOutputs(pos)
+	if err != nil {
+		fmt.Fprintln(out, err)
+		return
+	}
+	fee, err := opts.amount("fee")
+	if err != nil {
+		fmt.Fprintln(out, "bad fee:", err)
+		return
+	}
+	tip := n.Chain().Height()
+	expiry, err := opts.height("expiry", tip)
+	if err != nil {
+		fmt.Fprintln(out, err)
+		return
+	}
+	lock, err := opts.height("lock", tip)
+	if err != nil {
+		fmt.Fprintln(out, err)
+		return
+	}
+
+	w := n.Wallet()
+	tx := core.Transaction{
+		From: w.Address(), Outputs: outputs, Fee: fee,
+		Nonce: n.NextNonce(w.Address()), Expiry: expiry, LockUntil: lock, Memo: opts["memo"],
+	}
+	if err := tx.Sign(w); err != nil {
+		fmt.Fprintln(out, err)
+		return
+	}
+	if err := n.SubmitTx(tx); err != nil {
+		fmt.Fprintln(out, "rejected:", err)
+		return
+	}
+	fmt.Fprintf(out, "submitted %s  %s to %d recipients (fee %s, nonce %d)\n",
+		short(tx.Hash()), core.FormatAmount(total), len(outputs), core.FormatAmount(fee), tx.Nonce)
+	for _, o := range outputs {
+		fmt.Fprintf(out, "  %s  %s\n", core.FormatAmount(o.Amount), short(o.To))
+	}
 	if lock != 0 || expiry != 0 {
 		fmt.Fprintf(out, "  valid in heights %s\n", describeWindow(lock, expiry))
 	}

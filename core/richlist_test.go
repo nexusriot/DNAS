@@ -109,7 +109,7 @@ func TestRichListLimitIsClamped(t *testing.T) {
 func TestRichListSkipsEmptyAccounts(t *testing.T) {
 	bc, _ := richChain(t)
 	bc.mu.Lock()
-	bc.state["dnasempty"] = Account{Balance: 0, Nonce: 4}
+	bc.state.Put("dnasempty", Account{Balance: 0, Nonce: 4})
 	bc.mu.Unlock()
 
 	for _, e := range bc.RichList(MaxRichListLimit).Entries {
@@ -128,7 +128,7 @@ func TestRichListIsDeterministicOnTies(t *testing.T) {
 	bc := NewBlockchain()
 	bc.mu.Lock()
 	for _, a := range []string{"dnasa", "dnasb", "dnasc", "dnasd", "dnase"} {
-		bc.state[a] = Account{Balance: 1000}
+		bc.state.Put(a, Account{Balance: 1000})
 	}
 	bc.mu.Unlock()
 

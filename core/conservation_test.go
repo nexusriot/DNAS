@@ -18,10 +18,10 @@ func TestConservationRejectsInflation(t *testing.T) {
 	state := map[string]Account{"a": {Balance: 100}}
 	undo := []undoEntry{{addr: "a"}}
 
-	if err := checkConservation(state, undo, coinbaseOnly, 100, 0); err != nil {
+	if err := checkConservation(memStateOf(state), undo, coinbaseOnly, 100, 0); err != nil {
 		t.Fatalf("an honest block was rejected: %v", err)
 	}
-	err := checkConservation(state, undo, coinbaseOnly, 50, 0)
+	err := checkConservation(memStateOf(state), undo, coinbaseOnly, 50, 0)
 	if err == nil {
 		t.Fatal("a block that created 100 coin from a 50 subsidy was accepted")
 	}
@@ -38,10 +38,10 @@ func TestConservationRejectsUnaccountedBurn(t *testing.T) {
 	undo := []undoEntry{{addr: "a", prev: Account{Balance: 100}, existed: true}}
 
 	// Lost 90: legal only if the subsidy was 0 and the block burned exactly 90.
-	if err := checkConservation(state, undo, coinbaseOnly, 0, 90); err != nil {
+	if err := checkConservation(memStateOf(state), undo, coinbaseOnly, 0, 90); err != nil {
 		t.Fatalf("an honest burn was rejected: %v", err)
 	}
-	if err := checkConservation(state, undo, coinbaseOnly, 0, 40); err == nil {
+	if err := checkConservation(memStateOf(state), undo, coinbaseOnly, 0, 40); err == nil {
 		t.Fatal("a block that destroyed 90 coin while burning 40 was accepted")
 	}
 }
@@ -56,7 +56,7 @@ func TestConservationUsesPreBlockValuePerAccount(t *testing.T) {
 		{addr: "a"}, // created by the block: 0 before
 		{addr: "a", prev: Account{Balance: 30}, existed: true}, // touched again mid-block
 	}
-	if err := checkConservation(state, undo, coinbaseOnly, 50, 0); err != nil {
+	if err := checkConservation(memStateOf(state), undo, coinbaseOnly, 50, 0); err != nil {
 		t.Fatalf("delta measured from the wrong undo entry: %v", err)
 	}
 }
@@ -68,7 +68,7 @@ func TestConservationRejectsAssetMintedWithoutIssuance(t *testing.T) {
 	state := map[string]Account{"a": {Assets: map[string]uint64{"tokdead": 5}}}
 	undo := []undoEntry{{addr: "a"}}
 
-	err := checkConservation(state, undo, coinbaseOnly, 0, 0)
+	err := checkConservation(memStateOf(state), undo, coinbaseOnly, 0, 0)
 	if err == nil {
 		t.Fatal("5 units of an asset appeared with no issuance and the block was accepted")
 	}
@@ -86,12 +86,12 @@ func TestConservationChecksIssuedAmount(t *testing.T) {
 
 	good := map[string]Account{"issuer": {Assets: map[string]uint64{id: 10}}}
 	undo := []undoEntry{{addr: "issuer"}}
-	if err := checkConservation(good, undo, txs, 0, 0); err != nil {
+	if err := checkConservation(memStateOf(good), undo, txs, 0, 0); err != nil {
 		t.Fatalf("a correct issuance was rejected: %v", err)
 	}
 
 	bad := map[string]Account{"issuer": {Assets: map[string]uint64{id: 1000}}}
-	if err := checkConservation(bad, undo, txs, 0, 0); err == nil {
+	if err := checkConservation(memStateOf(bad), undo, txs, 0, 0); err == nil {
 		t.Fatal("an issuance that credited 1000 for a stated supply of 10 was accepted")
 	}
 }
@@ -107,7 +107,7 @@ func TestConservationAllowsAssetTransfer(t *testing.T) {
 		{addr: "a", prev: Account{Assets: map[string]uint64{"tokbeef": 1000}}, existed: true},
 		{addr: "b"},
 	}
-	if err := checkConservation(state, undo, coinbaseOnly, 0, 0); err != nil {
+	if err := checkConservation(memStateOf(state), undo, coinbaseOnly, 0, 0); err != nil {
 		t.Fatalf("a plain asset transfer was rejected: %v", err)
 	}
 }

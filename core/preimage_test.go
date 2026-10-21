@@ -40,6 +40,9 @@ func preimageCases() []Header {
 }
 
 func TestHeaderPreimageMatchesTheFormattedReference(t *testing.T) {
+	// referencePreimage is deliberately the BASE format, so this test is a
+	// statement about the schedule in which no header commitment is active.
+	withoutUpgrade(t, UpgradeFilterCommit, UpgradeHistoryRoot)
 	for i, h := range preimageCases() {
 		want := referencePreimage(h)
 		if got := h.headerString(); got != want {

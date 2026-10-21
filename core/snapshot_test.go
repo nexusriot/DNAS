@@ -75,7 +75,7 @@ func TestSnapshotBootstrap(t *testing.T) {
 
 	// A tampered snapshot (inflated balance) must fail verification.
 	bad := snap
-	bad.Accounts = cloneState(snap.Accounts)
+	bad.Accounts = stateAsMap(cloneState(memStateOf(snap.Accounts)))
 	acc := bad.Accounts[bob.Address()]
 	acc.Balance += Coin
 	bad.Accounts[bob.Address()] = acc

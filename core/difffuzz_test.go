@@ -202,7 +202,7 @@ func FuzzStateRootAgainstOracle(f *testing.F) {
 			}
 			state[w.Address()] = acc
 		}
-		if got, want := stateRoot(state), oracleStateRoot(state); got != want {
+		if got, want := stateRoot(memStateOf(state)), oracleStateRoot(state); got != want {
 			t.Fatalf("state root disagrees for %d accounts: %s vs oracle %s", accounts, got, want)
 		}
 	})
@@ -345,16 +345,17 @@ func FuzzUndoMatchesAFullRebuild(f *testing.F) {
 		// was, apart from what the winning branch itself changed.
 		rebuilt := rival.stateCopy()
 		got := bc.stateCopy()
-		if len(got) != len(rebuilt) {
-			t.Fatalf("after the reorg the state holds %d accounts, a rebuild holds %d", len(got), len(rebuilt))
+		if got.Len() != rebuilt.Len() {
+			t.Fatalf("after the reorg the state holds %d accounts, a rebuild holds %d", got.Len(), rebuilt.Len())
 		}
-		for addr, acc := range rebuilt {
-			mine := got[addr]
+		rebuilt.Range(func(addr string, acc Account) bool {
+			mine := got.Get(addr)
 			if mine.Balance != acc.Balance || mine.Nonce != acc.Nonce {
 				t.Fatalf("%s: after the reorg balance=%d nonce=%d, a rebuild gives balance=%d nonce=%d",
 					addr, mine.Balance, mine.Nonce, acc.Balance, acc.Nonce)
 			}
-		}
+			return true
+		})
 		if bc.Tip().StateRoot != rival.Tip().StateRoot {
 			t.Fatalf("state root after the reorg is %s, a rebuild gives %s",
 				bc.Tip().StateRoot, rival.Tip().StateRoot)

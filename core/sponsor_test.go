@@ -12,7 +12,7 @@ import (
 func withUpgrade(t *testing.T, name string) {
 	t.Helper()
 	SetUpgradeHeight(name, 0)
-	t.Cleanup(ClearUpgrades)
+	t.Cleanup(restoreUpgrades)
 }
 
 // sponsoredTx builds a transfer whose fee is charged to sponsor: the sender
@@ -49,18 +49,18 @@ func TestSponsoredSenderNeedsNoCoinForTheFee(t *testing.T) {
 	matureCoinbase(t, bc)
 	// The sender is funded with exactly what it will pay out and not one unit more,
 	// so it could not cover any fee itself.
-	fund := signedTx(t, sponsor, sender.Address(), 500, testFee, 0)
+	fund := signedTx(t, sponsor, sender.Address(), 2*DustThreshold, testFee, 0)
 	mustAdd(t, bc, mineOn(t, bc, sponsor.Address(), []Transaction{fund}))
 
 	sponsorBefore := bc.Balance(sponsor.Address())
-	tx := sponsoredTx(t, sender, sponsor, recipient.Address(), 500, testFee, 0)
+	tx := sponsoredTx(t, sender, sponsor, recipient.Address(), 2*DustThreshold, testFee, 0)
 	mustAdd(t, bc, mineOn(t, bc, sponsor.Address(), []Transaction{tx}))
 
 	if got := bc.Balance(sender.Address()); got != 0 {
 		t.Fatalf("sender balance = %d, want 0 (it paid out everything it had)", got)
 	}
-	if got := bc.Balance(recipient.Address()); got != 500 {
-		t.Fatalf("recipient balance = %d, want 500", got)
+	if got := bc.Balance(recipient.Address()); got != 2*DustThreshold {
+		t.Fatalf("recipient balance = %d, want %d", got, 2*DustThreshold)
 	}
 	// The sponsor paid the fee, and was paid the block's tip back as its miner —
 	// so it is out exactly the burned base-fee portion.
@@ -76,6 +76,7 @@ func TestSponsoredSenderNeedsNoCoinForTheFee(t *testing.T) {
 }
 
 func TestSponsorshipInactiveBeforeUpgrade(t *testing.T) {
+	withoutUpgrade(t, UpgradeFeeSponsor)
 	bc := NewBlockchain()
 	sponsor, _ := wallet.New()
 	sender, _ := wallet.New()
@@ -84,7 +85,7 @@ func TestSponsorshipInactiveBeforeUpgrade(t *testing.T) {
 	fund := signedTx(t, sponsor, sender.Address(), 10_000, testFee, 0)
 	mustAdd(t, bc, mineOn(t, bc, sponsor.Address(), []Transaction{fund}))
 
-	tx := sponsoredTx(t, sender, sponsor, sponsor.Address(), 100, testFee, 0)
+	tx := sponsoredTx(t, sender, sponsor, sponsor.Address(), 2*DustThreshold, testFee, 0)
 	err := bc.AddBlock(mineOn(t, bc, sponsor.Address(), []Transaction{tx}))
 	if err == nil {
 		t.Fatal("a sponsored transaction was accepted before the upgrade activated")
@@ -99,7 +100,7 @@ func TestSponsorSignatureIsBoundToTheTransaction(t *testing.T) {
 	sponsor, _ := wallet.New()
 	sender, _ := wallet.New()
 	victim, _ := wallet.New()
-	tx := sponsoredTx(t, sender, sponsor, victim.Address(), 100, 10, 0)
+	tx := sponsoredTx(t, sender, sponsor, victim.Address(), 2*DustThreshold, 10, 0)
 
 	// Lifting the sponsorship onto a different transfer must not verify: the
 	// sponsor signed the amount, the recipient and the nonce too.
@@ -143,7 +144,7 @@ func TestSponsorMustAffordTheFee(t *testing.T) {
 	fund := signedTx(t, miner, sender.Address(), 10_000, testFee, 0)
 	mustAdd(t, bc, mineOn(t, bc, miner.Address(), []Transaction{fund}))
 
-	tx := sponsoredTx(t, sender, broke, miner.Address(), 100, testFee, 0)
+	tx := sponsoredTx(t, sender, broke, miner.Address(), 2*DustThreshold, testFee, 0)
 	err := bc.AddBlock(mineOn(t, bc, miner.Address(), []Transaction{tx}))
 	if err == nil {
 		t.Fatal("a sponsor with no coin covered a fee")
@@ -205,7 +206,7 @@ func TestSponsoredTransferConservesSupply(t *testing.T) {
 	fund := signedTx(t, sponsor, sender.Address(), 5_000, testFee, 0)
 	mustAdd(t, bc, mineOn(t, bc, sponsor.Address(), []Transaction{fund}))
 
-	tx := sponsoredTx(t, sender, sponsor, recipient.Address(), 500, testFee, 0)
+	tx := sponsoredTx(t, sender, sponsor, recipient.Address(), 2*DustThreshold, testFee, 0)
 	mustAdd(t, bc, mineOn(t, bc, sponsor.Address(), []Transaction{tx}))
 
 	if s := bc.Supply(); !s.Consistent {

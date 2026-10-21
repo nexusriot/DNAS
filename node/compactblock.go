@@ -276,19 +276,13 @@ func (n *Node) onBlockTxn(p *peer, hash string, txs []core.Transaction) {
 // honest short-id collision or a lying peer — and is answered by asking for the
 // block in full, which is always correct if slower.
 func (n *Node) completeBlock(p *peer, h core.Header, txs []core.Transaction) {
-	b := core.Block{
-		Version:      h.Version,
-		Index:        h.Index,
-		Timestamp:    h.Timestamp,
-		Transactions: txs,
-		PrevHash:     h.PrevHash,
-		MerkleRoot:   h.MerkleRoot,
-		StateRoot:    h.StateRoot,
-		BaseFee:      h.BaseFee,
-		Bits:         h.Bits,
-		Nonce:        h.Nonce,
-		Hash:         h.Hash,
-	}
+	// core owns the Header -> Block widening. Spelling it out here is how this
+	// path came to drop the scheduled header commitments, which made every
+	// compactly-relayed block fail validation ("wrong filter root") on any chain
+	// running them — and silently, because the merkle root is over transactions
+	// alone, so reconstruction still looked like it had succeeded.
+	b := core.BlockFromHeader(h)
+	b.Transactions = txs
 	if core.MerkleRoot(b.Transactions) != h.MerkleRoot {
 		Debugf("compact block did not reconstruct; fetching in full",
 			"hash", short(h.Hash), "height", h.Index)

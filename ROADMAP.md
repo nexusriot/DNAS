@@ -27,6 +27,19 @@ a **proof**, the **peer wire is binary**, the mempool does **package relay and
 child-pays-for-parent**, and the state root is computed **incrementally**
 rather than rebuilt over the whole ledger per block.
 
+Since then: the consensus rules are exercised IN COMBINATION rather than one at
+a time (`make test-upgrades`), which is how six real defects surfaced at once —
+`checkedaddresses` forbidding every asset and name operation, the header
+commitments breaking pruning, snapshot bootstrap and compact relay, and the
+history accumulator making every reorg fail on a chain that activated it at
+height 0. Block **selection is checked against application** by an invariant
+fuzz target rather than by hand; a running node can **re-derive its own ledger**
+(`-audit N`, `GET /audit`); peer frames are capped **per message type** instead
+of by one 64 MiB ceiling; compact filters are served **over the wire** so a
+light client can be a peer; and the consensus application path reads and writes
+through a **`StateDB`** rather than indexing a map, with the commitment cache
+able to live in a fixed-size file.
+
 One structural thing changed about how the clients work, and it is worth
 stating here because it was a real defect rather than a feature: every SPV
 verifier outside `core` — the explorer's JavaScript, the TUI's Go, the GUI's
@@ -72,13 +85,25 @@ sections matter most for "toy → real".
   linear. The node store is a bounded CACHE — a miss falls back to the full
   rebuild, so correctness never depends on it being warm.
 
-  **What remains is the memory bound**, which is the hard part and the reason
-  this item is still open: `applyBlock` reads and writes a resident
-  `map[string]Account`, so the ledger must fit in RAM. Threading a state
-  accessor through the application path (~10 functions, ~44 sites) plus a
-  disk-backed `NodeStore` is the remaining work. It is a careful refactor of
-  the consensus core and is deliberately not bundled with the commitment
-  change.
+  **The memory bound is now half lifted.** The application path no longer
+  indexes a map: every read and write goes through `StateDB`
+  ([core/statedb.go](core/statedb.go)), so where the ledger lives is a choice
+  rather than an assumption, and `Range` yields in address order so a future
+  backend cannot reintroduce an order-dependence into a state root. The
+  commitment cache can also live on disk
+  ([core/disknodes.go](core/disknodes.go), `-triecache N`): a fixed-size
+  open-addressed file with NO resident index — a node's slot comes from its own
+  hash — so it costs O(1) memory, survives a restart, and evicts by collision.
+  All of that is safe for one reason, which is the same reason the cache was
+  safe before: a miss costs a rebuild, never a wrong answer.
+
+  **What remains is a disk-backed `StateDB`.** `memState` is still the only
+  implementation, so the ACCOUNTS are still resident even though nothing in
+  `applyBlock` requires them to be. The seam is there; what has to be written
+  against it is a durable key/value store with the same semantics (absent reads
+  as the zero Account, `Range` in address order, `Snapshot` independent), plus a
+  decision about what `Snapshot` costs when a copy is no longer a map copy —
+  which is the part that wants its own design rather than being bolted on.
 - ~~**`[M]` Prune the STORE, not just memory.**~~ **Done.** `-prune` bounded a
   node's resident size while the file kept every original record, so a pruning
   node still paid full disk for history it had discarded and still replayed all
@@ -269,15 +294,35 @@ sections matter most for "toy → real".
   throughput, and a range that times out is not re-requested from a *specific*
   better peer. A proper scheduler (per-peer speed, adaptive window, re-assignment)
   would make catch-up on a long chain predictable rather than merely unstuck.
-- **`[S]` Bound P2P and HTTP request sizes.** A peer frame may be up to 64 MiB
-  (`maxFrame`, [node/secure.go](node/secure.go)) and the API decodes request bodies
-  with no cap, so one message can force a large allocation before anything
-  validates it. Per-message-type limits plus an `http.MaxBytesReader` on the write
-  endpoints would price that properly. The `MsgGetChain` fallback is the same shape
-  of problem: it serializes the whole chain (throttled per peer, but unbounded in
-  size) where a ranged request would do. The HTTP *read* side is now bounded —
-  `/chain`, `/headers`, `/cfilters` and `/cfheaders` are paged — so what remains
-  is inbound bodies and the P2P frames.
+- ~~**`[S]` Bound P2P and HTTP request sizes.**~~ **Done.** A peer frame could be
+  up to 64 MiB whatever it carried, so a peer could announce a 64 MiB `ping` and
+  the reader would allocate 64 MiB to find out it was a ping — nothing is
+  verified before the length is believed, which makes it five bytes to send and
+  the whole claim to receive. A flat ceiling could not be lowered to fix it,
+  because the legitimate messages differ by orders of magnitude.
+
+  Caps are now per message type ([node/framecap.go](node/framecap.go)), derived
+  from consensus limits where a block is involved so they cannot drift from what
+  a valid block is. The binary wire format puts the type first, so it is peeked
+  off the buffered reader and the cap applies BEFORE the allocation; a JSON
+  frame has no fixed layout and is checked after decoding, which refuses it just
+  as surely. An unknown type gets the small cap, so a future message must opt
+  into room rather than inherit the ceiling.
+
+  The HTTP side was already bounded (`http.MaxBytesReader` on bodies, paging on
+  the bulk reads). What remains is `MsgGetChain`, which still serializes the
+  whole chain where a ranged request would do — throttled per peer, and now
+  capped, but still the one message with no natural size.
+
+- **`[M]` A peer-protocol light client.** Compact filters and the filter-header
+  chain are now served over the WIRE as well as over HTTP
+  ([node/cfilterwire.go](node/cfilterwire.go), gated on the `cf` capability), so
+  a light client can be one peer among several instead of an HTTP client of one
+  node — which is what the eclipse argument behind "a non-match proves
+  non-inclusion" assumes. A node that cannot answer says where its filters start
+  rather than answering with less, because an empty filter is a proof of
+  ABSENCE. What remains is the CLIENT: `dnas spv` still speaks HTTP, so nothing
+  in this repo yet samples several peers and compares them.
 
 ## 3. Programmability
 
@@ -512,6 +557,24 @@ sections matter most for "toy → real".
   not exported, since a renamed series turns a panel into a flat line and an
   alert into one that can never fire — both of which look exactly like nothing
   being wrong.
+- ~~**`[S]` Let a running node check its own ledger.**~~ **Done.** Every block a
+  node accepted was validated on the way in, which is not the same as the
+  invariants still holding now — and the gap is where the interesting failures
+  live, because the per-block state check compares a root the incremental
+  committer produced against the root in the header, so a committer and a header
+  wrong in the same way agree.
+
+  `-audit N` re-derives the whole ledger every N blocks and `GET /audit` does it
+  on demand ([core/audit.go](core/audit.go), [node/audit.go](node/audit.go)): a
+  trie rebuilt from the account map, sharing no cache and no cursor with the
+  path that produced the header, plus the supply identity. Off by default
+  because it is O(ledger) and holds the chain's read lock. A failure is loud,
+  carries the remedy, fails `/health`, and is counted MONOTONICALLY — a node
+  that has diverged once is not healthy because a later audit happened to pass,
+  since the audit only inspects the tip and the damage may sit below it. The
+  endpoint is token-guarded despite being a read: it is strictly more expensive
+  than `/snapshot`, and the flat per-client bucket does not price that.
+
 - **`[M]` JSON-RPC 2.0 interface.** The HTTP API is REST; a bitcoind-style JSON-RPC
   surface eases integration with existing tooling and block explorers.
 - **`[S]` Wider release matrix.** *The unit and the RPM are done; darwin/windows
@@ -618,6 +681,33 @@ sections matter most for "toy → real".
   would not catch it. Releases carry a `SHA256SUMS`, signed when
   `DNAS_SIGN_KEY` is set and reported as UNSIGNED when it is not — a checksum
   file anyone can rewrite proves nothing about who built the release.
+
+- ~~**`[M]` Exercise the consensus rules IN COMBINATION.**~~ **Done.** Every
+  upgrade was tested on its own: a test switched on the one it was about and
+  left the rest unscheduled. That shows a rule does what it says and cannot show
+  one that is correct alone and wrong beside another — which is how
+  `checkedaddresses` came to forbid every asset and name operation, how the
+  header commitments came to break pruning, snapshot bootstrap and compact
+  relay, and how the history accumulator came to make every reorg fail on a
+  chain that activated it at height 0.
+
+  `make test-upgrades` (`DNAS_TEST_UPGRADES=all`, [core/main_test.go](core/main_test.go))
+  runs the whole suite a second time with everything in force, and CI runs both.
+  The two header commitments activate at height 1 rather than 0, because genesis
+  is a constant whose hash is the network's identity and a commitment active at
+  height 0 is inside its preimage. Tests whose SUBJECT is pre-activation
+  behaviour pin their own schedule instead of being skipped, so they still mean
+  something under both.
+
+- ~~**`[S]` Check that selection agrees with application.**~~ **Done.**
+  `Mempool.Select` re-implements, against a simulated ledger, every rule
+  `applyTxsAndCoinbase` applies for real, and the two were mirrored by hand. A
+  transaction Select picks and consensus refuses does not waste a slot, it
+  invalidates the whole candidate — and the node then drops a valid transaction
+  to get moving again, so the symptom is a user's payment quietly disappearing.
+  [core/selectapply_fuzz_test.go](core/selectapply_fuzz_test.go) asserts the
+  invariant instead: whatever the pool holds, what Select returns must apply,
+  across one block and across several. It found two gaps on its first run.
 
 - **`[M]` Long-running adversarial testnet.** The in-process `simnet` harness proves
   convergence in seconds; a real multi-node testnet with churn, partitions, and a

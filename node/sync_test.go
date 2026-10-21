@@ -33,16 +33,20 @@ func sentMsgs(t *testing.T, buf *bytes.Buffer) []Message {
 func mineWith(t *testing.T, bc *core.Blockchain, w *wallet.Wallet, txs []core.Transaction) core.Block {
 	t.Helper()
 	tip := bc.Tip()
+	height := tip.Index + 1
 	baseFee := bc.NextBaseFee()
-	cb := core.NewCoinbase(w.Address(), core.CoinbaseAmount(tip.Index+1, txs, baseFee))
+	// Same order node.assembleBlock uses; see the note on api's mineOnto.
+	cb := core.NewCoinbaseAt(w.Address(), core.CoinbaseAmount(height, txs, baseFee), height)
 	b := core.Block{
-		Index:        tip.Index + 1,
+		Index:        height,
 		Timestamp:    tip.Timestamp + 1,
 		Transactions: append([]core.Transaction{cb}, txs...),
 		PrevHash:     tip.Hash,
 		BaseFee:      baseFee,
 		Bits:         bc.NextBits(),
 	}
+	b.MerkleRoot = core.MerkleRoot(b.Transactions)
+	b.FilterRoot, b.HistoryRoot, _ = bc.NextCommitments(b)
 	b.StateRoot, _ = bc.NextStateRoot(b)
 	mined, ok := core.Mine(b, nil)
 	if !ok {

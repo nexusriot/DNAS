@@ -63,7 +63,7 @@ func stateLeaf(addr string, acc Account) string {
 // still rebuilt from the whole account set on each call rather than updated
 // incrementally. Both need applyBlock to read and write THROUGH the trie, which
 // is a refactor of the whole application path and is still open (ROADMAP §1).
-func stateRoot(state map[string]Account) string {
+func stateRoot(state StateDB) string {
 	return stateTrieOf(state).Root()
 }
 
@@ -71,7 +71,7 @@ func stateRoot(state map[string]Account) string {
 // through to cache rather than thrown away. It is the fallback path of the
 // incremental committer (statetrie.go): a rebuild that repopulates the cache
 // leaves the next block cheap again.
-func stateRootInto(cache NodeStore, state map[string]Account) string {
+func stateRootInto(cache NodeStore, state StateDB) string {
 	return stateTrieWarming(cache, state).Root()
 }
 
@@ -82,7 +82,7 @@ func stateRootInto(cache NodeStore, state map[string]Account) string {
 // them by then — so building into one can fail on a trie it is itself in the
 // middle of constructing. The authoritative store for the build is therefore
 // unbounded and private to it, and the cache only ever receives copies.
-func stateTrieWarming(cache NodeStore, state map[string]Account) *Trie {
+func stateTrieWarming(cache NodeStore, state StateDB) *Trie {
 	return stateTrieInto(&teeNodeStore{build: NewMemNodeStore(), cache: cache}, state)
 }
 
@@ -108,7 +108,7 @@ func (t *teeNodeStore) PutNode(hash string, data []byte) error {
 }
 
 // stateTrieOf builds the state trie for an account set in a throwaway store.
-func stateTrieOf(state map[string]Account) *Trie {
+func stateTrieOf(state StateDB) *Trie {
 	return stateTrieInto(NewMemNodeStore(), state)
 }
 
@@ -116,24 +116,18 @@ func stateTrieOf(state map[string]Account) *Trie {
 // Deterministic: the trie is canonical, so insertion order cannot change the
 // root (which is what stops two honest nodes committing different roots for
 // identical state).
-func stateTrieInto(store NodeStore, state map[string]Account) *Trie {
+func stateTrieInto(store NodeStore, state StateDB) *Trie {
+	// StateDB.Range yields in ascending address order, which is what makes the
+	// root independent of how the ledger is stored. The map backing used to be
+	// sorted here instead; moving the guarantee into the interface means a
+	// future backend cannot reintroduce an order-dependence into a state root.
 	t := NewTrie(store, EmptyTrieRoot())
-	// Sorted for reproducibility of the NODE STORE, not of the root: the root is
-	// order-independent by construction (see TestTrieRootIsInsertionOrderIndependent).
-	addrs := make([]string, 0, len(state))
-	for a := range state {
-		addrs = append(addrs, a)
-	}
-	sort.Strings(addrs)
-	for _, a := range addrs {
-		if _, err := t.Update(trieKeyFor(a), stateLeaf(a, state[a])); err != nil {
-			// The only error paths are a missing node (impossible: this store was
-			// just built) and a 256-bit key collision (a sha256 collision). Neither
-			// is recoverable and neither can be reported through a root, so this
-			// panics rather than returning a root that is silently wrong.
-			panic("state trie update failed: " + err.Error())
+	state.Range(func(addr string, acc Account) bool {
+		if _, err := t.Update(trieKeyFor(addr), stateLeaf(addr, acc)); err != nil {
+			return false
 		}
-	}
+		return true
+	})
 	return t
 }
 
@@ -163,7 +157,7 @@ func (bc *Blockchain) ProveAccount(addr string) (AccountProof, bool) {
 	bc.mu.RLock()
 	defer bc.mu.RUnlock()
 	tip := bc.blocks[len(bc.blocks)-1]
-	acct, present := bc.state[addr]
+	acct, present := bc.state.Lookup(addr)
 
 	// Prove against the retained trie at the tip's committed root: O(depth)
 	// rather than a full rebuild of the ledger per request, which is what made

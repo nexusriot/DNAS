@@ -31,7 +31,7 @@ E2E_DOCKER_RUN := --rm --init --network none --read-only \
 # Pass computed settings down to the build/packaging scripts.
 export VERSION PLATFORMS ARCHES GO
 
-.PHONY: all build dnas tui wasm test test-race bench bench-update bench-check verify-reproducible e2e e2e-docker e2e-docker-shell vet fmt dist deb rpm demo install uninstall clean version help
+.PHONY: all build dnas tui wasm test test-race test-upgrades bench bench-update bench-check verify-reproducible e2e e2e-docker e2e-docker-shell vet fmt dist deb rpm demo install uninstall clean version help
 
 all: build
 
@@ -70,6 +70,21 @@ test:
 	else \
 		echo "skipping GUI tests (python3 / PyQt6 not available)"; \
 	fi
+
+## test-upgrades: run the Go tests with every consensus upgrade active
+# A second pass over the same suite, not a different suite. The default run
+# leaves upgrades unscheduled and each test switches on the one it is about, so
+# the rules only ever got exercised ONE AT A TIME — which is how a rule that is
+# correct alone and wrong in combination survives. Everything the commitments
+# touch (pruning, snapshots, compact relay) and every rule that reads a
+# transaction's shape (checked addresses vs. asset and name operations) is only
+# covered here.
+#
+# The header commitments activate at height 1 rather than 0: genesis is a
+# constant whose hash is the network's identity, and a commitment active at
+# height 0 is inside its preimage. See core/main_test.go.
+test-upgrades:
+	DNAS_TEST_UPGRADES=all $(GO) test -count=1 $(GOMODS)
 
 ## test-race: run the Go tests under the race detector
 # The timeout is explicit because go's default is 10 minutes and the core suite

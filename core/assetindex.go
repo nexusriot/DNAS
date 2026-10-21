@@ -212,11 +212,12 @@ func (bc *Blockchain) AssetHolders(id string) []AssetHolder {
 	bc.mu.RLock()
 	defer bc.mu.RUnlock()
 	var out []AssetHolder
-	for addr, acc := range bc.state {
+	bc.state.Range(func(addr string, acc Account) bool {
 		if amount := acc.Assets[id]; amount > 0 {
 			out = append(out, AssetHolder{Address: addr, Amount: amount})
 		}
-	}
+		return true
+	})
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Amount != out[j].Amount {
 			return out[i].Amount > out[j].Amount

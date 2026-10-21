@@ -18,7 +18,7 @@ import (
 func withCheckedAddresses(t *testing.T) {
 	t.Helper()
 	SetUpgradeHeight(UpgradeCheckedAddresses, 1)
-	t.Cleanup(ClearUpgrades)
+	t.Cleanup(restoreUpgrades)
 }
 
 func mustAddr(t *testing.T) (*wallet.Wallet, string) {
@@ -147,7 +147,7 @@ func TestFeePayerAddressIsChecked(t *testing.T) {
 // scheduled upgrade rather than a break.
 func TestMalformedAddressesStillAcceptedBeforeActivation(t *testing.T) {
 	SetUpgradeHeight(UpgradeCheckedAddresses, 100)
-	t.Cleanup(ClearUpgrades)
+	t.Cleanup(restoreUpgrades)
 	alice, _ := mustAddr(t)
 
 	tx := signedTx(t, alice, "hello-world", Coin, testFee, 0)

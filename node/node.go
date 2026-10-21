@@ -121,6 +121,17 @@ type Config struct {
 	// and tests set it low to get blocks as fast as proof of work allows. It is
 	// local mining policy, not consensus — peers need not agree on it.
 	EmptyBlockInterval time.Duration
+
+	// AuditEvery makes the node re-derive its own ledger every N blocks and
+	// compare it against what its chain commits (see core.Blockchain.AuditState
+	// and auditLoop). Zero is off, which is the default.
+	//
+	// It is opt-in because the check is O(ledger) and holds the chain's read
+	// lock for its duration — the very cost the incremental committer exists to
+	// avoid, so it must not be something a node does by reflex. It is worth
+	// paying where the consequence of being wrong is worst: an archival node, a
+	// node backing an exchange, or one being watched after a reorg.
+	AuditEvery uint64
 }
 
 type peer struct {
@@ -185,9 +196,16 @@ type Node struct {
 	stratum *StratumServer
 	faucet  *faucet
 	reorgs  *reorgLog
-	book    *peerbook
-	addrs   *addrman // outbound address manager: tried/new tables + group diversity
-	bans    *banbook
+	audit   auditState // periodic ledger self-audit (see audit.go); inert unless AuditEvery is set
+
+	// Compact-filter service counters (see cfilterwire.go).
+	cfiltersServed  atomic.Uint64
+	cfheadersServed atomic.Uint64
+	cfilterReplies  atomic.Uint64
+	cfheaderReplies atomic.Uint64
+	book            *peerbook
+	addrs           *addrman // outbound address manager: tried/new tables + group diversity
+	bans            *banbook
 
 	// resolveSeed is the DNS lookup used for -dnsseeds, injectable so tests need
 	// no working resolver.
@@ -358,6 +376,7 @@ func (n *Node) Start() {
 	n.fillOutbound()
 	go n.peerLoop()     // keeps the outbound set full and diverse as peers come and go
 	go n.compactLoop()  // rewrites the pruned block store off the hot path
+	go n.auditLoop()    // re-derives the ledger on a schedule (see audit.go); returns at once when off
 	go n.timeSyncLoop() // keeps timestamp validation in step with peers' clocks
 	go n.syncLoop()     // times out unanswered block requests and keeps ranges in flight
 	if n.webhooks != nil {
@@ -953,6 +972,20 @@ func (n *Node) handleMessage(p *peer, m Message) {
 	case MsgBlocks:
 		n.onBlocks(p, m.Blocks)
 
+	// Compact filters over the wire (see cfilterwire.go), so a light client can
+	// be a peer among several rather than an HTTP client of one.
+	case MsgGetCFilters:
+		n.onGetCFilters(p, m.From, m.To)
+
+	case MsgCFilters:
+		n.onCFilters(p, m)
+
+	case MsgGetCFHeaders:
+		n.onGetCFHeaders(p, m.From, m.To)
+
+	case MsgCFHeaders:
+		n.onCFHeaders(p, m)
+
 	// whole-chain exchange, used only as a fork/bootstrap fallback — throttled
 	// per peer because serializing the whole chain is expensive.
 	case MsgGetChain:
@@ -1119,7 +1152,7 @@ func (n *Node) broadcastExcept(m Message, except *peer) {
 
 // caps returns this node's advertised protocol capabilities.
 func (n *Node) caps() []string {
-	c := []string{CapMempool, CapTxInv, CapCompact}
+	c := []string{CapMempool, CapTxInv, CapCompact, CapCFilters}
 	if n.cfg.Dandelion {
 		c = append(c, CapDandelion)
 	}

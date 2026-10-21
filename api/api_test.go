@@ -23,16 +23,24 @@ import (
 func mineOnto(t *testing.T, chain *core.Blockchain, miner string, txs []core.Transaction) {
 	t.Helper()
 	tip := chain.Tip()
+	height := tip.Index + 1
 	baseFee := chain.NextBaseFee()
-	cb := core.NewCoinbase(miner, core.CoinbaseAmount(tip.Index+1, txs, baseFee))
+	// The miner's contract, in the order node.assembleBlock does it: a
+	// height-bound coinbase, the merkle root (the filter is keyed on it), then
+	// the scheduled header commitments, then the state root. Skipping any of
+	// them builds a block this chain rejects as soon as the matching upgrade is
+	// in force.
+	cb := core.NewCoinbaseAt(miner, core.CoinbaseAmount(height, txs, baseFee), height)
 	b := core.Block{
-		Index:        tip.Index + 1,
+		Index:        height,
 		Timestamp:    tip.Timestamp + 1,
 		Transactions: append([]core.Transaction{cb}, txs...),
 		PrevHash:     tip.Hash,
 		BaseFee:      baseFee,
 		Bits:         chain.NextBits(),
 	}
+	b.MerkleRoot = core.MerkleRoot(b.Transactions)
+	b.FilterRoot, b.HistoryRoot, _ = chain.NextCommitments(b)
 	b.StateRoot, _ = chain.NextStateRoot(b)
 	mined, ok := core.Mine(b, nil)
 	if !ok {

@@ -6,28 +6,6 @@ import (
 	"github.com/nexusriot/DNAS/wallet"
 )
 
-// mineAt mines a block with an explicit timestamp (to exercise the MTP rule).
-func mineAt(t *testing.T, bc *Blockchain, miner string, txs []Transaction, ts int64) Block {
-	t.Helper()
-	tip := bc.Tip()
-	baseFee := bc.NextBaseFee()
-	cb := NewCoinbase(miner, CoinbaseAmount(tip.Index+1, txs, baseFee))
-	b := Block{
-		Index:        tip.Index + 1,
-		Timestamp:    ts,
-		Transactions: append([]Transaction{cb}, txs...),
-		PrevHash:     tip.Hash,
-		BaseFee:      baseFee,
-		Bits:         bc.NextBits(),
-	}
-	b.StateRoot, _ = bc.NextStateRoot(b)
-	mined, ok := Mine(b, nil)
-	if !ok {
-		t.Fatal("mining aborted")
-	}
-	return mined
-}
-
 func TestMedianTimePast(t *testing.T) {
 	b := make([]Block, 11)
 	for i := range b {

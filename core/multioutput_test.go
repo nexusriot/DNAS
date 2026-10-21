@@ -20,7 +20,7 @@ func signedOutputs(t *testing.T, from *wallet.Wallet, fee, nonce uint64, outs ..
 func activate(t *testing.T, bc *Blockchain) {
 	t.Helper()
 	ClearUpgrades()
-	t.Cleanup(ClearUpgrades)
+	t.Cleanup(restoreUpgrades)
 	SetUpgradeHeight(UpgradeMultiOutput, bc.Height()+1)
 }
 
@@ -65,7 +65,7 @@ func TestMultiOutputTransferPaysEveryRecipient(t *testing.T) {
 // rather than disagreeing about whether a block is valid.
 func TestMultiOutputRejectedBeforeActivation(t *testing.T) {
 	ClearUpgrades()
-	defer ClearUpgrades()
+	defer restoreUpgrades()
 
 	bc := NewBlockchain()
 	alice, _ := wallet.New()
@@ -277,7 +277,7 @@ func TestDustLimitAppliesToEveryOutput(t *testing.T) {
 	mustAdd(t, bc, mineOn(t, bc, alice.Address(), nil))
 	matureCoinbase(t, bc)
 	ClearUpgrades()
-	defer ClearUpgrades()
+	defer restoreUpgrades()
 	SetUpgradeHeight(UpgradeMultiOutput, 0)
 	SetUpgradeHeight(UpgradeDustLimit, bc.Height()+1)
 

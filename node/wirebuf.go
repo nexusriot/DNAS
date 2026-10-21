@@ -190,3 +190,44 @@ func (r *rbuf) blocks() ([]core.Block, error) {
 }
 
 var errEmptyWireMessage = errors.New("empty wire message")
+
+// filters encodes a batch of compact block filters.
+//
+// Field by field rather than through a core codec: a filter is four short
+// values and one hex blob, and giving it a consensus-level encoding would imply
+// it is consensus — which it is not. The filter's COMMITMENT is what the header
+// covers (core/cfilter.go); the serialization a peer ships it in is wire
+// business, and lives here with the rest of it.
+func (w *wbuf) filters(fs []core.BlockFilter) {
+	w.u64(uint64(len(fs)))
+	for _, f := range fs {
+		w.u64(f.Index)
+		w.u64(uint64(f.N))
+		w.str(f.BlockHash)
+		w.str(f.Data)
+		// Key is empty below UpgradeFilterCommit and must stay empty on the
+		// wire there, or a peer would key its matches off the wrong digest.
+		w.str(f.Key)
+	}
+}
+
+func (r *rbuf) filters() []core.BlockFilter {
+	n := r.count()
+	if r.err != nil {
+		return nil
+	}
+	out := make([]core.BlockFilter, 0, n)
+	for i := 0; i < n; i++ {
+		var f core.BlockFilter
+		f.Index = r.u64()
+		f.N = int(r.u64())
+		f.BlockHash = r.str()
+		f.Data = r.str()
+		f.Key = r.str()
+		if r.err != nil {
+			return nil
+		}
+		out = append(out, f)
+	}
+	return out
+}

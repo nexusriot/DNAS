@@ -555,6 +555,27 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	// The alert-worthy one: fork choice preferred a chain and the finality guard
 	// refused it. Non-zero means this node may have stopped converging.
 	counter("dnas_reorgs_refused_total", "Reorgs refused by the finality guards (too deep, or below a checkpoint).", reorgs.Refused)
+	// A node that has ever failed a self-audit is diverged until an operator
+	// says otherwise, so this is the one gauge worth alerting on unconditionally.
+	gauge("dnas_audit_failures_total", "Ledger self-audits that found a divergence (see /audit).", float64(s.node.AuditFailures()))
+	// Compact filters served over the PEER wire (cfilterwire.go). Worth its own
+	// counters because it is the surface light clients reach this node through,
+	// and a node whose filter base has drifted above what clients ask for is
+	// serving nothing while looking perfectly healthy everywhere else.
+	cf := s.node.CFilters()
+	counter("dnas_cfilters_served_total", "Compact filters served to peers over the wire.", float64(cf.FiltersServed))
+	counter("dnas_cfheaders_served_total", "Filter-chain headers served to peers over the wire.", float64(cf.HeadersServed))
+	gauge("dnas_cfilter_base", "Lowest height this node can answer filter questions for.", float64(cf.Base))
+	gauge("dnas_cfheader_base", "Lowest height this node's filter-header chain covers.", float64(cf.HeaderBase))
+	if a, ok := s.node.LastAudit(); ok {
+		gauge("dnas_audit_last_height", "Chain height of the most recent ledger self-audit.", float64(a.Height))
+		gauge("dnas_audit_last_ms", "How long the most recent ledger self-audit took.", float64(a.TookMS))
+		ok01 := 0.0
+		if a.OK() {
+			ok01 = 1
+		}
+		gauge("dnas_audit_last_ok", "1 if the most recent ledger self-audit passed, 0 if it did not.", ok01)
+	}
 	gauge("dnas_reorg_refused_deepest", "Deepest refused reorg, in blocks.", reorgs.RefusedDeepest)
 	gauge("dnas_reorg_deepest", "Deepest reorg this node has seen, in blocks.", reorgs.Deepest)
 	gauge("dnas_orphan_blocks", "Blocks parked awaiting a parent.", reorgs.Orphans)
@@ -1065,6 +1086,28 @@ func (s *Server) reorgs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.node.Reorgs())
 }
 
+// audit re-derives the node's ledger and reports whether it still matches what
+// its chain commits to.
+//
+// It is a READ, but an expensive one — a full trie rebuild over every account —
+// so it is rate-limited like the other costly reads rather than left open. The
+// answer is the node's own honesty about itself, which is exactly the thing an
+// operator cannot get from /info.
+func (s *Server) audit(w http.ResponseWriter, r *http.Request) {
+	a := s.node.RunAudit()
+	status := http.StatusOK
+	if !a.OK() {
+		// 500, not 200-with-a-flag: a caller that only checks the status code
+		// must not read a diverged ledger as a healthy one.
+		status = http.StatusInternalServerError
+	}
+	writeJSON(w, status, struct {
+		core.StateAudit
+		Problem  string `json:"problem,omitempty"`
+		Failures uint64 `json:"failures"`
+	}{StateAudit: a, Problem: a.Problem(), Failures: s.node.AuditFailures()})
+}
+
 // health is the readiness check a supervisor needs, which /info cannot be: /info
 // answers 200 while a node is still syncing, has no peers, or is sitting on a
 // tip that stopped moving hours ago. This answers 200 only when the node is
@@ -1093,6 +1136,18 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		reasons = append(reasons, fmt.Sprintf(
 			"refused %d reorg(s) (deepest %d, last: %s) — this node may be on a diverged chain",
 			rr.Refused, rr.RefusedDeepest, rr.RefusedWhy))
+	}
+	// A failed self-audit outranks everything else here: the node's own ledger
+	// does not match what its chain commits to, so every other signal in this
+	// check — peers, tip age, height — is being reported off a state nobody
+	// else shares. It stays unhealthy once it has ever failed, because the
+	// audit only inspects the tip and the damage may be below it.
+	if s.node.AuditFailures() > 0 {
+		if a, ok := s.node.LastAudit(); ok {
+			reasons = append(reasons, a.Problem())
+		} else {
+			reasons = append(reasons, "a ledger self-audit has failed")
+		}
 	}
 	if tip.Index == 0 {
 		reasons = append(reasons, "chain is at genesis")

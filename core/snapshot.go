@@ -32,7 +32,7 @@ func (bc *Blockchain) SnapshotAt(height uint64) (Snapshot, bool) {
 	for i := len(bc.blocks) - 1; i > int(height); i-- {
 		applyUndo(state, bc.undos[i])
 	}
-	return Snapshot{Height: height, Header: bc.blocks[height].Header(), Accounts: state}, true
+	return Snapshot{Height: height, Header: bc.blocks[height].Header(), Accounts: stateAsMap(state)}, true
 }
 
 // VerifySnapshot checks a snapshot is internally consistent and trustworthy: the
@@ -47,7 +47,7 @@ func VerifySnapshot(s Snapshot) error {
 	if !s.Header.HasValidPoW() {
 		return errors.New("snapshot header fails proof of work")
 	}
-	if root := stateRoot(s.Accounts); root != s.Header.StateRoot {
+	if root := stateRoot(memStateOf(s.Accounts)); root != s.Header.StateRoot {
 		return errors.New("account set does not hash to the header state root")
 	}
 	return nil
@@ -83,10 +83,10 @@ func NewFromSnapshot(s Snapshot, headers []Header) (*Blockchain, error) {
 	undos := make([][]undoEntry, len(headers))
 	work := new(big.Int)
 	for i, h := range headers {
-		blocks[i] = blockFromHeader(h) // header-only placeholder (pruned body)
+		blocks[i] = BlockFromHeader(h) // header-only placeholder (pruned body)
 		work.Add(work, BlockWork(h.Bits))
 	}
-	state := cloneState(s.Accounts)
+	state := cloneState(memStateOf(s.Accounts))
 	// The bodies below the snapshot are pruned, so the burn they contain cannot be
 	// summed directly. It is implied instead: everything minted that is no longer
 	// held by an account was burned. The accounts come from the snapshot, whose
@@ -121,15 +121,22 @@ func NewFromSnapshot(s Snapshot, headers []Header) (*Blockchain, error) {
 	// carry — so a fast-synced node rebuilds it in full even though it never saw
 	// the bodies. Ancestry stays provable below the snapshot; only the bodies,
 	// and what is derived from them, are missing.
-	bc.history = bc.historyUpTo(len(bc.blocks) - 1)
+	bc.history = bc.rebuildHistoryTo(len(bc.blocks) - 1)
 	return bc, nil
 }
 
-// blockFromHeader returns a header-only placeholder block (no transaction
-// bodies): its hash and every header field are set, but Transactions is empty. It
-// stands in for a pruned block below a snapshot so height indexing, linkage,
-// median-time-past and difficulty retargeting keep working unchanged.
-func blockFromHeader(h Header) Block {
+// BlockFromHeader returns a header-only block: every header field is set, and
+// Transactions is empty.
+//
+// It is exported because it is the ONE place that knows how to widen a Header
+// back into a Block, and getting that wrong is silent. Two callers used to
+// spell it out by hand — the pruning placeholder here, and compact-block
+// reconstruction in the node — and both forgot the scheduled commitments, so
+// both produced a block whose stored hash no longer recomputed: a pruned height
+// whose header failed its own proof-of-work check, and a compactly-relayed
+// block every node rejected. A header field added later must only have to be
+// added here.
+func BlockFromHeader(h Header) Block {
 	return Block{
 		Version:    h.Version,
 		Index:      h.Index,
@@ -141,5 +148,14 @@ func blockFromHeader(h Header) Block {
 		Bits:       h.Bits,
 		Nonce:      h.Nonce,
 		Hash:       h.Hash,
+		// The scheduled commitments are part of the proof-of-work preimage from
+		// their activation height on, so a placeholder that dropped them would
+		// carry a header whose stored Hash no longer recomputes — HasValidPoW
+		// false on a block the chain had already accepted. Every pruned height
+		// on a chain running these upgrades was that: a snapshot taken there was
+		// rejected by the node that wrote it, `db verify` failed, and a header
+		// served to a light client did not match its own hash.
+		FilterRoot:  h.FilterRoot,
+		HistoryRoot: h.HistoryRoot,
 	}
 }

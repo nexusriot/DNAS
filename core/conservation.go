@@ -58,24 +58,24 @@ func touchedBefore(undo []undoEntry) map[string]Account {
 // int64 is wide enough by construction: the total coin ever minted is bounded by
 // the halving schedule at well under 2^62 base units, and a sum over a subset of
 // accounts cannot exceed it.
-func coinDelta(state map[string]Account, before map[string]Account) int64 {
+func coinDelta(state StateDB, before map[string]Account) int64 {
 	var sumBefore, sumAfter uint64
 	for addr, prev := range before {
 		sumBefore += prev.Balance
-		sumAfter += state[addr].Balance
+		sumAfter += state.Get(addr).Balance
 	}
 	return int64(sumAfter) - int64(sumBefore)
 }
 
 // assetDeltas is the net change per asset id that a block produced, over the
 // accounts it touched. Ids absent from the result were not moved at all.
-func assetDeltas(state map[string]Account, before map[string]Account) map[string]int64 {
+func assetDeltas(state StateDB, before map[string]Account) map[string]int64 {
 	deltas := map[string]int64{}
 	for addr, prev := range before {
 		for id, amt := range prev.Assets {
 			deltas[id] -= int64(amt)
 		}
-		for id, amt := range state[addr].Assets {
+		for id, amt := range state.Get(addr).Assets {
 			deltas[id] += int64(amt)
 		}
 	}
@@ -93,7 +93,7 @@ func assetDeltas(state map[string]Account, before map[string]Account) map[string
 //
 // txs is the block's full transaction list (the coinbase included, and skipped);
 // burned is the base-fee total the caller already accumulated while applying it.
-func checkConservation(state map[string]Account, undo []undoEntry, txs []Transaction, reward, burned uint64) error {
+func checkConservation(state StateDB, undo []undoEntry, txs []Transaction, reward, burned uint64) error {
 	before := touchedBefore(undo)
 
 	wantCoin := int64(reward) - int64(burned)

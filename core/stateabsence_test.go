@@ -178,7 +178,7 @@ func TestStateRootIsCanonical(t *testing.T) {
 		for i, w := range order {
 			st[w.Address()] = Account{Balance: uint64(i+1) * Coin, Nonce: uint64(i)}
 		}
-		return stateRoot(st)
+		return stateRoot(memStateOf(st))
 	}
 	// Same contents, different map construction order.
 	one := build([]*wallet.Wallet{a, b, c})
@@ -187,7 +187,7 @@ func TestStateRootIsCanonical(t *testing.T) {
 		t.Errorf("the same state gave two roots: %s vs %s", one, two)
 	}
 	// An empty state has a fixed root, and it is the empty trie's.
-	if got := stateRoot(map[string]Account{}); got != EmptyTrieRoot() {
+	if got := stateRoot(NewMemState()); got != EmptyTrieRoot() {
 		t.Errorf("empty state root = %s, want the empty trie root %s", got, EmptyTrieRoot())
 	}
 }

@@ -36,7 +36,7 @@ func TestAddressIndexBuildsFromAnExistingChain(t *testing.T) {
 		mustAdd(t, bc, mineOn(t, bc, miner.Address(), nil))
 		matureCoinbase(t, bc)
 		for i := uint64(0); i < 3; i++ {
-			pay := signedTx(t, miner, bob.Address(), 100, testFee, i)
+			pay := signedTx(t, miner, bob.Address(), 2*DustThreshold, testFee, i)
 			mustAdd(t, bc, mineOn(t, bc, miner.Address(), []Transaction{pay}))
 		}
 		if !enableFirst {
@@ -69,9 +69,9 @@ func TestAddressIndexCoversSenderRecipientAndSponsor(t *testing.T) {
 	recipient, _ := wallet.New()
 	mustAdd(t, bc, mineOn(t, bc, sponsor.Address(), nil))
 	matureCoinbase(t, bc)
-	fund := signedTx(t, sponsor, sender.Address(), 5_000, testFee, 0)
+	fund := signedTx(t, sponsor, sender.Address(), 50*DustThreshold, testFee, 0)
 	mustAdd(t, bc, mineOn(t, bc, sponsor.Address(), []Transaction{fund}))
-	tx := sponsoredTx(t, sender, sponsor, recipient.Address(), 500, testFee, 0)
+	tx := sponsoredTx(t, sender, sponsor, recipient.Address(), 2*DustThreshold, testFee, 0)
 	mustAdd(t, bc, mineOn(t, bc, sponsor.Address(), []Transaction{tx}))
 
 	for _, addr := range []string{sender.Address(), recipient.Address(), sponsor.Address()} {
@@ -99,7 +99,7 @@ func TestAddressIndexPagesAndFilters(t *testing.T) {
 	mustAdd(t, bc, mineOn(t, bc, miner.Address(), nil))
 	matureCoinbase(t, bc)
 	for i := uint64(0); i < 5; i++ {
-		pay := signedTx(t, miner, bob.Address(), 100, testFee, i)
+		pay := signedTx(t, miner, bob.Address(), 2*DustThreshold, testFee, i)
 		mustAdd(t, bc, mineOn(t, bc, miner.Address(), []Transaction{pay}))
 	}
 	all, _ := bc.AddressHistory(bob.Address(), 0, 0)
@@ -130,7 +130,7 @@ func TestAddressIndexFollowsReorg(t *testing.T) {
 	matureCoinbase(t, bc)
 	forkHeight := bc.Height()
 
-	pay := signedTx(t, miner, bob.Address(), 100, testFee, 0)
+	pay := signedTx(t, miner, bob.Address(), 2*DustThreshold, testFee, 0)
 	mustAdd(t, bc, mineOn(t, bc, miner.Address(), []Transaction{pay}))
 	if entries, _ := bc.AddressHistory(bob.Address(), 0, 0); len(entries) != 1 {
 		t.Fatalf("history before the reorg = %d entries, want 1", len(entries))

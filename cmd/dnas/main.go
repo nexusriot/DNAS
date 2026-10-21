@@ -173,6 +173,10 @@ Node flags:
   -mempool N      max pending transactions (default 5000)
   -minrelayfee N  base min relay fee, base units per byte; rises with load (default 10)
   -prune N        keep only the N most recent block bodies in memory (0 = keep all)
+  -audit N        re-derive and verify this node's whole ledger every N blocks
+                  (0 = never; costs O(ledger), see GET /audit)
+  -triecache N    hold the state-trie cache in a file of N slots instead of RAM
+                  (0 = in memory; 512 bytes per slot, survives restarts)
   -webhook LIST   comma-separated URLs to POST every block/tx event to
   -emptyinterval N  seconds the miner idles before minting an EMPTY block
                   (default 0 = one target block time, currently 60s)
@@ -455,6 +459,18 @@ func runNode(args []string) {
 	minRelayFee := fs.Int("minrelayfee", cfg.integer("minrelayfee", int(core.DefaultMinRelayFee)), "base minimum relay fee in base units (rises with mempool load; 0 disables)")
 	console := fs.Bool("console", cfg.boolean("console", false), "run the interactive console even when stdin is not a terminal (for scripts)")
 	prune := fs.Int("prune", cfg.integer("prune", 0), "keep only this many recent block bodies in memory (0 = keep all; minimum "+strconv.Itoa(core.MinPruneKeep)+")")
+	// Off by default: the check is O(ledger) and holds the chain's read lock for
+	// its duration, so it is a cost an operator opts into, not one every node
+	// pays. Worth it where being silently wrong is worst — an archival node, or
+	// one backing something that pays out.
+	audit := fs.Int("audit", cfg.integer("audit", 0), "re-derive and verify the ledger every N blocks (0 = never; see GET /audit)")
+	// The trie cache holds the nodes the state root is committed through. In
+	// memory it is bounded by node COUNT and thrown away at every restart; on
+	// disk it is bounded by a file size, costs almost no RAM, and survives — so
+	// the first block, state proof and reorg after a restart are not each a full
+	// rebuild. Opt-in because a memory cache is faster per lookup, which is what
+	// a small chain wants.
+	trieCache := fs.Int("triecache", cfg.integer("triecache", 0), "keep the state-trie cache in a file of this many slots (0 = in memory; 512 bytes per slot)")
 	webhooks := fs.String("webhook", cfg.str("webhook", ""), "comma-separated URLs to POST every block/tx event to")
 	emptyInterval := fs.Int("emptyinterval", cfg.integer("emptyinterval", 0), "seconds the miner idles before minting an EMPTY block (0 = one target block time)")
 	apiRate := fs.Int("apirate", cfg.integer("apirate", int(api.DefaultAPIRate)), "sustained HTTP API requests per second per client (0 disables the limit)")
@@ -668,7 +684,23 @@ func runNode(args []string) {
 		// network and far too slow for a demo or a test harness that wants a
 		// chain to exist within a few seconds.
 		EmptyBlockInterval: time.Duration(*emptyInterval) * time.Second,
+		AuditEvery:         uint64(max(0, *audit)),
 	}, chain, mp, w)
+	if *audit > 0 {
+		log.Printf("ledger self-audit enabled: every %d blocks (GET /audit to run one now)", *audit)
+	}
+	if *trieCache > 0 {
+		path := core.DiskTrieCachePath(*dbPath)
+		if err := chain.UseDiskTrieCache(path, *trieCache); err != nil {
+			// Not fatal: the trie cache is a cache. Falling back to the
+			// in-memory one costs speed, and refusing to start a node because a
+			// cache file could not be opened would cost availability.
+			log.Printf("could not open the disk trie cache at %s (%v); staying in memory", path, err)
+		} else {
+			log.Printf("state-trie cache on disk: %s, %d slots (%d MiB)",
+				path, *trieCache, int64(*trieCache)*512/(1<<20))
+		}
+	}
 	if *faucet {
 		if n.FaucetEnabled() {
 			log.Printf("faucet enabled: %s per request, one per %s", core.FormatAmount(n.FaucetAmount()), n.FaucetCooldown())

@@ -38,7 +38,7 @@ func BenchmarkStateRootRebuild(b *testing.B) {
 		state := ledger(n)
 		b.Run(fmt.Sprintf("accounts=%d", n), func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
-				_ = stateRoot(state)
+				_ = stateRoot(memStateOf(state))
 			}
 		})
 	}
@@ -51,7 +51,7 @@ func BenchmarkStateCommitIncremental(b *testing.B) {
 	for _, n := range benchLedgerSizes {
 		store := NewBoundedNodeStore(0)
 		state := ledger(n)
-		root := stateRootInto(store, state)
+		root := stateRootInto(store, memStateOf(state))
 		addr := fmt.Sprintf("dnas%040x", 0)
 		b.Run(fmt.Sprintf("accounts=%d", n), func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
@@ -59,7 +59,7 @@ func BenchmarkStateCommitIncremental(b *testing.B) {
 				acc.Balance++
 				state[addr] = acc
 				sc := &stateCommitter{store: store, root: root}
-				root = sc.rootAfter(state, []undoEntry{{addr: addr, prev: acc, existed: true}})
+				root = sc.rootAfter(memStateOf(state), []undoEntry{{addr: addr, prev: acc, existed: true}})
 			}
 		})
 	}
@@ -71,7 +71,7 @@ func BenchmarkProveAccount(b *testing.B) {
 	for _, n := range benchLedgerSizes {
 		store := NewBoundedNodeStore(0)
 		state := ledger(n)
-		root := stateRootInto(store, state)
+		root := stateRootInto(store, memStateOf(state))
 		key := trieKeyFor(fmt.Sprintf("dnas%040x", n/2))
 		b.Run(fmt.Sprintf("accounts=%d", n), func(b *testing.B) {
 			for i := 0; i < b.N; i++ {

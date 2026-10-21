@@ -48,19 +48,29 @@ type stateCommitter struct {
 // On any store miss it falls back to building the trie from the whole account
 // set, which is the old behaviour and always correct — the fallback is what
 // lets the store be a bounded cache rather than a second source of truth.
-func (c *stateCommitter) rootAfter(state map[string]Account, undo []undoEntry) string {
+func (c *stateCommitter) rootAfter(state StateDB, undo []undoEntry) string {
 	touched := touchedAddrs(undo)
 	t := NewTrie(c.store, c.root)
 	for _, addr := range touched {
 		value := ""
-		if acc, ok := state[addr]; ok {
+		if acc, ok := state.Lookup(addr); ok {
 			value = stateLeaf(addr, acc)
 		}
 		if _, err := t.Update(trieKeyFor(addr), value); err != nil {
 			// A missing node (an evicted or never-populated cache) is the only
 			// reachable error here; a key collision would be a sha256 collision.
 			// Either way the whole-set rebuild is authoritative.
-			return stateRootInto(c.store, state)
+			//
+			// The cursor MUST move to the rebuilt root, not stay where the
+			// failed incremental attempt left it. A committer is reused across
+			// a whole suffix (reorgLocked, and so whole-chain sync via
+			// ReplaceChain), so a cursor left behind would have the NEXT block
+			// apply its changes to the state of the block before last — a root
+			// that is simply wrong, which rejects a valid chain and diverges
+			// the node. The fallback is allowed to be slow; it is not allowed
+			// to lose the position.
+			c.root = stateRootInto(c.store, state)
+			return c.root
 		}
 	}
 	c.root = t.Root()
@@ -83,7 +93,7 @@ type commitCtx struct {
 
 // commitStateRoot is the root of `state` after a block whose changes `undo`
 // records.
-func commitStateRoot(cc *commitCtx, state map[string]Account, undo []undoEntry) string {
+func commitStateRoot(cc *commitCtx, state StateDB, undo []undoEntry) string {
 	if cc == nil || cc.state == nil {
 		return stateRoot(state)
 	}
@@ -107,9 +117,26 @@ func (cc *commitCtx) advance(block Block) {
 	if cc == nil || cc.history == nil {
 		return
 	}
-	if IsUpgradeActive(UpgradeHistoryRoot, block.Index) {
+	if inHistory(block.Index) {
 		cc.history.Append(block.Hash)
 	}
+}
+
+// inHistory reports whether the block at this height is one the accumulator
+// covers. There are two ways to arrive at the range — appending block by block
+// as the chain extends (advance), and rebuilding it to a fork point
+// (historyUpTo) — plus a third that enumerates its leaves to build a proof
+// (ProveAncestry). All three MUST agree on the membership rule, so there is one
+// predicate rather than three copies of the condition.
+//
+// Genesis is never in it. It is the chain's axiom rather than a block anyone
+// connects: advance only ever runs for a block being applied, so the
+// incremental range cannot contain genesis however the schedule is set. A
+// rebuild that included it would disagree with forward extension — and did,
+// for any chain activating the accumulator at height 0, which made every reorg
+// fail with "wrong history root" and so made the chain unable to reorg at all.
+func inHistory(height uint64) bool {
+	return height > 0 && IsUpgradeActive(UpgradeHistoryRoot, height)
 }
 
 // touchedAddrs is the deduplicated set of accounts a block's undo log mentions,
@@ -154,9 +181,24 @@ func (bc *Blockchain) historyUpTo(at int) *MMR {
 	if at == len(bc.blocks)-1 && bc.history != nil {
 		return bc.history.Clone()
 	}
+	return bc.rebuildHistoryTo(at)
+}
+
+// rebuildHistoryTo recomputes the accumulator from the block list, ignoring
+// whatever bc.history holds.
+//
+// It is separate from historyUpTo because that function's fast path — "at the
+// tip, the maintained range is already right" — is only true for a chain that
+// built the range up block by block. A chain bootstrapped from a SNAPSHOT did
+// not: it starts with header-only placeholders and an empty accumulator, and
+// asking historyUpTo for the range at its tip handed back a clone of that
+// empty one. The node then expected an empty-range root from every block it
+// replayed, rejected all of them with "wrong history root", and could neither
+// finish opening its own store nor follow the chain.
+func (bc *Blockchain) rebuildHistoryTo(at int) *MMR {
 	m := &MMR{}
 	for i := 0; i <= at; i++ {
-		if IsUpgradeActive(UpgradeHistoryRoot, bc.blocks[i].Index) {
+		if inHistory(bc.blocks[i].Index) {
 			m.Append(bc.blocks[i].Hash)
 		}
 	}

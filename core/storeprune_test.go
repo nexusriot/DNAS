@@ -311,16 +311,7 @@ func buildPrunedFixture() {
 	miner, _ := wallet.New()
 	sink, _ := wallet.New()
 	mine := func(txs []Transaction) bool {
-		tip := bc.Tip()
-		baseFee := bc.NextBaseFee()
-		cb := NewCoinbase(miner.Address(), CoinbaseAmount(tip.Index+1, txs, baseFee))
-		b := Block{
-			Index: tip.Index + 1, Timestamp: tip.Timestamp + 1,
-			Transactions: append([]Transaction{cb}, txs...),
-			PrevHash:     tip.Hash, BaseFee: baseFee, Bits: bc.NextBits(),
-		}
-		b.StateRoot, _ = bc.NextStateRoot(b)
-		mined, ok := Mine(b, nil)
+		mined, ok := buildBlockAt(bc, miner.Address(), txs, bc.Tip().Timestamp+1)
 		if !ok {
 			fail(errors.New("mining aborted"))
 			return false

@@ -94,9 +94,10 @@ func TestSelectRespectsMax(t *testing.T) {
 		t.Fatal(err)
 	}
 	matureCoinbase(t, bc)
+	bob, _ := wallet.New()
 	mp := NewMempool()
 	for n := uint64(0); n < 3; n++ {
-		if _, err := mp.Add(signedTx(t, alice, "dnasx", Coin, testFee, n)); err != nil {
+		if _, err := mp.Add(signedTx(t, alice, bob.Address(), Coin, testFee, n)); err != nil {
 			t.Fatal(err)
 		}
 	}

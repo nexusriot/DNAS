@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -36,6 +37,13 @@ const Coin = 100_000_000
 
 // readyTimeout bounds how long a freshly started node may take to serve /info.
 const readyTimeout = 30 * time.Second
+
+// syncTimeout bounds how long a peer may take to catch up. Blocks are instant in
+// regtest, so this only has to cover dial + handshake + propagation.
+const syncTimeout = 45 * time.Second
+
+// itoa renders a height for a CLI flag.
+func itoa(v uint64) string { return strconv.FormatUint(v, 10) }
 
 var (
 	buildOnce sync.Once

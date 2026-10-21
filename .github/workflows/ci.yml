@@ -40,6 +40,14 @@ jobs:
       - name: test (race detector)
         run: make test-race
 
+      # A second pass with every consensus upgrade in force. The default run
+      # exercises each rule on its own, which cannot show one that is correct
+      # alone and wrong in combination — the class that broke pruning,
+      # snapshot bootstrap and compact relay once the header commitments were
+      # switched on. See core/main_test.go.
+      - name: test (every upgrade active)
+        run: make test-upgrades
+
   e2e:
     name: end-to-end (containerized)
     runs-on: ubuntu-latest

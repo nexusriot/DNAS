@@ -112,6 +112,7 @@ func TestVaultScriptMustMatchTheAddress(t *testing.T) {
 }
 
 func TestVaultInactiveBeforeUpgrade(t *testing.T) {
+	withoutUpgrade(t, UpgradeVault)
 	bc := NewBlockchain()
 	hot, _ := wallet.New()
 	cold, _ := wallet.New()

@@ -47,6 +47,12 @@ const (
 	MsgBlocks     MsgType = "blocks"     // a batch of block bodies
 
 	// Whole-chain exchange, used only as a fork/bootstrap fallback.
+	// Compact filters over the wire (BIP157/158-shaped), gated on CapCFilters.
+	MsgGetCFilters  MsgType = "getcfilters"  // request filters for a height range
+	MsgCFilters     MsgType = "cfilters"     // the filters for that range
+	MsgGetCFHeaders MsgType = "getcfheaders" // request the filter-header chain
+	MsgCFHeaders    MsgType = "cfheaders"    // that stretch of the filter-header chain
+
 	MsgGetChain MsgType = "getchain"
 	MsgChain    MsgType = "chain"
 
@@ -81,6 +87,16 @@ const (
 	// receiving full pushes, so an older node loses nothing and the rollout needs
 	// no flag day.
 	CapTxInv = "txinv"
+	// CapCFilters advertises that the peer serves compact filters and the
+	// filter-header chain over the WIRE (MsgGetCFilters/MsgGetCFHeaders).
+	//
+	// Until this existed a light client could only get filters over a node's
+	// HTTP API, which made it a client OF one node rather than a participant in
+	// the network. That matters for the thing filters are for: a non-match is a
+	// proof of non-inclusion, and the eclipse argument that makes such a proof
+	// trustworthy is "ask several independent peers" — which a client that
+	// cannot speak the peer protocol has no way to do.
+	CapCFilters = "cf"
 )
 
 // Protocol limits (caps on what a single message may carry, to bound work).
@@ -96,6 +112,15 @@ const (
 	// name a million hashes in a single message and make us allocate a reply for
 	// each before anything has been validated.
 	maxTxInvBatch = 512
+	// maxCFilterBatch bounds one filter answer. A filter is proportional to the
+	// number of addresses its block touched, so a batch is bounded by blocks
+	// rather than bytes; this is deliberately smaller than maxBlocksBatch because
+	// a client walking filters is doing it to AVOID downloading blocks, and a
+	// smaller window keeps the answer latency low.
+	maxCFilterBatch = 128
+	// maxCFHeaderBatch bounds one filter-header answer. Headers are 64-character
+	// digests, so this stays small even at the cap.
+	maxCFHeaderBatch = 2000
 )
 
 // Message is the single JSON envelope exchanged between peers over the
@@ -150,4 +175,15 @@ type Message struct {
 	Hash    string        `json:"hash,omitempty"`
 	From    uint64        `json:"from,omitempty"`
 	To      uint64        `json:"to,omitempty"`
+
+	// compact filters (CapCFilters)
+	Filters []core.BlockFilter `json:"filters,omitempty"`
+	// CFHeaders is a stretch of the filter-header chain, starting at From.
+	CFHeaders []string `json:"cfheaders,omitempty"`
+	// Base is the lowest height this peer can answer filter questions for. A
+	// pruned or fast-synced node never saw the bodies below it and so cannot
+	// fold their commitments — and must say so rather than answer with an empty
+	// set, because an empty filter is a proof of ABSENCE and would tell a client
+	// its address is provably not in a block this node simply cannot read.
+	Base uint64 `json:"base,omitempty"`
 }

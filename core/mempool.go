@@ -807,6 +807,24 @@ type selCandidate struct {
 // What it chooses is unchanged, with one deliberate exception: ties on fee rate
 // now break on the transaction hash instead of on Go's map iteration order, so
 // two nodes with the same mempool build the same block template.
+// nameOpMineable reports whether a name operation would be accepted against the
+// name's record as it stands, at the height the block is being built for. It
+// mirrors applyNameOp's ownership rules: a registration needs the name to be
+// free (never claimed, or lapsed), and everything else needs the sender to hold
+// it right now.
+//
+// The height matters: a lease that expires exactly at mineHeight is already
+// free for the block being built, so asking at the tip would refuse a
+// registration that consensus would accept.
+func nameOpMineable(bc *Blockchain, tx Transaction, mineHeight uint64) bool {
+	rec, _ := bc.LookupName(tx.Name.Name)
+	held := rec.heldAt(mineHeight)
+	if tx.Name.Op == NameOpRegister {
+		return !held
+	}
+	return held && rec.Owner == tx.From
+}
+
 func (m *Mempool) Select(bc *Blockchain, max int) []Transaction {
 	mineHeight := bc.Height() + 1 // the block we're selecting for
 	baseFee := bc.NextBaseFee()   // the next block's base fee (per byte); txs must cover it
@@ -831,6 +849,14 @@ func (m *Mempool) Select(bc *Blockchain, max int) []Transaction {
 			continue
 		}
 		if CheckTxSanity(tx) != nil || checkTxAtHeight(tx, mineHeight) != nil {
+			continue
+		}
+		// A name operation is also checked against the name's CURRENT record.
+		// claimedNames below stops two operations on one name sharing a block,
+		// but says nothing about a name somebody already holds on the chain —
+		// so the loser of a race kept being selected and kept invalidating the
+		// candidate, every block, until the miner dropped it.
+		if tx.IsNameOp() && !nameOpMineable(bc, tx, mineHeight) {
 			continue
 		}
 		hash := tx.Hash()
@@ -900,6 +926,24 @@ func (m *Mempool) Select(bc *Blockchain, max int) []Transaction {
 		switch {
 		case tx.IsIssue():
 			return s.balance >= senderFee(tx)
+		case tx.IsAssetOp():
+			// A mint or a burn moves the ISSUER's own holding, so two of them in
+			// one block are not independent: applyAssetOp burns only what the
+			// issuer still holds and mints only up to the supply cap, and the
+			// second of a pair that each look fine against the chain is what
+			// invalidates the candidate.
+			if s.balance < senderFee(tx) {
+				return false
+			}
+			held := s.assets[tx.AssetID]
+			switch tx.AssetOp.Op {
+			case AssetOpMint:
+				return held+tx.AssetOp.Amount >= held && held+tx.AssetOp.Amount <= MaxAssetSupply
+			case AssetOpBurn:
+				return held >= tx.AssetOp.Amount
+			default:
+				return false
+			}
 		case tx.IsAssetTransfer():
 			return s.balance >= senderFee(tx) && s.assets[tx.AssetID] >= tx.Amount
 		default:
@@ -974,6 +1018,18 @@ func (m *Mempool) Select(bc *Blockchain, max int) []Transaction {
 		case pick.IsIssue():
 			s.balance -= senderFee(pick)
 			s.assets[IssuedAssetID(pick.From, pick.Nonce, pick.Issue)] += pick.Issue.Supply
+			cache[pick.From] = s
+			debitSponsor(pick)
+		case pick.IsAssetOp():
+			// Mirrors applyAssetOp: the fee in coin, the amount on the issuer's
+			// own holding, nothing moved to a recipient.
+			s.balance -= senderFee(pick)
+			switch pick.AssetOp.Op {
+			case AssetOpMint:
+				s.assets[pick.AssetID] += pick.AssetOp.Amount
+			case AssetOpBurn:
+				s.assets[pick.AssetID] -= pick.AssetOp.Amount
+			}
 			cache[pick.From] = s
 			debitSponsor(pick)
 		case pick.IsAssetTransfer():

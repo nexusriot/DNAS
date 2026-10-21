@@ -38,8 +38,30 @@ const (
 type BlockFilter struct {
 	Index     uint64 `json:"index"`
 	N         int    `json:"n"`          // number of distinct items encoded
-	BlockHash string `json:"block_hash"` // keys the SipHash; ties the filter to a header
+	BlockHash string `json:"block_hash"` // ties the filter to a header
 	Data      string `json:"data"`       // hex of the Golomb-Rice encoded set
+	// Key is the digest the SipHash key is derived from, when that is not the
+	// block hash. Below UpgradeFilterCommit the two are the same and this is
+	// empty, which is also what every filter serialized before this field
+	// existed carries — so an absent Key means "key by BlockHash" and old
+	// filters keep matching exactly as they did.
+	//
+	// It has to be carried rather than re-derived. From the upgrade on, the key
+	// comes from PrevHash and MerkleRoot (see filterKeySeed), and a filter is
+	// served on its own: whoever is matching against it may hold no header for
+	// that height at all. Keying the build from one digest and the match from
+	// another is not a mismatch that fails loudly — it silently answers "not in
+	// this block" for addresses that ARE in it, which is precisely the false
+	// negative that makes a non-match an unsound proof of non-inclusion.
+	Key string `json:"key,omitempty"`
+}
+
+// keySeed is the digest this filter's SipHash key is derived from.
+func (f BlockFilter) keySeed() string {
+	if f.Key != "" {
+		return f.Key
+	}
+	return f.BlockHash
 }
 
 // blockAddresses returns the sorted, de-duplicated set of addresses a block
@@ -78,7 +100,11 @@ func BuildBlockFilter(b Block) BlockFilter {
 	if n == 0 {
 		return f
 	}
-	k0, k1 := filterKeyFor(b)
+	seed := filterKeySeed(b)
+	if seed != b.Hash {
+		f.Key = seed // the matcher cannot re-derive it; see BlockFilter.Key
+	}
+	k0, k1 := filterKey(seed)
 	modulus := uint64(n) * gcsM
 	vals := make([]uint64, n)
 	for i, a := range addrs {
@@ -109,7 +135,7 @@ func (f BlockFilter) Match(addr string) bool {
 	if f.N == 0 {
 		return false
 	}
-	k0, k1 := filterKey(f.BlockHash)
+	k0, k1 := filterKey(f.keySeed())
 	target := fastReduce(sipHash24(k0, k1, []byte(addr)), uint64(f.N)*gcsM)
 	data, err := hex.DecodeString(f.Data)
 	if err != nil {
@@ -288,11 +314,18 @@ func FoldFilterHeaders(prevHex string, filters []BlockFilter) ([]string, error) 
 // Both inputs are needed: MerkleRoot alone repeats across two blocks with
 // identical transaction sets, and PrevHash alone repeats across siblings at the
 // same height. Together they are distinct per block in any chain that extends.
-func filterKeyFor(b Block) (uint64, uint64) {
+func filterKeyFor(b Block) (uint64, uint64) { return filterKey(filterKeySeed(b)) }
+
+// filterKeySeed is the digest filterKeyFor keys from. It is returned as a value
+// rather than folded straight into the key because a filter TRAVELS: a light
+// client holding one has only the filter, and from UpgradeFilterCommit the seed
+// is no longer anything it can re-derive from the filter's own BlockHash. So
+// the builder records it (BlockFilter.Key) and the matcher reads it back.
+func filterKeySeed(b Block) string {
 	if !IsUpgradeActive(UpgradeFilterCommit, b.Index) {
-		return filterKey(b.Hash)
+		return b.Hash
 	}
-	return filterKey(hashBytes([]byte("dnas-cfilter-key:" + b.PrevHash + "|" + b.MerkleRoot)))
+	return hashBytes([]byte("dnas-cfilter-key:" + b.PrevHash + "|" + b.MerkleRoot))
 }
 
 // filterKey derives the 128-bit SipHash key from a hex digest (its first 16

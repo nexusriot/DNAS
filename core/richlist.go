@@ -90,18 +90,18 @@ func (bc *Blockchain) RichList(limit int) RichList {
 
 	out := RichList{
 		Height:      bc.blocks[len(bc.blocks)-1].Index,
-		Accounts:    len(bc.state),
+		Accounts:    bc.state.Len(),
 		Circulating: totalBalance(bc.state),
 	}
 
 	top := &holderHeap{}
 	heap.Init(top)
-	for addr, acc := range bc.state {
+	bc.state.Range(func(addr string, acc Account) bool {
 		if acc.Balance == 0 {
 			// An account with no coin is not a holder. It can still exist — an asset
 			// holder, or an address whose balance was spent to zero — and listing it
 			// would push a real holder out of the ranking.
-			continue
+			return true
 		}
 		heap.Push(top, RichListEntry{
 			Address: addr, Balance: acc.Balance, Nonce: acc.Nonce, Assets: len(acc.Assets),
@@ -109,7 +109,8 @@ func (bc *Blockchain) RichList(limit int) RichList {
 		if top.Len() > limit {
 			heap.Pop(top)
 		}
-	}
+		return true
+	})
 
 	entries := make([]RichListEntry, top.Len())
 	copy(entries, *top)

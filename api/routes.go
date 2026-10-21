@@ -97,6 +97,14 @@ func (r route) open() route {
 	return r
 }
 
+// guarded marks a GET endpoint that DOES require the token. Reads are open by
+// default, and almost all of them should be; this is for the rare one whose
+// cost, rather than whose content, is the reason to hold it back.
+func (r route) guarded() route {
+	r.Auth = true
+	return r
+}
+
 func (r route) does(h http.HandlerFunc) route {
 	r.handler = h
 	return r
@@ -175,6 +183,20 @@ func (s *Server) routes() []route {
 		get("/reorgs", "Reorgs this node has lived through, and the ones it REFUSED").
 			out(node.ReorgReport{}).
 			does(s.reorgs),
+		get("/audit", "Re-derive this node's ledger and check it against what its chain commits").
+			describe("Rebuilds the state trie over every account and re-checks the supply " +
+				"identity, independently of the incremental committer that produced the " +
+				"header. Answers 500 when they disagree: a node whose ledger is not the " +
+				"one its own chain commits to cannot recover by syncing, so a caller that " +
+				"only reads the status code must not mistake it for healthy. " +
+				"TOKEN-GUARDED despite being a read: it is O(ledger) — strictly more " +
+				"expensive than /snapshot — and the flat per-client bucket does not price " +
+				"that, so leaving it open would be a way to spend a node's CPU from a " +
+				"laptop. The RESULT is public via /health and /metrics, which is what a " +
+				"monitor needs; running one on demand is the operator's.").
+			out(core.StateAudit{}).
+			guarded().
+			does(s.guard(s.audit)),
 		get("/richlist", "The largest coin holders, ranked").
 			describe("Needs no index: the answer is already in the account state the chain " +
 				"keeps resident. Bounded to a top-N so one request cannot sort a whole ledger.").

@@ -124,7 +124,7 @@ func TestNameTransferAndRelease(t *testing.T) {
 	}
 	// A released name must leave NOTHING behind: the state root of a chain
 	// where a name was claimed and released must not carry a dead record.
-	if _, ok := bc.state[NameStateKey("shop")]; ok {
+	if _, ok := bc.state.Lookup(NameStateKey("shop")); ok {
 		t.Fatal("a released name left a record in state")
 	}
 }
@@ -140,7 +140,7 @@ func TestExpiredNameIsClaimable(t *testing.T) {
 	// blocks to let a lease run out is not a unit test.
 	mineTxs(t, bc, alice, nameTx(t, alice, &NameOp{Op: NameOpRegister, Name: "lapsed"}, 0))
 	bc.mu.Lock()
-	bc.state[NameStateKey("lapsed")] = Account{Owner: alice.Address(), Expires: 1}
+	bc.state.Put(NameStateKey("lapsed"), Account{Owner: alice.Address(), Expires: 1})
 	bc.mu.Unlock()
 
 	if _, held := bc.LookupName("lapsed"); held {
@@ -303,9 +303,9 @@ func TestSelectNeverPutsTwoClaimsOfOneNameInABlock(t *testing.T) {
 // without the feature, or scheduling it forks the chain.
 func TestNameFieldsDoNotChangeStateRootWithoutNames(t *testing.T) {
 	plain := map[string]Account{"dnasa": {Balance: 5, Nonce: 1}}
-	before := stateRoot(plain)
+	before := stateRoot(memStateOf(plain))
 	withUpgradeAt(t, UpgradeNameService, 0)
-	if after := stateRoot(plain); after != before {
+	if after := stateRoot(memStateOf(plain)); after != before {
 		t.Fatal("scheduling the name service changed the state root of a chain with no names")
 	}
 }

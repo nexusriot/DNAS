@@ -115,13 +115,13 @@ func TestCommitterDeletesEmptiedAccounts(t *testing.T) {
 		"dnasaaa": {Balance: 10},
 		"dnasbbb": {Balance: 20},
 	}
-	sc := &stateCommitter{store: store, root: stateRootInto(store, state)}
+	sc := &stateCommitter{store: store, root: stateRootInto(store, memStateOf(state))}
 
 	delete(state, "dnasbbb")
 	undo := []undoEntry{{addr: "dnasbbb", prev: Account{Balance: 20}, existed: true}}
-	got := sc.rootAfter(state, undo)
+	got := sc.rootAfter(memStateOf(state), undo)
 
-	if want := stateRoot(state); got != want {
+	if want := stateRoot(memStateOf(state)); got != want {
 		t.Fatalf("after deletion: incremental %s, rebuild %s", short12(got), short12(want))
 	}
 }
@@ -209,14 +209,14 @@ func TestCommitCostIsIndependentOfLedgerSize(t *testing.T) {
 		for i := 0; i < accounts; i++ {
 			state[fmt.Sprintf("dnas%040x", i)] = Account{Balance: uint64(i)}
 		}
-		sc := &stateCommitter{store: store, root: stateRootInto(store, state)}
+		sc := &stateCommitter{store: store, root: stateRootInto(store, memStateOf(state))}
 		before := store.Len()
 
 		addr := fmt.Sprintf("dnas%040x", 0)
 		acc := state[addr]
 		acc.Balance += 1
 		state[addr] = acc
-		sc.rootAfter(state, []undoEntry{{addr: addr, prev: Account{}, existed: true}})
+		sc.rootAfter(memStateOf(state), []undoEntry{{addr: addr, prev: Account{}, existed: true}})
 		return store.Len() - before // nodes written by the one-account update
 	}
 

@@ -280,6 +280,22 @@ func CheckTxSanity(tx Transaction) error {
 		if err := tx.AssetOp.Validate(); err != nil {
 			return err
 		}
+		// Authorization to manage an asset is proven by DERIVATION, not by a
+		// lookup: the id must reproduce from (sender, ticker, issuing nonce).
+		// That makes it a rule about the transaction alone, so it belongs here
+		// rather than only in applyAssetOp — otherwise an unauthorized mint is
+		// admitted to the mempool, selected into a candidate, and refused only
+		// when the block is applied, which invalidates the whole candidate.
+		// Four of them in one template exhaust the miner's rebuild budget
+		// (Node.maxBuildAttempts) and block production stops.
+		//
+		// A tightening that cannot change any block's validity: application has
+		// always refused these, so no valid chain contains one and no flag day
+		// is needed (the same argument as the name-key rule above).
+		if !tx.AssetOp.AuthorizedBy(tx.From, tx.AssetID) {
+			return fmt.Errorf("%s did not issue asset %s (the stated ticker and nonce do not derive it)",
+				tx.From, tx.AssetID)
+		}
 	case tx.IsNameOp():
 		// A name operation names no recipient: its effect is on the name
 		// record, and its shape was checked above. The transfer fields must
@@ -772,13 +788,25 @@ func checkTxAddresses(tx Transaction) error {
 		}
 	}
 	for _, o := range tx.outputs() {
-		// An issuance has no recipient at all, so an empty To is legitimate there
-		// and only there.
-		if o.To == "" && tx.IsIssue() {
+		// Three transaction forms name no recipient at all, and CheckTxSanity
+		// REQUIRES their To to be empty: an issuance credits the issuer, an
+		// asset operation moves the issuer's own holding, and a name operation
+		// writes a name record. An empty To is legitimate for exactly those,
+		// and demanding an address of them would not tighten anything — it
+		// would make all three impossible from the activation height on.
+		if o.To == "" && (tx.IsIssue() || tx.IsAssetOp() || tx.IsNameOp()) {
 			continue
 		}
 		if err := wallet.ValidateAddress(o.To); err != nil {
 			return fmt.Errorf("recipient address %q: %w", o.To, err)
+		}
+	}
+	// A name's TARGET is the address the name resolves to, so it is the one
+	// address on a name operation that a payer will later send coin to — the
+	// typo this rule exists to catch, one indirection further out.
+	if tx.IsNameOp() && tx.Name.Target != "" {
+		if err := wallet.ValidateAddress(tx.Name.Target); err != nil {
+			return fmt.Errorf("name target address %q: %w", tx.Name.Target, err)
 		}
 	}
 	if tx.FeePayer != "" {

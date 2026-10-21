@@ -7,11 +7,13 @@ import (
 )
 
 // withUpgradeAt schedules an upgrade for the duration of a test and unschedules
-// it afterwards, so an activation in one test cannot leak into another.
+// it afterwards, so an activation in one test cannot leak into another. The
+// restore goes back to the profile baseline, not to "unscheduled" — see
+// core/main_test.go.
 func withUpgradeAt(t *testing.T, name string, height uint64) {
 	t.Helper()
 	SetUpgradeHeight(name, height)
-	t.Cleanup(func() { ClearUpgradeHeight(name) })
+	t.Cleanup(func() { restoreUpgrade(name) })
 }
 
 // Scheduling a commitment must not change any block hash below its activation

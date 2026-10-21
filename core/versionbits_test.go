@@ -151,7 +151,7 @@ func TestRegisterDeploymentRefusesAContestedBit(t *testing.T) {
 // The end-to-end claim: a chain whose miners signal actually turns the rule on,
 // through the same upgrade table every validation rule already reads.
 func TestMinerVoteActivatesTheRuleOnChain(t *testing.T) {
-	t.Cleanup(func() { ClearDeployments(); ClearUpgrades() })
+	t.Cleanup(func() { ClearDeployments(); restoreUpgrades() })
 	ClearDeployments()
 	ClearUpgrades()
 
@@ -201,7 +201,7 @@ func TestMinerVoteActivatesTheRuleOnChain(t *testing.T) {
 // that discards it: the winning chain never cast those votes, so a node that
 // kept the rule on would be validating against a chain nobody else is on.
 func TestReorgWithdrawsALockIn(t *testing.T) {
-	t.Cleanup(func() { ClearDeployments(); ClearUpgrades() })
+	t.Cleanup(func() { ClearDeployments(); restoreUpgrades() })
 	ClearDeployments()
 	ClearUpgrades()
 
@@ -242,7 +242,7 @@ func TestReorgWithdrawsALockIn(t *testing.T) {
 // BIP34's actual purpose: two blocks paying the same miner the same subsidy no
 // longer share a transaction id, so "which block paid this" has one answer.
 func TestUniqueCoinbaseGivesDistinctTxids(t *testing.T) {
-	t.Cleanup(ClearUpgrades)
+	t.Cleanup(restoreUpgrades)
 	ClearUpgrades()
 
 	dup := NewCoinbase("addr", 50*Coin)
@@ -264,7 +264,7 @@ func TestUniqueCoinbaseGivesDistinctTxids(t *testing.T) {
 }
 
 func TestCoinbaseShapeChecksHeightBinding(t *testing.T) {
-	t.Cleanup(ClearUpgrades)
+	t.Cleanup(restoreUpgrades)
 	ClearUpgrades()
 
 	// Inactive: a nonce is forbidden, as it always was.

@@ -31,7 +31,8 @@ func TestREPLVocabularyIsCompleteAndDocumented(t *testing.T) {
 	}
 	// The surfaces the node grew and the console could not reach.
 	for _, want := range []string{"send", "balance", "address", "info", "peers", "mempool",
-		"tx", "assets", "supply", "stats", "health", "reorgs", "prune", "webhooks", "mine", "generate"} {
+		"tx", "assets", "supply", "stats", "health", "reorgs", "prune", "webhooks", "mine", "generate",
+		"sendmany"} {
 		if !seen[want] {
 			t.Errorf("the console has no %q command", want)
 		}
@@ -234,5 +235,40 @@ func TestREPLSendCarriesTheOptions(t *testing.T) {
 	// And the console must show it, memo and window included.
 	if !strings.Contains(got, "valid in heights") {
 		t.Errorf("the send did not report the window it attached:\n%s", got)
+	}
+}
+
+// sendmany's argument form is the whole interface: `addr:amount`, repeated. A
+// parse that quietly accepted a malformed pair would sign a payment nobody
+// meant, so every rejection here matters more than the happy path.
+func TestSendManyArgumentsParse(t *testing.T) {
+	a, _ := wallet.New()
+	b, _ := wallet.New()
+
+	outs, total, err := parseOutputs([]string{a.Address() + ":1.5", b.Address() + ":0.25"})
+	if err != nil {
+		t.Fatalf("a well-formed pair list was refused: %v", err)
+	}
+	if len(outs) != 2 {
+		t.Fatalf("parsed %d outputs, want 2", len(outs))
+	}
+	if want := core.Coin*3/2 + core.Coin/4; total != want {
+		t.Fatalf("total = %d, want %d", total, want)
+	}
+	if outs[0].To != a.Address() || outs[0].Amount != core.Coin*3/2 {
+		t.Fatalf("first output = %+v", outs[0])
+	}
+
+	for name, args := range map[string][]string{
+		"no recipients":    {},
+		"missing colon":    {a.Address() + " 1.5"},
+		"bad address":      {"dnasnotreal:1"},
+		"bad amount":       {a.Address() + ":not-a-number"},
+		"pays nothing":     {a.Address() + ":0"},
+		"one bad of three": {a.Address() + ":1", "dnasnotreal:1", b.Address() + ":1"},
+	} {
+		if _, _, err := parseOutputs(args); err == nil {
+			t.Errorf("%s: accepted %v", name, args)
+		}
 	}
 }

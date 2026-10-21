@@ -50,11 +50,12 @@ func blockBurned(b Block) uint64 {
 
 // totalBalance sums the coin held by every account. Assets are a separate ledger
 // and never count toward coin supply.
-func totalBalance(state map[string]Account) uint64 {
+func totalBalance(state StateDB) uint64 {
 	var total uint64
-	for _, acc := range state {
+	state.Range(func(_ string, acc Account) bool {
 		total += acc.Balance
-	}
+		return true
+	})
 	return total
 }
 
@@ -91,7 +92,7 @@ func (bc *Blockchain) Supply() Supply {
 		Minted:      minted,
 		Burned:      bc.burned,
 		Circulating: circulating,
-		Accounts:    len(bc.state),
+		Accounts:    bc.state.Len(),
 		Subsidy:     BlockReward(next),
 		NextHalving: (next/HalvingInterval + 1) * HalvingInterval,
 		Consistent:  minted >= bc.burned && minted-bc.burned == circulating,

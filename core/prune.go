@@ -90,7 +90,7 @@ func (bc *Blockchain) pruneLocked() {
 		// exists and is still held; what is lost is the ability to fetch the
 		// transaction that issued it, not the fact that it happened.
 		bc.forgetBodyLocked(b)
-		bc.blocks[i] = blockFromHeader(b.Header())
+		bc.blocks[i] = BlockFromHeader(b.Header())
 		bc.undos[i] = nil // no reorg may reach here (see MinPruneKeep)
 		bc.pruned++
 	}
@@ -342,7 +342,7 @@ func (bc *Blockchain) stateSnapshotLocked() (*Snapshot, error) {
 	for i := len(bc.blocks) - 1; i > int(at); i-- {
 		applyUndo(state, bc.undos[i])
 	}
-	return &Snapshot{Height: at, Header: bc.blocks[at].Header(), Accounts: state}, nil
+	return &Snapshot{Height: at, Header: bc.blocks[at].Header(), Accounts: stateAsMap(state)}, nil
 }
 
 // writeStateSnapshotFile writes a sidecar beside the store, atomically. Holds

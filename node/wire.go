@@ -99,6 +99,37 @@ func (mw *msgWriter) Encode(m Message) error {
 	return err
 }
 
+// peekBinaryType reads the message type out of the head of a binary frame
+// without consuming it, so the per-type cap can be applied before the payload
+// is allocated.
+//
+// The layout it relies on is encodeMessageBinary's first write: the fType tag,
+// then an 8-byte length, then that many bytes of type name. Anything that does
+// not match — a short read, a different first field, an implausible name
+// length — returns false, and the caller falls back to the global ceiling
+// rather than guessing. It must never reject a frame on its own: a wrong guess
+// here would drop valid traffic, so an unrecognized head is simply unknown.
+func peekBinaryType(r *bufio.Reader, length int) (MsgType, bool) {
+	const tagAndLen = 1 + 8
+	if length < tagAndLen {
+		return "", false
+	}
+	head, err := r.Peek(tagAndLen)
+	if err != nil || head[0] != fType {
+		return "", false
+	}
+	n := binary.BigEndian.Uint64(head[1:])
+	// A type name is a short ASCII word. Anything else is not this layout.
+	if n == 0 || n > 32 || int(n) > length-tagAndLen {
+		return "", false
+	}
+	full, err := r.Peek(tagAndLen + int(n))
+	if err != nil {
+		return "", false
+	}
+	return MsgType(full[tagAndLen:]), true
+}
+
 // msgReader reads framed messages from a peer.
 type msgReader struct{ r *bufio.Reader }
 
@@ -119,6 +150,19 @@ func (mr *msgReader) Decode(m *Message) error {
 	if int(length) > maxFrame {
 		return fmt.Errorf("peer announced a %d-byte message, over the %d frame limit", length, maxFrame)
 	}
+	// And a tighter, PER-TYPE bound where the type can be known without reading
+	// the body. The binary format puts the type first, so it can be peeked off
+	// the buffered reader while the rest of the frame is still on the socket —
+	// which is the difference between refusing a 64 MiB `ping` and allocating
+	// for it first (see framecap.go).
+	if hdr[0] == wireBinary {
+		if t, ok := peekBinaryType(mr.r, int(length)); ok {
+			if cap := maxPayloadFor(t); int(length) > cap {
+				return fmt.Errorf("peer announced a %d-byte %s message, over the %d cap for that type",
+					length, t, cap)
+			}
+		}
+	}
 	payload := make([]byte, length)
 	if _, err := io.ReadFull(mr.r, payload); err != nil {
 		return err
@@ -130,7 +174,17 @@ func (mr *msgReader) Decode(m *Message) error {
 		full := make([]byte, 0, len(payload)+1)
 		full = append(full, wireJSON)
 		full = append(full, payload...)
-		return json.Unmarshal(full, m)
+		if err := json.Unmarshal(full, m); err != nil {
+			return err
+		}
+		// A JSON frame has no fixed layout, so its type could not bound the
+		// allocation above. Check it now: the message is refused either way,
+		// just after the bytes rather than before them.
+		if cap := maxPayloadFor(m.Type); len(payload) > cap {
+			return fmt.Errorf("peer sent a %d-byte %s message, over the %d cap for that type",
+				len(payload), m.Type, cap)
+		}
+		return nil
 	case wireBinary:
 		return decodeMessageBinary(payload, m)
 	default:
@@ -167,6 +221,9 @@ const (
 	fHash
 	fFrom
 	fTo
+	fFilters
+	fCFHeaders
+	fBase
 	fEnd byte = 0
 )
 
@@ -240,6 +297,18 @@ func encodeMessageBinary(m Message) []byte {
 	if len(m.Locator) > 0 {
 		w.field(fLocator)
 		w.strs(m.Locator)
+	}
+	if len(m.Filters) > 0 {
+		w.field(fFilters)
+		w.filters(m.Filters)
+	}
+	if len(m.CFHeaders) > 0 {
+		w.field(fCFHeaders)
+		w.strs(m.CFHeaders)
+	}
+	if m.Base != 0 {
+		w.field(fBase)
+		w.u64(m.Base)
 	}
 	if len(m.Hashes) > 0 {
 		w.field(fHashes)
@@ -386,6 +455,12 @@ func decodeMessageBinary(data []byte, m *Message) error {
 			m.From = r.u64()
 		case fTo:
 			m.To = r.u64()
+		case fFilters:
+			m.Filters = r.filters()
+		case fCFHeaders:
+			m.CFHeaders = r.strs()
+		case fBase:
+			m.Base = r.u64()
 		default:
 			// An unknown field cannot be skipped: the length of its value is
 			// not knowable without understanding the tag. A newer peer sending

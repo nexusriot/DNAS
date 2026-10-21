@@ -12,14 +12,44 @@ import (
 const testFee = uint64(1_000_000)
 
 // mineOn builds and mines a valid block (coinbase to minerAddr + txs) on the tip.
+// mineOn mines the next block on bc, paying the coinbase to minerAddr.
 func mineOn(t testing.TB, bc *Blockchain, minerAddr string, txs []Transaction) Block {
 	t.Helper()
+	return mineAt(t, bc, minerAddr, txs, bc.Tip().Timestamp+1)
+}
+
+// mineAt is mineOn with an explicit timestamp, for the rules that turn on when
+// a block claims to have been made (median-time-past, future drift).
+//
+// There is ONE implementation on purpose. It used to be two, and the second had
+// quietly fallen a commitment behind: it filled neither the merkle root nor the
+// scheduled header commitments, so every test that reached for it started
+// failing the moment those upgrades were switched on — which is exactly the
+// drift between two copies of a rule that the suite exists to catch.
+func mineAt(t testing.TB, bc *Blockchain, minerAddr string, txs []Transaction, ts int64) Block {
+	t.Helper()
+	mined, ok := buildBlockAt(bc, minerAddr, txs, ts)
+	if !ok {
+		t.Fatal("mining aborted unexpectedly")
+	}
+	return mined
+}
+
+// buildBlockAt assembles and mines the next block on bc. It takes no testing.TB
+// so that fixtures built outside a test — storeprune_test's sync.Once, say —
+// go through this same path instead of keeping a copy that falls behind.
+func buildBlockAt(bc *Blockchain, minerAddr string, txs []Transaction, ts int64) (Block, bool) {
 	tip := bc.Tip()
+	height := tip.Index + 1
 	baseFee := bc.NextBaseFee()
-	cb := NewCoinbase(minerAddr, CoinbaseAmount(tip.Index+1, txs, baseFee))
+	// NewCoinbaseAt rather than NewCoinbase: it binds the height in only once
+	// UpgradeUniqueCoinbase is active, so this is the identical transaction (and
+	// therefore the identical block hash) when it is not. Spelling it this way is
+	// what lets the whole suite run with every upgrade switched on.
+	cb := NewCoinbaseAt(minerAddr, CoinbaseAmount(height, txs, baseFee), height)
 	block := Block{
-		Index:        tip.Index + 1,
-		Timestamp:    tip.Timestamp + 1,
+		Index:        height,
+		Timestamp:    ts,
 		Transactions: append([]Transaction{cb}, txs...),
 		PrevHash:     tip.Hash,
 		BaseFee:      baseFee,
@@ -28,11 +58,7 @@ func mineOn(t testing.TB, bc *Blockchain, minerAddr string, txs []Transaction) B
 	block.MerkleRoot = MerkleRoot(block.Transactions) // the filter root is keyed on it
 	block.FilterRoot, block.HistoryRoot, _ = bc.NextCommitments(block)
 	block.StateRoot, _ = bc.NextStateRoot(block) // commit post-block state (err ignored: invalid blocks are meant to be rejected)
-	mined, ok := Mine(block, nil)
-	if !ok {
-		t.Fatal("mining aborted unexpectedly")
-	}
-	return mined
+	return Mine(block, nil)
 }
 
 // mineVersioned is mineOn with an explicit header version, for the BIP9 tests:
@@ -424,7 +450,7 @@ func TestReplaceChainLongestWins(t *testing.T) {
 
 // stateCopy returns a snapshot of the account state, for tests that compare a
 // chain's state against one rebuilt independently.
-func (bc *Blockchain) stateCopy() map[string]Account {
+func (bc *Blockchain) stateCopy() StateDB {
 	bc.mu.RLock()
 	defer bc.mu.RUnlock()
 	return cloneState(bc.state)

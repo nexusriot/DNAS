@@ -211,7 +211,7 @@ func buildVectors(t *testing.T) vectorFile {
 			"pow_limit_bits":                  PowLimitBits,
 			"tx_codec_version":                txCodecVersion,
 			"coinbase_sender":                 CoinbaseSender,
-			"empty_state_root":                stateRoot(map[string]Account{}),
+			"empty_state_root":                stateRoot(NewMemState()),
 			"genesis_hash_mainnet":            GenesisBlock().Hash,
 		},
 	}
@@ -339,7 +339,7 @@ func buildVectors(t *testing.T) vectorFile {
 		}},
 	} {
 		v.StateRoots = append(v.StateRoots, stateRootVector{
-			Name: tc.name, Accounts: tc.state, Root: stateRoot(tc.state),
+			Name: tc.name, Accounts: tc.state, Root: stateRoot(memStateOf(tc.state)),
 		})
 	}
 
@@ -354,7 +354,7 @@ func buildVectors(t *testing.T) vectorFile {
 		{"synthetic", Header{
 			Index: 7, Timestamp: 1735689700, PrevHash: genesis.Hash,
 			MerkleRoot: merkleRootOf([]string{"aa", "bb"}),
-			StateRoot:  stateRoot(map[string]Account{alice.Address(): {Balance: Coin, Nonce: 1}}),
+			StateRoot:  stateRoot(memStateOf(map[string]Account{alice.Address(): {Balance: Coin, Nonce: 1}})),
 			BaseFee:    12, Bits: GenesisBits, Nonce: 99,
 		}},
 	}
@@ -509,6 +509,7 @@ func buildFilterVectors(t *testing.T, ws []*wallet.Wallet) []blockFilterVector {
 // ---------------------------------------------------------------------------
 
 func TestConsensusVectors(t *testing.T) {
+	withDefaultUpgrades(t)
 	built := buildVectors(t)
 
 	if *updateVectors {
@@ -677,6 +678,7 @@ func brief(v any) string {
 // value that is internally inconsistent (a txid that is not the hash of the
 // canonical bytes beside it) would otherwise be invisible.
 func TestConsensusVectorsAreSelfConsistent(t *testing.T) {
+	withDefaultUpgrades(t)
 	raw, err := os.ReadFile(vectorsPath)
 	if err != nil {
 		t.Skipf("no vectors file yet: %v", err)

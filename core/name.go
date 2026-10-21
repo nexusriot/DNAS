@@ -181,13 +181,13 @@ func (r NameRecord) heldAt(height uint64) bool {
 // The fee is paid in coin like every other operation, and the name record is
 // written into the same state the balances live in, so it is committed by the
 // block's state root and provable to a light client.
-func applyNameOp(state map[string]Account, tx Transaction, height, reserve, payerReserve uint64, set func(string, Account)) error {
+func applyNameOp(state StateDB, tx Transaction, height, reserve, payerReserve uint64, set func(string, Account)) error {
 	op := tx.Name
 	if err := op.Validate(); err != nil {
 		return err
 	}
 
-	sender := state[tx.From]
+	sender := state.Get(tx.From)
 	if tx.Nonce != sender.Nonce {
 		return fmt.Errorf("bad nonce for %s: got %d, want %d", tx.From, tx.Nonce, sender.Nonce)
 	}
@@ -202,7 +202,7 @@ func applyNameOp(state map[string]Account, tx Transaction, height, reserve, paye
 	}
 
 	key := nameStateKey(op.Name)
-	rec := nameRecordOf(op.Name, state[key])
+	rec := nameRecordOf(op.Name, state.Get(key))
 
 	switch op.Op {
 	case NameOpRegister:
@@ -272,7 +272,7 @@ func applyNameOp(state map[string]Account, tx Transaction, height, reserve, paye
 func (bc *Blockchain) LookupName(name string) (NameRecord, bool) {
 	bc.mu.RLock()
 	defer bc.mu.RUnlock()
-	acc, ok := bc.state[nameStateKey(name)]
+	acc, ok := bc.state.Lookup(nameStateKey(name))
 	if !ok {
 		return NameRecord{Name: name}, false
 	}
@@ -286,16 +286,17 @@ func (bc *Blockchain) Names() []NameRecord {
 	defer bc.mu.RUnlock()
 	height := bc.blocks[len(bc.blocks)-1].Index
 	var out []NameRecord
-	for k, acc := range bc.state {
+	bc.state.Range(func(k string, acc Account) bool {
 		if !isNameKey(k) {
-			continue
+			return true
 		}
 		rec := nameRecordOf(nameFromKey(k), acc)
 		if !rec.heldAt(height) {
-			continue
+			return true
 		}
 		out = append(out, rec)
-	}
+		return true
+	})
 	sortNameRecords(out)
 	return out
 }

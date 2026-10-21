@@ -39,7 +39,7 @@ func opTx(t *testing.T, w *wallet.Wallet, id, op string, amount, nonce uint64) T
 }
 
 func TestAssetMintAndBurnMoveTheSupply(t *testing.T) {
-	t.Cleanup(ClearUpgrades)
+	t.Cleanup(restoreUpgrades)
 	ClearUpgrades()
 	SetUpgradeHeight(UpgradeAssetOps, 0)
 
@@ -74,7 +74,7 @@ func TestAssetMintAndBurnMoveTheSupply(t *testing.T) {
 // The authority check is the whole design: an id that matches can only have been
 // produced by the account that issued it, so nothing is looked up.
 func TestOnlyTheIssuerCanMint(t *testing.T) {
-	t.Cleanup(ClearUpgrades)
+	t.Cleanup(restoreUpgrades)
 	ClearUpgrades()
 	SetUpgradeHeight(UpgradeAssetOps, 0)
 
@@ -102,7 +102,7 @@ func TestOnlyTheIssuerCanMint(t *testing.T) {
 
 // Naming the wrong preimage fails for the same reason: the id no longer derives.
 func TestMintWithTheWrongPreimageIsRefused(t *testing.T) {
-	t.Cleanup(ClearUpgrades)
+	t.Cleanup(restoreUpgrades)
 	ClearUpgrades()
 	SetUpgradeHeight(UpgradeAssetOps, 0)
 
@@ -124,7 +124,7 @@ func TestMintWithTheWrongPreimageIsRefused(t *testing.T) {
 // An issuer may only destroy what it holds. Burning someone else's units would
 // be confiscation, which is a different feature.
 func TestBurnCannotExceedWhatTheIssuerHolds(t *testing.T) {
-	t.Cleanup(ClearUpgrades)
+	t.Cleanup(restoreUpgrades)
 	ClearUpgrades()
 	SetUpgradeHeight(UpgradeAssetOps, 0)
 
@@ -153,7 +153,7 @@ func TestBurnCannotExceedWhatTheIssuerHolds(t *testing.T) {
 // Before the upgrade activates, a supply is fixed at issuance and holders can
 // rely on that.
 func TestAssetOpsAreInactiveUntilTheirUpgrade(t *testing.T) {
-	t.Cleanup(ClearUpgrades)
+	t.Cleanup(restoreUpgrades)
 	ClearUpgrades()
 
 	bc, issuer, id := issuedChain(t)
@@ -179,7 +179,7 @@ func TestAssetOpsAreInactiveUntilTheirUpgrade(t *testing.T) {
 // Conservation must account for the new ways an asset total can move, or every
 // mint would be rejected as unexplained.
 func TestConservationAccountsForMintsAndBurns(t *testing.T) {
-	t.Cleanup(ClearUpgrades)
+	t.Cleanup(restoreUpgrades)
 	ClearUpgrades()
 	SetUpgradeHeight(UpgradeAssetOps, 0)
 
@@ -203,14 +203,14 @@ func TestConservationAccountsForMintsAndBurns(t *testing.T) {
 	undo := []undoEntry{{addr: "issuer"}}
 	stated := []Transaction{NewCoinbase("m", 0), {From: "issuer", AssetID: id,
 		AssetOp: &AssetOp{Op: AssetOpMint, Amount: 10, Ticker: "GOLD", IssueNonce: 0}}}
-	if err := checkConservation(state, undo, stated, 0, 0); err == nil {
+	if err := checkConservation(memStateOf(state), undo, stated, 0, 0); err == nil {
 		t.Fatal("a mint of 10 that credited 999 was accepted")
 	}
 }
 
 // A reorg that discards a mint must take the supply back with it.
 func TestRegistrySupplyFollowsAReorg(t *testing.T) {
-	t.Cleanup(ClearUpgrades)
+	t.Cleanup(restoreUpgrades)
 	ClearUpgrades()
 	SetUpgradeHeight(UpgradeAssetOps, 0)
 
@@ -244,8 +244,11 @@ func TestRegistrySupplyFollowsAReorg(t *testing.T) {
 }
 
 func TestAssetOpShapeIsChecked(t *testing.T) {
+	// The id must DERIVE from the sender, ticker and issuing nonce: that is how
+	// authority over an asset is proven, and CheckTxSanity enforces it, so a
+	// placeholder pair is not a well-formed operation.
 	base := func() Transaction {
-		return Transaction{From: "dnasx", AssetID: "tok1", Fee: 1, Nonce: 0,
+		return Transaction{From: "dnasx", AssetID: AssetID("dnasx", "GOLD", 0), Fee: 1, Nonce: 0,
 			AssetOp: &AssetOp{Op: AssetOpMint, Amount: 5, Ticker: "GOLD"}}
 	}
 	if err := CheckTxSanity(base()); err != nil {
@@ -260,6 +263,11 @@ func TestAssetOpShapeIsChecked(t *testing.T) {
 		"absurd amount":    func(tx *Transaction) { tx.AssetOp.Amount = MaxAssetSupply + 1 },
 		"bad ticker":       func(tx *Transaction) { tx.AssetOp.Ticker = "not a ticker!" },
 		"no ticker":        func(tx *Transaction) { tx.AssetOp.Ticker = "" },
+		// Authority is proven by derivation, so a sender who did not issue the
+		// asset cannot manage it — and must be refused HERE rather than at block
+		// application, where it would invalidate the miner's whole candidate.
+		"not the issuer": func(tx *Transaction) { tx.From = "dnasy" },
+		"wrong nonce":    func(tx *Transaction) { tx.AssetOp.IssueNonce = 7 },
 	}
 	for name, mutate := range cases {
 		tx := base()

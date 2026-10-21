@@ -8,7 +8,7 @@ import (
 
 // TestUpgradeActivation checks the height-based activation predicate.
 func TestUpgradeActivation(t *testing.T) {
-	defer ClearUpgrades()
+	defer restoreUpgrades()
 	if IsUpgradeActive("nope", 1_000_000) {
 		t.Fatal("an unscheduled upgrade must never be active")
 	}
@@ -28,7 +28,8 @@ func TestUpgradeActivation(t *testing.T) {
 // TestDustLimitUpgradeGated exercises a real height-activated consensus rule: a
 // sub-threshold transfer is valid before the upgrade and invalid at/after it.
 func TestDustLimitUpgradeGated(t *testing.T) {
-	defer ClearUpgrades()
+	withoutUpgrade(t, UpgradeDustLimit)
+	defer restoreUpgrades()
 	bc := NewBlockchain()
 	alice, _ := wallet.New()
 	bob, _ := wallet.New()
