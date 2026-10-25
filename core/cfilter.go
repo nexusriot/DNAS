@@ -547,3 +547,54 @@ func VerifyCommittedFilter(f BlockFilter, prevRoot, committedRoot string) bool {
 	}
 	return folded[0] == committedRoot
 }
+
+// AdoptFilterHeaders installs a filter-header chain fetched from a peer,
+// covering every height this node has, and checks it against the block bodies
+// this node can actually read.
+//
+// A fast-synced node never saw the bodies below its snapshot, so it cannot
+// fold their filters and answers 410 below that height. The chain a full peer
+// serves fills that gap. Every height whose body is here must fold onto the
+// previous header in the served chain — a chain that does not connect to a
+// block this node validated is rejected. Heights whose bodies were never
+// downloaded are the prefix the peer supplied; a caller that asked more than
+// one peer compares those bytes before calling this. This method does not
+// invent a check it cannot make.
+func (bc *Blockchain) AdoptFilterHeaders(chain []string) error {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+	if uint64(len(chain)) != uint64(len(bc.blocks)) {
+		return fmt.Errorf("filter-header chain covers %d heights, this node has %d blocks",
+			len(chain), len(bc.blocks))
+	}
+	for i, h := range chain {
+		raw, err := hex.DecodeString(h)
+		if err != nil || len(raw) != 32 {
+			return fmt.Errorf("filter header %d is not a sha256", i)
+		}
+	}
+	prev := ""
+	for i, b := range bc.blocks {
+		// A placeholder (height > 0, no transactions) has no filter. A fast-synced
+		// genesis is the same shape at height 0: BlockFromHeader leaves Transactions
+		// empty, and IsPlaceholder deliberately does not call that a placeholder, so
+		// the height-0 case is named here. A genesis that still has its coinbase is
+		// folded, which pins the start of the chain. Either way the served header
+		// is what the next real body has to link to.
+		if len(b.Transactions) == 0 {
+			prev = chain[i]
+			continue
+		}
+		got, err := FoldFilterHeaders(prev, []BlockFilter{BuildBlockFilter(b)})
+		if err != nil {
+			return fmt.Errorf("fold filter header %d: %w", i, err)
+		}
+		if got[0] != chain[i] {
+			return fmt.Errorf("filter header %d does not match this node's block body", i)
+		}
+		prev = chain[i]
+	}
+	bc.filterHeaders = append([]string(nil), chain...)
+	bc.filterBase = 0
+	return nil
+}

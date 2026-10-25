@@ -97,13 +97,20 @@ sections matter most for "toy → real".
   All of that is safe for one reason, which is the same reason the cache was
   safe before: a miss costs a rebuild, never a wrong answer.
 
-  **What remains is a disk-backed `StateDB`.** `memState` is still the only
-  implementation, so the ACCOUNTS are still resident even though nothing in
-  `applyBlock` requires them to be. The seam is there; what has to be written
-  against it is a durable key/value store with the same semantics (absent reads
-  as the zero Account, `Range` in address order, `Snapshot` independent), plus a
-  decision about what `Snapshot` costs when a copy is no longer a map copy —
-  which is the part that wants its own design rather than being bolted on.
+  **A disk-backed `StateDB` now exists** ([core/diskstate.go](core/diskstate.go),
+  `dnas node -diskstate`). Committed accounts live in a sorted file beside the
+  block log (`<db>.accounts`); unflushed writes live in an overlay that is
+  rewritten into a new file every `diskFlushEvery` (1024) dirty accounts and on
+  `Close`. `Snapshot` copies the overlay and shares the file, so a reorg or a
+  candidate block costs the overlay, not the ledger. The block log stays
+  authoritative: the account file is rebuilt by replay on every start, so a
+  crash cannot double-apply it.
+
+  What remains: (a) the restart replay is O(chain) — a tip marker in the file
+  header would let a clean restart skip it; (b) `Lookup` has no error return,
+  so a read error on the file is indistinguishable from an absent account;
+  (c) memory is still the default, and `-diskstate` has not been benchmarked
+  against a large ledger.
 - ~~**`[M]` Prune the STORE, not just memory.**~~ **Done.** `-prune` bounded a
   node's resident size while the file kept every original record, so a pruning
   node still paid full disk for history it had discarded and still replayed all
@@ -125,12 +132,15 @@ sections matter most for "toy → real".
   median-time-past and the retarget all read those headers. So the saving is the
   size of the transaction bodies — large on a busy chain, near zero on a devnet
   mining empty blocks.
-- **`[M]` Fetch the filter-header chain during fast sync.** A fast-synced node
-  never saw the bodies below its snapshot, so it cannot fold their filter
-  commitments and reports `filter_base` above them (410 for anything lower).
-  Fetching the chain from a peer during fast-sync — and checking it against a
-  checkpoint — would close the one gap where such a node cannot serve a light
-  client at all.
+- ~~**`[M]` Fetch the filter-header chain during fast sync.**~~ **Done, as a
+  check.** `dnas fastsync` now fetches the API node's filter-header chain, folds
+  every block body it validated onto it (`Blockchain.AdoptFilterHeaders`,
+  [core/cfilter.go](core/cfilter.go)), and with `-peers a,b` requires each peer
+  to serve the same bytes over the wire. A failure is reported without
+  withholding the balances, which do not depend on it. The prefix below the
+  snapshot is still only as good as the agreement of the sources asked — no
+  checkpoint commits to it — and because `fastsync` keeps its chain in memory,
+  the adopted headers are not yet persisted for a node to serve.
 - **`[L]` A second implementation.** *The golden-vector half is done.*
   [core/testdata/consensus_vectors.json](core/testdata/consensus_vectors.json) is a
   language-neutral corpus — 24 transactions across all three networks with their
@@ -143,19 +153,16 @@ sections matter most for "toy → real".
   the spec is *right*, only that it has not silently moved: a corpus agrees with
   whatever produced it. A second client remains the real item, and this is now
   the first thing it should be run against.
-- **`[M]` Make a failed reorg persist atomic — *the divergence is now contained,
-  not yet prevented*.** `reorgLocked` truncates the block store and appends the
-  winning suffix *before* swapping the chain in memory
-  ([core/blockchain.go](core/blockchain.go)). Once the truncate lands there is no
-  old chain left on disk to roll back to, so a failure partway used to leave the
-  store holding a prefix of a chain the node was not running — and the next
-  `AddBlock` would stack the old chain's continuation on top of it, leaving a log
-  that would not replay on restart. The store is now **poisoned** on any such
-  failure ([core/store.go](core/store.go)): every later write is refused with an
-  error naming `dnas db verify`, so the damage stops at one bad reorg instead of
-  compounding silently. What remains is the *atomic* version — writing the suffix
-  to a side region and switching in one step — so a disk error is recoverable
-  rather than merely loud.
+- ~~**`[M]` Make a failed reorg persist atomic.**~~ **Done.**
+  ([core/reorgcommit.go](core/reorgcommit.go).) A reorg writes the winning
+  suffix to a side file (`<db>.reorg`, fsynced), publishes a commit record
+  (`<db>.reorg.commit`, temp file + fsync + rename + directory fsync), and only
+  then truncates and appends the main log. A crash before the record leaves the
+  log untouched; a crash after it is finished from the side file on the next
+  open, before any block is read. A failure during the apply still poisons the
+  running store, but recovery is now a restart rather than a hand repair. The
+  one case that still refuses to guess is a commit record whose side file does
+  not check: the store will not open, and the error names `dnas db verify`.
 - ~~**`[M]` Consensus-checked addresses.**~~ **Done, as a scheduled upgrade.**
   Consensus validated only that `To` was not absurdly long, so a buggy client
   could burn coin to a typo and `MaxAddressBytes` merely bounded how much junk
@@ -321,8 +328,13 @@ sections matter most for "toy → real".
   node — which is what the eclipse argument behind "a non-match proves
   non-inclusion" assumes. A node that cannot answer says where its filters start
   rather than answering with less, because an empty filter is a proof of
-  ABSENCE. What remains is the CLIENT: `dnas spv` still speaks HTTP, so nothing
-  in this repo yet samples several peers and compares them.
+  ABSENCE. The client half is in: `dnas spv -peers a,b scan|history` and
+  `dnas fastsync -peers …` dial each peer, do the node handshake with an
+  ephemeral identity, page the filter-header chain
+  ([node/lightclient.go](node/lightclient.go)), and refuse a split with the API
+  node before a non-match counts as absence. What remains is that filters and
+  blocks themselves still come over HTTP from one node; only the header chain
+  that binds them is cross-checked.
 
 ## 3. Programmability
 
@@ -599,11 +611,16 @@ sections matter most for "toy → real".
   is the per-height series the charts needed. `/richlist`
   ([core/richlist.go](core/richlist.go)) ranks holders through a bounded min-heap,
   so one request cannot sort a whole ledger.
-- **`[M]` Persist the address index.** It is in memory and rebuilt at every
-  startup ([core/addrindex.go](core/addrindex.go)), which is fine for a devnet and
-  not for a chain of any length. It also grows with an address's usage rather than
-  with the chain, so it wants an on-disk, paged representation rather than a map
-  of slices.
+- ~~**`[M]` Persist the address index.**~~ **Done.** A node with a `-db`
+  keeps the index in `<db>.addridx` ([core/addrlog.go](core/addrlog.go)): an
+  append-only log of `+`/`-` postings stamped with the tip it was built for,
+  reused across restarts when that tip matches and rebuilt when it does not (or
+  when a record is torn). RAM holds only the file offsets of each address's
+  records — no transaction data — and a query reads that address's records
+  alone, outside the chain lock, so a long history does not stall block
+  connection. `Close` compacts the `-` records away. Still O(postings) in RAM
+  for the offsets; a sorted on-disk index written at compaction would remove
+  that.
 - ~~**`[M]` A real mining pool, not just shares.**~~ **Done.** Shares existed with
   no pool around them: one target for everyone, no payout scheme, no persistence,
   no authentication. All four are now closed.

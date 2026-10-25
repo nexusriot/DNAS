@@ -48,6 +48,22 @@ func TestPrintConfigShowsTheResolvedSettings(t *testing.T) {
 	mustContain(t, out, "defaulted to -listen", "advertise resolution")
 }
 
+// Asking what a node would do must not create its key files, nor fail because
+// -db names a directory that does not exist yet.
+func TestPrintConfigCreatesNothing(t *testing.T) {
+	dir := t.TempDir()
+	out := runCLI(t, dir, "node", "-printconfig", "-network", "regtest",
+		"-db", filepath.Join(dir, "absent", "chain.db"), "-diskstate")
+	mustContain(t, out, "chain.db.accounts", "diskstate path")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		t.Errorf("-printconfig left %s behind", e.Name())
+	}
+}
+
 func TestStructuredLogging(t *testing.T) {
 	n := startNode(t, nodeOpts{name: "logjson", extra: []string{"-logjson"}})
 	n.generate(1)

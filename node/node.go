@@ -1523,6 +1523,7 @@ func (n *Node) Generate(count int) ([]string, error) {
 	hashes := make([]string, 0, count)
 	for i := 0; i < count; i++ {
 		committed := false
+		var lastErr error
 		for attempt := 0; attempt < 5 && !committed; attempt++ {
 			candidate, txs := n.buildBlock()
 			if candidate.StateRoot == "" {
@@ -1533,13 +1534,16 @@ func (n *Node) Generate(count int) ([]string, error) {
 				continue
 			}
 			if err := n.commitMined(mined, txs); err != nil {
+				lastErr = err
 				continue // tip moved under us; rebuild and retry
 			}
 			hashes = append(hashes, mined.Hash)
 			committed = true
 		}
 		if !committed {
-			return hashes, fmt.Errorf("failed to mine block %d after retries", i+1)
+			// Say why: the usual cause is not a moving tip but a rule the
+			// candidate keeps failing, which retrying cannot fix.
+			return hashes, fmt.Errorf("failed to mine block %d after retries: %v", i+1, lastErr)
 		}
 	}
 	return hashes, nil

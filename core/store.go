@@ -21,6 +21,7 @@ const maxStoredBlockBytes = 64 << 20
 // replaces rewriting the whole chain file on every block.
 type blockStore struct {
 	mu      sync.Mutex
+	path    string // the log this store owns, so a reorg can name its side files
 	f       *os.File
 	offsets []int64 // offsets[i] = byte offset of block i (len == blocks stored)
 	size    int64   // total bytes of intact records
@@ -108,10 +109,21 @@ func readStore(path string) (blocks []Block, intact, total int64, err error) {
 }
 
 // openStore opens (or creates) the log at path and returns every stored block.
-// A torn trailing record (from a crash mid-append) is truncated away; a
-// non-empty file that yields no valid records is treated as foreign and left
-// untouched (an error is returned rather than clobbering it).
+// A committed-but-unfinished reorg is finished first (see reorgcommit.go), so
+// the blocks returned are the chain the commit record named. A torn trailing
+// record (from a crash mid-append) is truncated away; a non-empty file that
+// yields no valid records is treated as foreign and left untouched (an error
+// is returned rather than clobbering it).
 func openStore(path string) (*blockStore, []Block, error) {
+	if err := recoverReorg(path); err != nil {
+		return nil, nil, err
+	}
+	return openStoreFile(path)
+}
+
+// openStoreFile opens the log without looking at a reorg commit. recoverReorg
+// calls it, so it must not call recoverReorg — that would recurse.
+func openStoreFile(path string) (*blockStore, []Block, error) {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
 		return nil, nil, err
@@ -123,7 +135,7 @@ func openStore(path string) (*blockStore, []Block, error) {
 	}
 	fileLen := fi.Size()
 
-	s := &blockStore{f: f}
+	s := &blockStore{f: f, path: path}
 	var blocks []Block
 	r := bufio.NewReader(f)
 	var off int64

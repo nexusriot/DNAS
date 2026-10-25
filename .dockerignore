@@ -19,6 +19,11 @@ dist/
 # Node/wallet state from local runs
 *.db
 *.db.tmp
+*.db.state
+*.db.accounts
+*.db.addridx
+*.db.reorg
+*.db.reorg.commit
 wallet.json
 wallet*.json
 w*.json

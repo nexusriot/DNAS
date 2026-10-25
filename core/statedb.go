@@ -15,8 +15,8 @@ import "sort"
 // StateDB is that question made explicit. Every read and write on the
 // application path goes through it, so the ledger's storage becomes a choice
 // rather than an assumption. memState is the map, unchanged in behaviour and
-// still the default; a disk-backed implementation is the same interface with a
-// different backing, and nothing in applyBlock has to know which it got.
+// still the default; diskState (diskstate.go) is the same interface with the
+// committed accounts in a file, and nothing in applyBlock has to know which it got.
 //
 // Two properties the application path depends on, which any implementation must
 // preserve:

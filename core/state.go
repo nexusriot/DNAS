@@ -58,11 +58,9 @@ func stateLeaf(addr string, acc Account) string {
 // the root differs from the fold's, so genesis and every block hash after it
 // differ too.
 //
-// What this does NOT yet buy is the other two things a trie can give. The state
-// is still a resident map, so memory still bounds the ledger; and the root is
-// still rebuilt from the whole account set on each call rather than updated
-// incrementally. Both need applyBlock to read and write THROUGH the trie, which
-// is a refactor of the whole application path and is still open (ROADMAP §1).
+// What this does NOT yet buy on its own is a disk-backed ledger. The trie
+// commit is incremental (statetrie.go); the accounts are a StateDB, which is
+// a map unless the node was opened with OpenDisk (diskstate.go).
 func stateRoot(state StateDB) string {
 	return stateTrieOf(state).Root()
 }

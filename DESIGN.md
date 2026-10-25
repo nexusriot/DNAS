@@ -1226,7 +1226,8 @@ a foreign-file guard). `Blockchain.Open(path)` backs a chain with it so:
 
 - `AddBlock` persists in O(1) (one append), and
 - a reorg **truncates** back to the fork point and appends the new suffix — no
-  whole-file rewrite.
+  whole-file rewrite — after first committing that suffix to a side file
+  (`core/reorgcommit.go`, below).
 
 `Save`/`Load` remain as a JSON import/export snapshot. On restart a node loads its
 store and re-syncs anything missing from peers.
@@ -1269,9 +1270,27 @@ So instead of returning an error and carrying on — which would let the next
 a log that silently will not replay on the *next* restart, possibly days later —
 the store is marked **poisoned** and refuses every subsequent write, naming the
 original cause and `dnas db verify`. The node stays up and readable; it just stops
-pretending its disk is authoritative. This bounds the damage rather than
-preventing it: making the sequence genuinely atomic (a side region and a single
-switch) is the open half, and is in the ROADMAP.
+pretending its disk is authoritative.
+
+**The reorg commit.** Poisoning bounds the damage; `core/reorgcommit.go` makes
+it recoverable. Before the main log is touched, the winning suffix is written to
+`chain.db.reorg` (magic, SHA-256 of the payload, then fork height, block count
+and length-framed blocks) and fsynced, and a 52-byte commit record naming the
+fork, the count and that checksum is published as `chain.db.reorg.commit` by
+temp file, fsync, rename and a directory fsync. Only then is the log truncated
+and appended. The rename is the switch:
+
+- a crash before it leaves the log as it was, and the next open discards the
+  orphan side file;
+- a crash after it — whether or not the apply had started — is finished on the
+  next open, before any block is read, because truncate-and-append is idempotent
+  once the suffix is known;
+- a commit record whose side file does not check is the one case that refuses to
+  guess: the store will not open, and the error names `dnas db verify`.
+
+A failure during the apply in a running node still poisons the store, so nothing
+is stacked on a half-written log; the difference is that a restart now repairs
+it.
 
 **Pruning.** A `Blockchain` keeps its blocks in a slice, so a long chain costs
 its whole size in RAM. `-prune N` (`core/prune.go`) keeps the state and every
@@ -1386,7 +1405,8 @@ a client with headers alone can:
 `Blockchain.FindTxProof` serves a `TxProof` (block index, confirmations, Merkle
 root, proof steps). The API exposes `/headers`, `/header/{index}`,
 `/proof/{txhash}`; `dnas spv` is a real light client that trusts only headers;
-and the web explorer does the same fold in-browser with the Web Crypto API.
+and the web explorer does the same fold in-browser by running `core` compiled
+to WebAssembly (`cmd/wasmverify`, built by `make wasm`).
 
 **Compact block filters (BIP158-style) — non-inclusion.** A merkle proof shows a
 transaction *is* in a block; it says nothing about a block a client didn't ask
@@ -2231,9 +2251,10 @@ See [scripts/README.md](scripts/README.md) for the script details.
   block and serving a state proof both cost the block rather than the ledger
   (at 10,000 accounts, 157ms to 19µs and 157ms to 5µs respectively). The store
   is a bounded cache and a miss falls back to the full rebuild, so correctness
-  never depends on it being warm. What the trie still does NOT buy is the last
-  thing it could: the state is a resident map, so memory bounds the ledger
-  (ROADMAP §1).
+  never depends on it being warm. The ledger is a resident map by default;
+  `-diskstate` ([core/diskstate.go](core/diskstate.go)) moves committed accounts
+  to a sorted file with an overlay of unflushed writes, at the cost of
+  replaying the block log on every start (ROADMAP §1).
 - A coinbase transaction commits only its recipient and amount **until
   `UpgradeUniqueCoinbase` activates**, so before that height two blocks paying
   the same miner the same subsidy share a **txid** (Bitcoin's pre-BIP34 problem)
@@ -2324,10 +2345,11 @@ See [scripts/README.md](scripts/README.md) for the script details.
   different pre-shared key. Still point each at its own data directory: a store
   from one network is refused by a node on another, but the error is easier to
   read than to prevent.
-- The address index (`-addrindex`) is in memory and rebuilt at every startup, and
-  its size is bounded by *usage*, not by the chain: an address appearing in a
-  million transactions has a million entries. It is off by default for that
-  reason.
+- The address index (`-addrindex`) is on disk (`chain.db.addridx`,
+  [core/addrlog.go](core/addrlog.go)) and survives restarts, but RAM still holds
+  an 8-byte offset per posting, and its size is bounded by *usage*, not by the
+  chain: an address appearing in a million transactions has a million entries.
+  It is off by default for that reason.
 - Mempool reconciliation is one request per peer, sent once we are caught up — not
   a continuous set-reconciliation protocol. A transaction broadcast during the
   window between that request and the peer's next push is still missed until
@@ -2347,9 +2369,9 @@ See [scripts/README.md](scripts/README.md) for the script details.
   telemetry rather than chain state.
 - A reorg whose persistence fails **poisons** the block store (§12): the node
   stops writing and says so, rather than continuing onto a log that has diverged
-  from memory. That contains the damage; it does not undo it. Recovery is manual
-  — `dnas db verify`, then re-sync — because making the truncate-and-append
-  sequence atomic is still open work.
+  from memory. A restart then finishes the reorg from its committed side file
+  (§12, the reorg commit). Only a commit record whose side file fails its
+  checksum still needs a manual `dnas db verify` and re-sync.
 - `/chainstats` reports estimates. Hashrate is window work ÷ elapsed time, and
   proof-of-work variance means a short window describes luck as much as
   hashpower; a window whose blocks share a timestamp reports no rate at all

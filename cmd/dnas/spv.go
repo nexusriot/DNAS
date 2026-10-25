@@ -10,24 +10,36 @@ import (
 	"time"
 
 	"github.com/nexusriot/DNAS/core"
+	"github.com/nexusriot/DNAS/node"
 )
 
 // runSPV implements `dnas spv ...`, a standalone light client. It trusts only
 // block headers (which it proof-of-work-verifies) and compact merkle proofs —
 // it never downloads block bodies or trusts the node's balances.
 //
-//	dnas spv [-api URL] sync            verify the header chain, print tip + work
+//	dnas spv [-api URL] [-peers a,b] [-netkey KEY] sync
 //	dnas spv [-api URL] verify <txhash> prove a transaction is in the chain
-//	dnas spv [-api URL] scan <address>  find (and prove non-inclusion of) an address
+//	dnas spv [-api URL] [-peers a,b] scan <address>
 //	dnas spv [-api URL] balance <addr>  prove an address's balance against the state root
-//	dnas spv [-api URL] history <addr>  reconstruct an address's transaction history (light wallet)
+//	dnas spv [-api URL] [-peers a,b] history <addr>
 //	dnas spv [-api URL] wallet ...      persistent light wallet (add/update/status/list/forget)
+//
+// -peers is two or more node addresses that speak the peer protocol. scan and
+// history ask them for the filter-header chain and require they agree with
+// each other and with the API node before a filter non-match is treated as
+// absence. One peer cannot confirm that, so fewer than two leaves the HTTP
+// behavior unchanged. -netkey is the shared key those peers expect; empty uses
+// the network default, which is no key on an open net.
 func runSPV(args []string) {
 	fs := flag.NewFlagSet("spv", flag.ExitOnError)
 	api := fs.String("api", "localhost:8080", "node HTTP API address")
 	cache := fs.String("cache", "spvheaders.json", "verified-header cache file (empty disables it and refetches every time)")
+	peers := fs.String("peers", "", "comma-separated peer addresses; two or more must agree on filter headers before a non-match counts as absence")
+	netkey := fs.String("netkey", "", "pre-shared key for -peers (empty = the network default, which is open on mainnet)")
 	_ = fs.Parse(args)
 	spvCachePath = *cache
+	spvPeers = parsePeers(*peers)
+	spvNetKey = *netkey
 	fs.Visit(func(f *flag.Flag) {
 		if f.Name == "cache" {
 			spvCacheExplicit = true
@@ -35,13 +47,21 @@ func runSPV(args []string) {
 	})
 	rest := fs.Args()
 	if len(rest) == 0 {
-		fmt.Println("usage: dnas spv [-api URL] <sync | verify <txhash> | scan <addr> | balance <addr> | history <addr> | wallet ...>")
+		fmt.Println("usage: dnas spv [-api URL] [-peers LIST] [-netkey KEY] <sync | verify <txhash> | scan <addr> | balance <addr> | history <addr> | wallet ...>")
 		return
 	}
 	base := ensureHTTP(*api)
 	// Everything below either checks the node's genesis or signs a transaction,
 	// both of which are network-bound — so take the network from the node.
 	adoptNetwork(base)
+	if spvNetKey == "" {
+		spvNetKey = core.Network().DefaultNetKey
+	}
+	if len(spvPeers) == 1 {
+		// Ignoring the flag silently would let the operator believe a
+		// non-match had been cross-checked when it had not.
+		fmt.Println("warning: -peers needs two or more addresses; filter headers will NOT be cross-checked")
+	}
 
 	switch rest[0] {
 	case "wallet":
@@ -222,6 +242,18 @@ func verifiedFiltersFrom(base string, from uint64) ([]core.Header, []core.BlockF
 	if err := cache.save(spvCachePath); err != nil {
 		fmt.Println("warning: could not save the header cache:", err)
 	}
+	// Two peers are the minimum that can disagree. Below that, a non-match is
+	// still only the API node's word, which is what this command used to be.
+	if len(spvPeers) >= 2 {
+		if len(cfheaders) != len(headers) {
+			return nil, nil, fmt.Errorf("the API node served %d filter headers for %d blocks; peers cannot confirm a partial chain",
+				len(cfheaders), len(headers))
+		}
+		if err := confirmFilterHeaders(base, cfheaders); err != nil {
+			return nil, nil, err
+		}
+		fmt.Printf("✓ filter-header chain agrees across the API node and %d peers\n", len(spvPeers))
+	}
 	if from > uint64(len(headers)) {
 		from = uint64(len(headers))
 	}
@@ -253,6 +285,32 @@ func verifiedFiltersFrom(base string, from uint64) ([]core.Header, []core.BlockF
 		}
 	}
 	return headers, filters, nil
+}
+
+// confirmFilterHeaders asks every -peers address for the same filter-header
+// chain the API node served and refuses a split. A non-match is only proof of
+// absence when these bytes agree: one node can serve a filter that omits an
+// address and a header chain that covers for it, and a second node that was
+// not asked would never get the chance to disagree.
+func confirmFilterHeaders(httpAddr string, cfheaders []string) error {
+	if len(cfheaders) == 0 {
+		return nil
+	}
+	tip := uint64(len(cfheaders) - 1)
+	sets := []node.CFHeaderSet{{
+		Addr:    httpAddr,
+		From:    0,
+		Headers: cfheaders,
+	}}
+	psk := []byte(spvNetKey)
+	for _, addr := range spvPeers {
+		set, err := node.FetchCFHeaders(addr, psk, 0, tip)
+		if err != nil {
+			return fmt.Errorf("peer %w", err)
+		}
+		sets = append(sets, set)
+	}
+	return node.CompareCFHeaderChains(sets)
 }
 
 // spvScan reports which blocks a compact filter flags for an address — and,
@@ -493,6 +551,8 @@ func ensureHTTP(addr string) string {
 var (
 	spvCachePath     = ""
 	spvCacheExplicit = false // the operator named a cache file, so don't override it
+	spvPeers         []string
+	spvNetKey        string
 )
 
 // fetchHeaders returns the node's whole header chain, verified. With a cache

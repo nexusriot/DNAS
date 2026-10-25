@@ -208,7 +208,9 @@ each defence assumes, and what is explicitly out of scope, see
   `dnas fastsync` fetches the account state at a (checkpoint) height, verifies it
   against the header's committed state root, then downloads and fully validates
   only the blocks above it — reaching the same cumulative work, balances proven
-  rather than trusted.
+  rather than trusted. It then checks the API node's filter-header chain against
+  every body it validated and, with `-peers`, requires the named peers to serve
+  the same chain.
 - **External mining, with long polling and shares.** Mining is decoupled from the
   node: `GET /blocktemplate` hands out a candidate block, an external miner
   (`dnas miner`) searches for the winning nonce off-node, and `POST /submitblock`
@@ -226,7 +228,9 @@ each defence assumes, and what is explicitly out of scope, see
 - **Address history on the node.** With `-addrindex`, `GET /address/{addr}/history`
   lists every transaction that touched an address (sender, recipient or fee
   sponsor), oldest first, paged. It is opt-in because its size is bounded by usage
-  rather than by the chain.
+  rather than by the chain. A node with a `-db` keeps it on disk
+  (`<db>.addridx`), reuses it across restarts, and answers a query from that
+  address's records alone without holding the chain lock.
 - **A faucet for throwaway networks.** `POST /faucet {"address":…}` (or
   `dnas faucet`) pays out of the node's wallet on testnet or regtest, rate-limited
   per address and per client. It is impossible on mainnet by definition rather
@@ -551,7 +555,8 @@ free.
 | `-mine`      | off            | enable mining                                  |
 | `-regtest`   | off            | regtest mode: mine on demand via `POST /generate` (shorthand for `-network regtest`) |
 | `-network`   | `mainnet`      | which network to run on: `mainnet`, `testnet` or `regtest` — separate genesis, signatures and peers |
-| `-addrindex` | off            | index address → transactions, serving `/address/{addr}/history` |
+| `-addrindex` | off            | index address → transactions, serving `/address/{addr}/history` (kept in `<db>.addridx`) |
+| `-diskstate` | off            | keep the account ledger in `<db>.accounts` instead of RAM (rebuilt from the block log on start) |
 | `-faucet`    | off            | hand out coin via `POST /faucet` (testnet/regtest only)        |
 | `-faucetamount` | `10`        | faucet payout in DNAS                                          |
 | `-faucetcooldown` | `60`      | seconds between faucet payouts to one address or requester     |
@@ -696,6 +701,11 @@ dnas spv -api localhost:8080 verify <txhash>   # prove a payment is included
 dnas spv -api localhost:8080 scan    <address> # find/prove non-inclusion of an address (compact filters)
 dnas spv -api localhost:8080 balance <address> # prove an address's balance against the state root
 dnas spv -api localhost:8080 history <address> # reconstruct a wallet's history (light wallet)
+
+# cross-check the filter-header chain against two or more peers (p2p ports)
+# before a filter non-match is accepted as proof that an address is absent
+dnas spv -api localhost:8080 -peers node-a:3000,node-b:3000 scan <address>
+dnas fastsync -api localhost:8080 -peers node-a:3000 <address>
 
 # a regtest node mines on demand instead of waiting on the block interval
 dnas node -regtest -api localhost:8080 &
@@ -895,8 +905,19 @@ block hash, a transaction hash or an address — and works out which it is.
 
 It also acts as a **light client**: paste a transaction hash and it fetches the
 proof + header and verifies inclusion *in your browser* — folding the merkle
-proof and checking the header's proof-of-work with the Web Crypto API, exactly as
-an SPV client would.
+proof and checking the header's proof-of-work with `core` itself, compiled to
+WebAssembly (`make wasm`), exactly as an SPV client would.
+
+![Explorer: chain status, node wallet, a balance lookup and a transaction verified in the browser](docs/screenshots/explorer-overview.png)
+
+*A regtest node after a few payments. The right-hand panel has just proven a
+transaction's inclusion client-side; without `make wasm` it says the verifier
+is missing instead.*
+
+![Explorer: per-block charts, the rich list and the node readiness panel](docs/screenshots/explorer-dashboard.png)
+
+*Further down: per-height series from `/series`, the rich list, and what this
+node can serve — here, ready with one peer and the address index on.*
 
 ## Demo
 
@@ -952,8 +973,9 @@ asset.
   key's position is fixed by the key and arriving at an empty slot is itself the
   proof that nothing is there. The root is computed incrementally against a
   retained node store, so committing a block costs the accounts it touched
-  rather than the whole ledger. What the trie does not yet buy is a disk-backed
-  ledger — state is still a resident map, so memory bounds it.
+  rather than the whole ledger. The ledger itself is a resident map by default;
+  `-diskstate` moves it to a sorted file with a small overlay, at the cost of a
+  full replay of the block log on every start.
 - Merkle SPV proves *inclusion*; compact filters add *non-inclusion*, and from
   the `filtercommit` upgrade that is backed by the chain's work rather than (as
   in BIP157/158) by an honest-node / multi-peer assumption: the filter's header
@@ -975,8 +997,9 @@ asset.
   OTHER senders only, since a sender's own nonce run is already bounded by
   `MaxPerSender`. There is no package *submission*: the parent must still
   arrive first.
-- The address index (`-addrindex`) lives in memory and is rebuilt at every
-  startup, and its size grows with an address's usage rather than with the chain.
+- The address index (`-addrindex`) is on disk and survives restarts, but RAM
+  still holds 8 bytes per posting (the record offsets), so it grows with usage
+  rather than with the chain. A node without `-db` keeps the old in-memory map.
 - Mining shares are node-local accounting: nothing is stored on chain, and
   nothing stops an operator reporting whatever they like. The pool side is real
   enough to point miners at — `-stratum` gives each connection its own extranonce

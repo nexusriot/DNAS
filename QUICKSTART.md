@@ -267,7 +267,8 @@ chains, see §8c2), `-advertise` (address peers should dial you at, for
 multi-host), `-maxpeers`, `-mempool`, `-minrelayfee` (base relay fee in base units
 **per byte**; 0 disables the floor), `-checkpoints height:hash,…` (pin finality
 checkpoints), `-upgrades name:height,…` (schedule consensus upgrades — set the
-same values on every node), `-addrindex` (serve address history),
+same values on every node), `-addrindex` (serve address history), `-diskstate` (keep accounts in
+`<db>.accounts` instead of RAM),
 `-faucet` (hand out coin on a throwaway network), `-dnsseeds host,host` (bootstrap
 from DNS when short of peers), `-wallet FILE`, `-db FILE`, `-netkey KEY`.
 
@@ -443,7 +444,18 @@ cumulative work, balances proven rather than trusted:
 ```sh
 dnas fastsync -api localhost:8080 -checkpoint 20:<hash> <addr>   # trustless bootstrap + report balances
 dnas fastsync -api localhost:8080                               # from the server's latest safe height
+dnas fastsync -api localhost:8080 -peers peer1:3000,peer2:3000  # also require peers to agree on filter headers
 ```
+
+After the bodies, `fastsync` fetches the filter-header chain and checks that
+every block it validated links into it. With `-peers` (p2p addresses, plus
+`-netkey` on a private net) each peer must serve the same chain byte for byte.
+A failure there is printed as `✗ filter headers NOT verified` — the balances
+are still reported, since they do not depend on it.
+
+`dnas spv scan` and `dnas spv history` take the same `-peers`: with two or
+more, a filter non-match only counts as "this address is absent" once the
+peers and the API node agree on the filter-header chain.
 
 ## 8c. Ops: config file, metrics, clean shutdown
 
@@ -626,6 +638,8 @@ curl -s localhost:8080/mempool/stats          # what the pending queue is paying
 ```
 
 It is opt-in: its size grows with an address's usage rather than with the chain.
+It lives in `chain.db.addridx`, so a restart reuses it instead of rebuilding;
+a query reads only that address's records and does not block block connection.
 
 ## 8d8. Chain-store tooling
 
@@ -1342,6 +1356,13 @@ produce signatures a node rejects.
 
 - `chain.db` — the append-only chain; it survives restarts, and a node re-syncs
   anything it's missing from peers.
+- side files beside `chain.db`, each derived from it: `chain.db.accounts`
+  (the account ledger with `-diskstate`, rebuilt by replay on every start),
+  `chain.db.addridx` (the address index with `-addrindex`, reused when it
+  matches the tip and rebuilt when it does not), `chain.db.state` (the state
+  snapshot a pruned store reopens from) and, only while a reorg is being
+  written, `chain.db.reorg` + `chain.db.reorg.commit` — leave those two alone:
+  the next start uses them to finish the reorg.
 - `peers.json`, `bans.json`, `mempool.json` — soft state written beside `chain.db`
   on graceful shutdown and reloaded on start, so a restart resumes warm. The chain
   stays authoritative; these are conveniences (re-learned from peers if lost).

@@ -118,15 +118,19 @@ Usage:
   dnas wallet address|pubkey [-o FILE]
   dnas wallet mnemonic|restore|addresses      BIP39 backup + HD addresses
   dnas wallet multisig -threshold M -pubkeys a,b,c   M-of-N multisig address
-  dnas spv [-api URL] sync            verify the header chain (light client)
+  dnas spv [-api URL] [-peers LIST] [-netkey KEY] sync
+                                      verify the header chain (light client)
   dnas spv [-api URL] verify <txhash> prove a payment is in the chain
-  dnas spv [-api URL] scan <address>  find/prove non-inclusion of an address
+  dnas spv [-api URL] [-peers LIST] scan <address>
+                                      find/prove non-inclusion of an address
   dnas spv [-api URL] balance <addr>  prove an address's balance (state proof)
-  dnas spv [-api URL] history <addr>  reconstruct an address's history (light wallet)
+  dnas spv [-api URL] [-peers LIST] history <addr>
+                                      reconstruct an address's history (light wallet)
   dnas spv [-api URL] wallet ...      persistent light wallet (add/update/status/watch)
   dnas spv [-api URL] wallet -key F new|send <to> <amount>   self-custodial light wallet (signs locally)
   dnas spv [-api URL] wallet -key F sendmany <addr:amt>...    pay many addresses in one transaction
-  dnas fastsync [-api URL] [-checkpoint H:HASH]   bootstrap state from a verified snapshot
+  dnas fastsync [-api URL] [-peers LIST] [-netkey KEY] [-checkpoint H:HASH]
+                                      bootstrap state from a verified snapshot
   dnas miner -api URL -address ADDR   external miner (get template, mine, submit)
   dnas htlc new                       mint a preimage + hash for an atomic swap
   dnas htlc <address|claim|refund>    build hash-time-locked contract spends
@@ -177,6 +181,8 @@ Node flags:
                   (0 = never; costs O(ledger), see GET /audit)
   -triecache N    hold the state-trie cache in a file of N slots instead of RAM
                   (0 = in memory; 512 bytes per slot, survives restarts)
+  -diskstate      keep accounts in <db>.accounts instead of RAM
+                  (replayed from the block log on start)
   -webhook LIST   comma-separated URLs to POST every block/tx event to
   -emptyinterval N  seconds the miner idles before minting an EMPTY block
                   (default 0 = one target block time, currently 60s)
@@ -471,6 +477,11 @@ func runNode(args []string) {
 	// rebuild. Opt-in because a memory cache is faster per lookup, which is what
 	// a small chain wants.
 	trieCache := fs.Int("triecache", cfg.integer("triecache", 0), "keep the state-trie cache in a file of this many slots (0 = in memory; 512 bytes per slot)")
+	// Accounts are a map unless this is set. The file is named beside the block
+	// log so it cannot be pointed at the chain itself, and it is rebuilt by
+	// replaying that log: a crash cannot leave a half-applied ledger that the
+	// next start would apply again.
+	diskState := fs.Bool("diskstate", cfg.boolean("diskstate", false), "keep the account ledger in a file beside -db instead of RAM")
 	webhooks := fs.String("webhook", cfg.str("webhook", ""), "comma-separated URLs to POST every block/tx event to")
 	emptyInterval := fs.Int("emptyinterval", cfg.integer("emptyinterval", 0), "seconds the miner idles before minting an EMPTY block (0 = one target block time)")
 	apiRate := fs.Int("apirate", cfg.integer("apirate", int(api.DefaultAPIRate)), "sustained HTTP API requests per second per client (0 disables the limit)")
@@ -593,38 +604,22 @@ func runNode(args []string) {
 		relayFloor = uint64(*minRelayFee)
 	}
 
-	w, created, err := wallet.LoadOrCreateEncrypted(*walletPath, walletPassphrase())
-	if err != nil {
-		log.Fatalf("wallet: %v", err)
-	}
-	if created {
-		node.Infof("created wallet", "file", *walletPath)
-	}
-	node.Infof("wallet address", "address", w.Address())
-
-	// The node's NETWORK identity is a separate key from the wallet on purpose:
-	// its public key goes to every peer, and a DNAS address is a hash of a public
-	// key, so sharing the wallet key hands every peer the address holding the coin
-	// (see node/identity.go). It defaults to a file beside the chain.
 	identityPath := *nodeKey
 	if identityPath == "" {
 		identityPath = filepath.Join(filepath.Dir(*dbPath), node.IdentityFile)
 	}
-	identity, idCreated, err := node.LoadOrCreateIdentity(identityPath, walletPassphrase())
-	if err != nil {
-		log.Fatal(err)
-	}
-	if idCreated {
-		node.Infof("created node identity", "file", identityPath)
-	}
 
+	// -printconfig reports and exits, so it runs before anything is created:
+	// asking what a node would do must not leave a fresh wallet or identity key
+	// behind (or fail because -db names a directory that does not exist yet).
 	if *printConfig {
 		printEffectiveConfig(effectiveConfig{
 			Network: core.NetworkName(), Listen: *listen, Advertise: *advertise, API: *apiAddr,
 			Peers: parsePeers(*peersStr), DNSSeeds: parsePeers(*dnsSeeds),
 			NetKey: *netKey, MaxPeers: *maxPeers,
 			Wallet: *walletPath, DB: *dbPath, NodeKey: identityPath,
-			Mine: *mine, Regtest: *regtest, Dandelion: *dandelion,
+			DiskState: diskStateLabel(*diskState, *dbPath),
+			Mine:      *mine, Regtest: *regtest, Dandelion: *dandelion,
 			AddrIndex: *addrIndex, Faucet: *faucet, ShareFactor: *shareFactor,
 			MempoolMax: *mempoolMax, MinRelayFee: *minRelayFee,
 			APIRate: *apiRate, APIBurst: *apiBurst, Webhooks: parsePeers(*webhooks),
@@ -638,11 +633,42 @@ func runNode(args []string) {
 		return
 	}
 
-	chain, err := core.Open(*dbPath)
+	w, created, err := wallet.LoadOrCreateEncrypted(*walletPath, walletPassphrase())
 	if err != nil {
-		log.Fatalf("open chain %s: %v", *dbPath, err)
+		log.Fatalf("wallet: %v", err)
 	}
-	node.Infof("chain opened", "height", chain.Height(), "db", *dbPath)
+	if created {
+		node.Infof("created wallet", "file", *walletPath)
+	}
+	node.Infof("wallet address", "address", w.Address())
+
+	// The node's NETWORK identity is a separate key from the wallet on purpose:
+	// its public key goes to every peer, and a DNAS address is a hash of a public
+	// key, so sharing the wallet key hands every peer the address holding the coin
+	// (see node/identity.go). It defaults to a file beside the chain.
+	identity, idCreated, err := node.LoadOrCreateIdentity(identityPath, walletPassphrase())
+	if err != nil {
+		log.Fatal(err)
+	}
+	if idCreated {
+		node.Infof("created node identity", "file", identityPath)
+	}
+
+	var chain *core.Blockchain
+	if *diskState {
+		accounts := *dbPath + ".accounts"
+		chain, err = core.OpenDisk(*dbPath, accounts)
+		if err != nil {
+			log.Fatalf("open chain %s: %v", *dbPath, err)
+		}
+		node.Infof("chain opened", "height", chain.Height(), "db", *dbPath, "accounts", accounts)
+	} else {
+		chain, err = core.Open(*dbPath)
+		if err != nil {
+			log.Fatalf("open chain %s: %v", *dbPath, err)
+		}
+		node.Infof("chain opened", "height", chain.Height(), "db", *dbPath)
+	}
 	if *addrIndex {
 		chain.EnableAddressIndex() // built once here, maintained as blocks connect
 		node.Infof("address index enabled", "serves", "/address/{addr}/history")
@@ -758,8 +784,15 @@ func runNode(args []string) {
 	}
 }
 
-// faucetPayout parses the -faucetamount flag (decimal DNAS); an empty value
-// leaves the node's default in place.
+// diskStateLabel is what -printconfig shows for the account ledger: the file
+// it will live in, or the memory default.
+func diskStateLabel(on bool, dbPath string) string {
+	if !on {
+		return ""
+	}
+	return dbPath + ".accounts"
+}
+
 func faucetPayout(s string) uint64 {
 	if strings.TrimSpace(s) == "" {
 		return 0

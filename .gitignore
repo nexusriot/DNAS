@@ -6,6 +6,15 @@
 chain*.json
 chain*.db
 *.db
+# Side files a chain store writes beside its -db path: the pruned-state
+# sidecar (.state), the disk account ledger (-diskstate, .accounts), the
+# address index (-addrindex, .addridx) and an in-flight reorg commit (.reorg,
+# .reorg.commit). All derived from, or finishing, the block log.
+*.db.state
+*.db.accounts
+*.db.addridx
+*.db.reorg
+*.db.reorg.commit
 wallet*.json
 w*.json
 spvwallet*.json

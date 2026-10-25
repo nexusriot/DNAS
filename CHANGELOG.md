@@ -103,6 +103,30 @@ It is still a learning project, not money. Do not point it at the internet.
   minting an empty block. It defaults to one target block time, which is right
   for a network and far too slow for a demo.
 
+- **A disk-backed account ledger** ([core/diskstate.go](core/diskstate.go),
+  `dnas node -diskstate`). Committed accounts live in a sorted file,
+  `<db>.accounts`; unflushed writes live in an overlay that `Snapshot` copies
+  while sharing the file, so a reorg or candidate block costs the overlay rather
+  than the ledger. The file is rebuilt by replaying the block log on every start,
+  so the log stays authoritative. Memory remains the default.
+
+- **A persistent address index** ([core/addrlog.go](core/addrlog.go)). With a
+  `-db`, `-addrindex` keeps an append-only `+`/`-` posting log in
+  `<db>.addridx`, stamped with the tip it was built for and reused across
+  restarts. RAM holds only each address's record offsets; a query reads that
+  address's records alone, outside the chain lock.
+
+- **Atomic reorg persistence** ([core/reorgcommit.go](core/reorgcommit.go)).
+  The winning suffix goes to a checksummed side file and a fsynced commit record
+  before the block log is truncated; the next open finishes an interrupted
+  reorg instead of leaving a poisoned store for hand repair.
+
+- **Multi-peer filter-header checks** ([node/lightclient.go](node/lightclient.go)).
+  `dnas spv -peers a,b scan|history` and `dnas fastsync -peers …` fetch the
+  filter-header chain over the peer protocol and refuse a split with the API
+  node. `fastsync` also checks the served chain against every body it validated
+  (`Blockchain.AdoptFilterHeaders`).
+
 ### Changed
 
 - **The state root is computed incrementally** ([core/statetrie.go](core/statetrie.go)).
@@ -123,6 +147,13 @@ It is still a learning project, not money. Do not point it at the internet.
   suggests.
 
 ### Fixed
+
+- **Review fixes to the above, before release.** A ledger flush that hit a
+  read error wrote a short account file instead of failing; the reorg commit
+  record was renamed without a directory fsync; the light client looped forever
+  on a peer that answered below the requested height; `fastsync` withheld the
+  verified balances when the filter-header check failed; and `spv -peers` with
+  one address was silently ignored.
 
 - **Every SPV verifier outside `core` was broken.** The explorer's JavaScript,
   the TUI's Go, the PyQt GUI's Python and `scripts/demo.sh`'s Python each

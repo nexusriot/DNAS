@@ -50,8 +50,10 @@ type Blockchain struct {
 	txIndex         map[string]TxLoc // txid -> where it is confirmed (see txindex.go)
 	// addrIndex maps an address to every transaction that touched it. Optional
 	// (nil = disabled, the default) because its size is unbounded by the chain —
-	// see addrindex.go.
+	// see addrindex.go. addrLog is the same index on disk, used when the chain
+	// has a store path; the two are not both set.
 	addrIndex map[string][]TxLoc
+	addrLog   *addrLog
 	// assets describes every asset the chain has issued (id -> ticker, issuer,
 	// supply). Always on: it is bounded by the number of issuances, and without it
 	// an asset balance is an opaque id (see assetindex.go).
@@ -335,6 +337,7 @@ func (bc *Blockchain) AddBlock(block Block) error {
 	bc.burned += blockBurned(block)
 	bc.extendFilterHeadersLocked(block)
 	bc.pruneLocked() // a no-op unless this node prunes (see prune.go)
+	bc.maybeFlushState()
 	return nil
 }
 
@@ -488,27 +491,16 @@ func (bc *Blockchain) reorgLocked(fork int, suffix []Block) (bool, []Block, erro
 		undos = append(undos, undo)
 	}
 
-	// Persist (truncate to the fork, append the new suffix) before committing in
-	// memory, so disk and memory stay consistent.
+	// Persist before committing in memory, so disk and memory stay consistent.
 	//
-	// This sequence is the one place a write cannot be rolled back: once the
-	// truncate lands, the log no longer holds the losing suffix, so a failure
-	// partway through leaves disk with a prefix of a chain this node is not yet
-	// running. There is nothing to undo to — so instead of returning an error and
-	// carrying on (which would append the old chain's continuation on top of the
-	// new suffix and leave a log that will not replay), the store is poisoned and
-	// refuses every later write. The node stays up and readable; it just cannot
-	// pretend its disk is still authoritative.
+	// The suffix is written to a side file and named by a commit record before
+	// the main log is touched (see reorgcommit.go). A failure before that
+	// record leaves the log as it was. A failure during the apply poisons the
+	// store — the same containment as before — and the next open finishes the
+	// reorg from the side file instead of needing a hand repair.
 	if bc.store != nil {
-		if err := bc.store.truncateAfter(uint64(fork)); err != nil {
-			bc.store.poison(err)
-			return false, nil, fmt.Errorf("persist reorg: %w", err)
-		}
-		for i := fork + 1; i < len(blocks); i++ {
-			if err := bc.store.append(blocks[i]); err != nil {
-				bc.store.poison(err)
-				return false, nil, fmt.Errorf("persist reorg: %w", err)
-			}
+		if err := bc.store.commitReorg(uint64(fork), blocks[fork+1:]); err != nil {
+			return false, nil, err
 		}
 	}
 
@@ -535,6 +527,7 @@ func (bc *Blockchain) reorgLocked(fork int, suffix []Block) (bool, []Block, erro
 	// A reorg can advance the tip by many blocks at once, which moves the prune
 	// cutoff with it.
 	bc.pruneLocked()
+	bc.maybeFlushState()
 	return true, disconnected, nil
 }
 
@@ -625,14 +618,34 @@ func (bc *Blockchain) Save(path string) error {
 
 // Open returns a blockchain backed by an append-only block log at path,
 // replaying and validating whatever is stored. Once open, AddBlock appends
-// incrementally (O(1) on disk) and reorgs truncate+append — no whole-file
-// rewrite. A fresh file is initialized with the genesis block.
+// incrementally (O(1) on disk) and reorgs commit through a side file — no
+// whole-file rewrite of the log. A fresh file is initialized with the genesis
+// block. Account state is the in-memory ledger; OpenDisk is the same open
+// with accounts in a file.
 func Open(path string) (*Blockchain, error) {
+	return openChain(path, nil)
+}
+
+// OpenDisk is Open with the account ledger in a file at statePath. The file
+// is rebuilt by replaying the block log (which stays authoritative) and
+// flushed as the overlay grows, so steady state does not hold every account.
+func OpenDisk(blockPath, statePath string) (*Blockchain, error) {
+	if statePath == "" {
+		return nil, errors.New("disk state path is empty")
+	}
+	st, err := NewDiskState(statePath)
+	if err != nil {
+		return nil, err
+	}
+	return openChain(blockPath, st)
+}
+
+func openChain(path string, state StateDB) (*Blockchain, error) {
 	store, blocks, err := openStore(path)
 	if err != nil {
 		return nil, err
 	}
-	bc := NewBlockchain() // in-memory genesis; store stays nil during replay
+	bc := newChain(state) // store stays nil during replay, so it is not written twice
 	if len(blocks) == 0 {
 		if err := store.append(GenesisBlock()); err != nil {
 			store.close()
@@ -655,6 +668,18 @@ func Open(path string) (*Blockchain, error) {
 				store.close()
 				return nil, err
 			}
+			if state != nil {
+				// The snapshot landed in a map. Move it into the caller's ledger
+				// and flush, so the map does not stay resident after open returns.
+				transferState(state, seeded.state)
+				seeded.state = state
+				if ds, ok := state.(*diskState); ok {
+					if err := ds.Flush(); err != nil {
+						store.close()
+						return nil, err
+					}
+				}
+			}
 			bc = seeded
 		} else {
 			for i := 1; i < len(blocks); i++ {
@@ -667,7 +692,47 @@ func Open(path string) (*Blockchain, error) {
 	}
 	bc.store = store // future writes now persist
 	bc.storePath = path
+	if ds, ok := bc.state.(*diskState); ok && ds.dirtyCount() > 0 {
+		// The tail of the replay was under the flush threshold. Flushing here
+		// means the overlay does not hold the ledger the replay just built.
+		if err := ds.Flush(); err != nil {
+			store.close()
+			return nil, err
+		}
+	}
 	return bc, nil
+}
+
+// newChain is NewBlockchain with an optional ledger. A nil state is the
+// in-memory one. An empty disk ledger commits the same genesis root: both
+// ranges are empty.
+func newChain(state StateDB) *Blockchain {
+	bc := NewBlockchain()
+	if state != nil {
+		bc.state = state
+	}
+	return bc
+}
+
+// transferState copies every account from src into dst. Used once, when a
+// pruned open built its ledger in a map and the caller asked for disk.
+func transferState(dst, src StateDB) {
+	src.Range(func(addr string, acc Account) bool {
+		dst.Put(addr, acc)
+		return true
+	})
+}
+
+// maybeFlushState rewrites the account file when the overlay has grown past
+// the threshold. It is a no-op for the in-memory ledger. A flush error leaves
+// the overlay in place — the accounts are still right — and the next flush
+// retries. Failing the block would be a lie: the block is already in the log.
+func (bc *Blockchain) maybeFlushState() {
+	ds, ok := bc.state.(*diskState)
+	if !ok || ds.dirtyCount() < diskFlushEvery {
+		return
+	}
+	_ = ds.Flush()
 }
 
 // openPrunedStore rebuilds a chain whose early bodies were pruned from disk,
@@ -719,16 +784,42 @@ func openPrunedStore(path string, blocks []Block, firstPruned int) (*Blockchain,
 	return bc, nil
 }
 
-// Close releases the backing store, if any.
+// Close flushes the account file, compacts the address index, and releases
+// the block log.
 func (bc *Blockchain) Close() error {
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
-	if bc.store != nil {
-		err := bc.store.close()
-		bc.store = nil
-		return err
+	var err error
+	if ds, ok := bc.state.(*diskState); ok {
+		if ferr := ds.Flush(); ferr != nil {
+			err = ferr
+		}
+		// The account file stays open for the life of the chain so reads do not
+		// reopen it per lookup. Close is the end of that life.
+		if ds.base != nil && ds.base.f != nil {
+			if cerr := ds.base.f.Close(); cerr != nil && err == nil {
+				err = cerr
+			}
+			ds.base.f = nil
+		}
 	}
-	return nil
+	if bc.addrLog != nil && len(bc.blocks) > 0 {
+		tip := bc.blocks[len(bc.blocks)-1]
+		if aerr := bc.addrLog.compact(tip.Index, tip.Hash); aerr != nil && err == nil {
+			err = aerr
+		}
+		if cerr := bc.addrLog.close(); cerr != nil && err == nil {
+			err = cerr
+		}
+		bc.addrLog = nil
+	}
+	if bc.store != nil {
+		if serr := bc.store.close(); serr != nil && err == nil {
+			err = serr
+		}
+		bc.store = nil
+	}
+	return err
 }
 
 // Load reads a chain from a JSON snapshot (as written by Save) and revalidates

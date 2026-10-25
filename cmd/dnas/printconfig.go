@@ -32,6 +32,7 @@ type effectiveConfig struct {
 	MaxPeers    int
 	Wallet      string
 	DB          string
+	DiskState   string
 	NodeKey     string
 	Mine        bool
 	Regtest     bool
@@ -90,6 +91,11 @@ func printEffectiveConfig(c effectiveConfig) {
 	fmt.Println()
 	row("wallet", c.Wallet)
 	row("db", c.DB)
+	if c.DiskState == "" {
+		row("diskstate", "off (accounts in memory)")
+	} else {
+		row("diskstate", c.DiskState)
+	}
 	row("nodekey", c.NodeKey)
 	fmt.Println()
 	row("mine", c.Mine)

@@ -55,7 +55,7 @@ DNAS is a learning project. Do not point it at the internet.
 | Deep history rewrite | `MaxReorgDepth` (100) + operator checkpoints | See §5: this is also a liveness hazard. A refusal is now counted, logged and surfaced by `/health` rather than silent |
 | Oversized/expensive blocks | `MaxBlockBytes`, `MaxBlockTxs`, `MaxBlockVerifyOps`, `MaxCoinbaseBytes` | The verification-cost model matches real cost |
 | Timestamp manipulation | Median-time-past, `MaxFutureDrift` (120s), plus a bounded median-of-peers clock offset ([core/nettime.go](core/nettime.go)) | Peers are majority-honest. The offset is capped at `MaxTimeOffset` (70 min), so a hostile peer set moves the clock at most that far |
-| A corrupt store after a failed reorg | The block store poisons itself and refuses further writes ([core/store.go](core/store.go)) | Recovery is manual |
+| A corrupt store after a failed reorg | The suffix is committed to a checksummed side file before the log is touched; a failed apply poisons the store, and the next open finishes the reorg from the side file ([core/reorgcommit.go](core/reorgcommit.go)) | A commit record whose side file fails its checksum is refused, and recovery from that is manual |
 
 ### Networking
 
