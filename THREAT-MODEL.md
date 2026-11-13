@@ -64,8 +64,16 @@ DNAS is a learning project. Do not point it at the internet.
 | Inbound eclipse | Total + per-network-group inbound caps | A /16 approximates an operator — weaker than an ASN |
 | **Outbound eclipse** | Address manager: tried/new tables, per-group cap on live outbound peers ([node/addrman.go](node/addrman.go)) | Same /16 approximation; an attacker with addresses in many ranges still wins |
 | Gossip flooding memory | Bounded tables with eviction, per-group entry caps | — |
-| Peer resource abuse | Per-peer token bucket, ban scoring, frame cap | 64 MiB frame cap is coarse; no per-message-type limits (ROADMAP §2) |
+| Peer resource abuse | Per-peer token bucket, ban scoring, per-message-type frame caps ([node/framecap.go](node/framecap.go)) — a frame's type (binary or JSON) is peeked and an oversized one refused before its body is allocated; encrypted frames are at most 1 MiB, so an unauthenticated connection cannot make the node allocate more per frame | — |
+| Expensive header requests | A `getheaders` locator is resolved by walking down from the tip against at most 128 hashes | — |
+| Stratum socket exhaustion | 1024 sessions overall, 64 per address; 30s to authorize, 10 min idle deadline | — |
+| A peer that stops reading | Every peer send has a 20s write deadline; a peer that misses it is disconnected | Without it one stalled socket froze relay node-wide |
+| Censoring the next block by hash | A block's hash enters the seen-set only after it validates, so an empty or bogus body sent under the real block's hash no longer makes the node ignore the real one | — |
+| Address-book bloat | The peer book is capped (4096 entries, addresses ≤ 262 bytes) and `getpeers` answers a bounded sample | — |
+| Compact block with a self-declared easy target | A compact block is only reconstructed if it extends our tip with the expected `Bits`, and only the peer asked can complete it; anything else takes the full-block path | — |
+| PPLNS share inflation | A duplicate share on the same tip is rejected (stratum and `/submitshare`) | — |
 | Passive eavesdropping | Encrypted, authenticated transport ([node/secure.go](node/secure.go)) | — |
+| Replaying, reordering or reflecting frames | A key per direction and a counter nonce the reader requires in order | — |
 | **Active MITM on the handshake** | **None.** The open handshake is anonymous | Safety rests on connecting to many peers. No key pinning yet |
 | Transaction origin linkage | Dandelion++ stem/fluff | Anonymity set is tiny on a small network |
 | Hostile bootstrap | DNS seeds enter the `new` table with no special standing, subject to the same diversity cap; consulted only when short of peers | Configure more than one seed. A single seed *is* an eclipse vector |
@@ -75,7 +83,7 @@ DNAS is a learning project. Do not point it at the internet.
 | Threat | Defence | Assumption |
 |---|---|---|
 | Unauthorised writes | Bearer token on mutating endpoints, constant-time compare | One shared token; no per-user auth |
-| Request flooding | Per-IP token bucket, 429 + `Retry-After` | Ignores `X-Forwarded-For` on purpose; needs a proxy-side limit behind a proxy |
+| Request flooding | Cost-weighted per-IP token bucket (IPv6 keyed by /64, client map capped at 65536), 429 + `Retry-After`; `/events` capped at 256 streams node-wide and 8 per client; HTTP read/header/idle timeouts | Ignores `X-Forwarded-For` on purpose; needs a proxy-side limit behind a proxy |
 | Memory amplification | Paged reads; `http.MaxBytesReader` on every write endpoint (413) | — |
 | Key theft at rest | PBKDF2 + AES-256-GCM when `DNAS_WALLET_PASSPHRASE` is set | **Unencrypted by default** |
 | Secrets in `ps` | Passphrase and API token come from the environment, never flags | Environment is readable by the same user |
@@ -86,7 +94,9 @@ DNAS is a learning project. Do not point it at the internet.
 | Threat | Defence | Assumption |
 |---|---|---|
 | Fake payment | Merkle inclusion proof against a PoW-verified header | Client verifies the header chain itself |
-| Fake balance | State proof against the header's state root | — |
+| A forged header chain at minimum difficulty | SPV, fastsync and the header cache require each header's `Bits` to equal the LWMA retarget (`core.ValidateHeaderDifficulty`), not merely to be met; the browser verifier does the same for every header its run holds the retarget window beneath (`core.ValidateHeaderRunDifficulty`) | The first 21 headers of a run anchored mid-chain cannot be checked; the result says how many were |
+| A txid changed in relay | Script witness hex must be lowercase to be relayed | Policy, not consensus: a miner can still include a mutated copy |
+| Fake balance | State proof against the header's state root, bound to the queried address (`core.VerifyAccountProofFor`) — a valid proof about a *different* account is refused | — |
 | **"You were never paid"** | An **absence proof** against the header's trie state root ([core/state.go](core/state.go)); compact filters additionally give probabilistic block-level non-inclusion | Both answers are trustless once `filtercommit` is active: the filter's header is in the proof-of-work preimage, so a forged filter does not fold to the committed value. Below that height the filter answer still rests on honest-node/multi-peer |
 | Being lied to about which address a name points at | The name record is in the state trie, so a resolution — and the absence of a registration — is provable against a PoW-verified header ([core/name.go](core/name.go)) | The client actually checks, rather than reading `/name/{name}`. `dnas name resolve` proves by default; `-trust` opts out |
 | Being shown a block that is not in the chain | An ancestry proof against the Merkle Mountain Range the later header commits ([core/mmr.go](core/mmr.go)) | `historyroot` is active at both heights; below it, ancestry still means holding every header in between |

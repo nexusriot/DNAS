@@ -156,10 +156,25 @@ type peer struct {
 // supports reports whether the peer advertised a capability.
 func (p *peer) supports(cap string) bool { return p.caps[cap] }
 
+// peerWriteTimeout bounds how long one message may take to reach a peer's
+// socket. send is called from relay paths that serve EVERY peer (block and tx
+// announcements, the miner, API submits); a peer that completes the handshake
+// and then stops reading would otherwise fill its TCP window and block those
+// paths forever, holding p.mu. A peer that cannot take a message in this long
+// is disconnected instead.
+var peerWriteTimeout = 20 * time.Second
+
 func (p *peer) send(m Message) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	_ = p.enc.Encode(m)
+	if p.conn != nil && p.conn.conn != nil {
+		_ = p.conn.conn.SetWriteDeadline(time.Now().Add(peerWriteTimeout))
+	}
+	if err := p.enc.Encode(m); err != nil && p.conn != nil {
+		// A frame may be half-written: the stream is unusable. Closing it ends
+		// the peer's read loop, which removes the peer.
+		_ = p.conn.Close()
+	}
 }
 
 // Node is a running participant in the DNAS network.
@@ -866,7 +881,9 @@ func (n *Node) handleMessage(p *peer, m Message) {
 		n.addrs.Add(m.Addr, "hello")
 
 	case MsgGetPeers:
-		p.send(Message{Type: MsgPeers, Peers: append(n.book.all(), n.cfg.AdvertiseAddr)})
+		// A bounded sample, not the whole book: a tiny request must not buy a
+		// reply the size of everything this node has ever heard of.
+		p.send(Message{Type: MsgPeers, Peers: append(n.book.sample(maxGossipPeers-1), n.cfg.AdvertiseAddr)})
 
 	case MsgPeers:
 		if len(m.Peers) > maxGossipPeers {
@@ -1210,17 +1227,25 @@ func (n *Node) onMempoolBatch(from *peer, txs []core.Transaction) {
 // compact block. Keeping it in one place is what lets compact relay be a
 // transport detail rather than a second, subtly different validation path.
 func (n *Node) onBlockReceived(p *peer, b core.Block) {
-	if n.markSeenBlock(b.Hash) {
+	if n.seenBlk.has(b.Hash) {
 		return
 	}
 	// A block that is malformed on its own terms (bad PoW or merkle root) is
 	// peer misbehaviour and earns ban points; one that is well-formed but
 	// doesn't link to our tip is just a fork, handled below with a re-sync.
+	//
+	// This runs BEFORE the hash is marked seen. The seen-set is keyed by the
+	// hash a block CLAIMS; marking first let a peer send an empty body under
+	// the hash of the real next block, after which the genuine block — pushed,
+	// pulled or compact — was dropped as a duplicate.
 	if err := b.SelfValid(); err != nil {
 		if n.bans.add(p.id, banInvalidBlock) {
 			Warnf("peer banned", "peer", short(p.id), "reason", "invalid block", "err", err)
 		}
 		return
+	}
+	if n.markSeenBlock(b.Hash) {
+		return // another peer's copy got here first
 	}
 	n.noteBestHeight(b.Index)
 	if err := n.chain.AddBlock(b); err != nil {

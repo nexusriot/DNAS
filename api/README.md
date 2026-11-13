@@ -17,8 +17,14 @@ genesis on a long chain.
 Every request passes a **per-client token bucket** (`ratelimit.go`,
 `-apirate`/`-apiburst`), answering **429** with `Retry-After` when it is
 exceeded. It keys on the client IP and deliberately ignores `X-Forwarded-For`: a
-client-set header would hand out a fresh bucket per request. `/events` is exempt,
-being one long-lived request that then sends many messages.
+client-set header would hand out a fresh bucket per request. An IPv6 client is
+keyed by its **/64**, since one subscriber is routinely handed a whole /64 and
+would otherwise have 2^64 buckets to rotate through. The bucket map itself is
+capped (65536 clients, least-recently-seen evicted first, idle ones expired), so
+the limiter's memory is bounded by a constant rather than by how many source
+addresses an attacker has. `/events` is exempt from the budget, being one
+long-lived request that then sends many messages — but it is capped instead: at
+most 256 concurrent streams node-wide and 8 per client, **429** beyond that.
 
 The bucket is **cost-weighted**: an endpoint debits tokens in proportion to
 what it costs the node, rather than one each. It used to be flat, which priced
@@ -26,7 +32,24 @@ what it costs the node, rather than one each. It used to be flat, which priced
 cost several orders of magnitude more than an `/info`, so the nominal limit
 and the actual CPU a client could demand were not the same number. The file's
 own comment had named the expensive endpoints and then charged them like the
-cheap ones.
+cheap ones. The weights (`routeCost`) are in units of one cheap read:
+
+| Cost | Endpoints |
+|------|-----------|
+| 30 | whole-ledger work: `/snapshot/{h}`, `/audit` |
+| 5 | a pass over every account or a window of blocks: `/richlist`, `/series`, `/chainstats`, `/supply` |
+| 2 + 1 per 100 of `?limit=` (or `?max=`) | the paged reads: `/chain`, `/headers`, `/cfheaders`, `/cfilters` |
+| 3 | a proof built per call: `/stateproof/`, `/nameproof/`, `/proof/`, `/ancestry`, `/cfilter/` |
+| 3 | `/metrics`, `/address*` |
+| 1 | everything else |
+
+A cost above the burst is charged as the burst, so a client with a full bucket
+can always make any single request.
+
+The HTTP server sets `ReadHeaderTimeout` 10s, `ReadTimeout` 30s and
+`IdleTimeout` 2m, so a slow-loris client cannot hold a connection open by
+trickling a request. There is deliberately **no** `WriteTimeout`: `/events` and
+the long-polled `/blocktemplate` are responses that are *meant* to stay open.
 
 The browser verification bundle is served from `/wasm/` (`dnas.wasm`,
 `wasm_exec.js`), embedded from `wasmdist/`. It is a build artifact: a binary
@@ -52,7 +75,7 @@ anyone may issue "GOLD"), `/asset/{id}` (one asset plus its holders and the held
 total, which must equal the issued supply), `/webhooks` (delivery counters),
 `/peers`, `/address`, `/estimatefee?blocks=N`
 (recommended per-byte fee = base fee + estimated tip, never below the relay
-floor), `/metrics` (Prometheus format: 55 series covering the chain, the mempool
+floor), `/metrics` (Prometheus format: 63 series covering the chain, the mempool
 by count *and* bytes, peers and their ban scores, reorg totals and depth, orphan
 count, hashrate and block intervals, supply, tip age, blocks-behind, the share
 ledger and webhook delivery — most of these were previously reachable only as
@@ -78,11 +101,28 @@ SPV / light-client endpoints: `/headers`, `/header/{index}`, `/block/{index}`
 (one full block body, so a light client downloads only filter-flagged blocks),
 `/proof/{txhash}` (a merkle inclusion proof, verifiable against a header's merkle
 root), `/stateproof/{addr}` (an account balance/nonce proof against the header
-state root; 404 for an absent account), `/snapshot/{height}` (the full account
+state root — for an account that does not exist it answers a verifiable
+*absence* proof with `found: false`, not 404, since arriving at an empty trie slot
+is itself the proof that nothing is there), `/snapshot/{height}` (the full account
 state at a height — or `/snapshot/latest` — verified against the header's state
 root, for `dnas fastsync`), plus the compact block filters `/cfilters`,
 `/cfilter/{index}`, and the BIP157-style filter-header chain `/cfheaders` for
-non-inclusion scans.
+non-inclusion scans. `/nameproof/{name}` is the state proof for a name (it takes
+the name and derives the key server-side, because a name's key contains a NUL byte
+and cannot travel in a path — the client must still check the proof is about the
+key it derived itself), and `/ancestry?height=H[&as_of=T]` proves a block is an
+ancestor of a later one through the header's Merkle Mountain Range, in
+logarithmic size (needs the `historyroot` upgrade active at both heights).
+
+Name service: `/names` (every name the chain holds) and `/name/{name}` (resolve a
+name to its address, returning the state key so the answer can be checked with
+`/stateproof/{key}` or `/nameproof/{name}`).
+
+Charts and ranking: `/series?from=H&limit=N` (or `?last=N`) is per-height
+difficulty, interval, base fee and fee flow — `/chainstats` summarizes a window
+into single numbers, which cannot show a quantity *moving*. `/richlist?limit=N`
+ranks the largest holders straight from resident account state, bounded to a
+top-N so one request cannot sort a whole ledger.
 
 Operator endpoints: `/peers` (every connection in detail — identity, negotiated
 version, capabilities, direction, uptime, ban score, whether a block request is
@@ -92,7 +132,20 @@ the threshold itself), `POST /unban`, `POST /addpeer`, `POST /droppeer`,
 flow, miners), `/reorgs` (the chain switches this node has lived through), and
 `/health` — which answers **503 with reasons** when the node is not usable.
 `/info` cannot serve that purpose: it answers 200 while syncing, un-peered, or on
-a tip that stopped moving hours ago.
+a tip that stopped moving hours ago. `/deployments` reports each BIP9 versionbits
+deployment — miner signal counts and the state the chain has taken it to — and
+`/pool` the PPLNS payout accounting (who has a claim on the next block found).
+
+`GET /audit` re-derives the ledger (rebuilds the state trie over every account
+and re-checks the supply identity) independently of the incremental committer,
+and answers **500** when it disagrees with what the chain commits. It is
+**token-guarded despite being a read**: it is O(ledger), strictly more expensive
+than `/snapshot`. Its *result* is public through `/health` and `/metrics`
+(`dnas_audit_*`); running one on demand is the operator's call.
+
+`GET /openapi.json` is the API's OpenAPI 3.1 document, generated from the same
+route table (`routes.go`) that registers the handlers, so it cannot describe an
+endpoint that is not served or miss one that is.
 
 Event stream: `GET /events` is a Server-Sent Events stream that pushes a small
 JSON envelope on every new block, reorg, and mempool transaction (fed by the

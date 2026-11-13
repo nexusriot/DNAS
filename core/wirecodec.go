@@ -17,7 +17,7 @@ import "errors"
 // bytes, so a peer decodes exactly what a disk record would.
 
 // EncodeBlock returns a block's canonical binary record.
-func EncodeBlock(b Block) []byte { return encodeBlockV5(b) }
+func EncodeBlock(b Block) []byte { return encodeBlockCurrent(b) }
 
 // DecodeBlock parses a block from EncodeBlock's output, accepting every record
 // version the store accepts.
@@ -53,8 +53,9 @@ func DecodeHeader(data []byte) (Header, error) {
 // and a signing preimage must not have.
 func EncodeTransaction(t Transaction) []byte {
 	s := &sbuf{}
-	s.byte(storeRecordV5)
-	encodeTxV2(s, t, storeRecordV5)
+	v := recordVersionFor([]Transaction{t})
+	s.byte(v)
+	encodeTxV2(s, t, v)
 	return s.b
 }
 
@@ -64,7 +65,7 @@ func DecodeTransaction(data []byte) (Transaction, error) {
 		return Transaction{}, errors.New("empty transaction record")
 	}
 	version := data[0]
-	if version < storeRecordV2 || version > storeRecordV5 {
+	if version < storeRecordV2 || version > storeRecordV6 {
 		return Transaction{}, errors.New("unrecognized transaction record version")
 	}
 	r := &srdr{b: data[1:]}

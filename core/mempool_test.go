@@ -141,3 +141,41 @@ func TestMempoolPruneExpired(t *testing.T) {
 		t.Fatalf("prune at tip 3: dropped %d, size %d", n, mp.Size())
 	}
 }
+
+func TestMempoolStatsBucketsByFeeRate(t *testing.T) {
+	mp := NewMempool()
+	if st := mp.Stats(); st.Count != 0 || len(st.Buckets) != len(feeBucketEdges) {
+		t.Fatalf("empty pool stats: %+v", st)
+	}
+	for i, rate := range []uint64{2, 30, 30, 700} {
+		w, _ := wallet.New()
+		tx := Transaction{From: w.Address(), To: "dnasx", Amount: 1, Nonce: 0}
+		if err := tx.Sign(w); err != nil {
+			t.Fatal(err)
+		}
+		size := uint64(tx.Size())
+		tx.Fee = rate * size
+		if err := tx.Sign(w); err != nil {
+			t.Fatal(err)
+		}
+		if uint64(tx.Size()) != size {
+			t.Fatalf("tx %d changed size when its fee was set", i)
+		}
+		if added, err := mp.Add(tx); !added || err != nil {
+			t.Fatalf("add %d: %v", i, err)
+		}
+	}
+	st := mp.Stats()
+	if st.Count != 4 || st.MinRate != 2 || st.MaxRate != 700 || st.MedianRate != 30 {
+		t.Fatalf("stats = %+v", st)
+	}
+	counts := map[uint64]int{}
+	total := 0
+	for _, b := range st.Buckets {
+		counts[b.From] = b.Count
+		total += b.Count
+	}
+	if total != 4 || counts[1] != 1 || counts[25] != 2 || counts[500] != 1 {
+		t.Fatalf("bucket counts = %v", counts)
+	}
+}

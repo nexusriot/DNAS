@@ -43,7 +43,45 @@ func (pb *peerbook) note(addr string) {
 	if pb.selfAliases[addr] {
 		return // another spelling of us; gossiping it would send peers in a circle
 	}
+	if len(addr) > maxPeerAddrLen {
+		return // not a host:port anyone could dial; gossip is attacker-controlled
+	}
+	if !pb.known[addr] && len(pb.known) >= maxKnownPeers {
+		// Full: evict an arbitrary address that is not being dialed. Gossip is
+		// attacker-controlled, so the book is bounded rather than trusted —
+		// without a cap one peer could grow it by ~25 MB per message.
+		for a := range pb.known {
+			if !pb.dialing[a] {
+				delete(pb.known, a)
+				break
+			}
+		}
+		if len(pb.known) >= maxKnownPeers {
+			return
+		}
+	}
 	pb.known[addr] = true
+}
+
+// maxKnownPeers bounds the gossip address book, and maxPeerAddrLen each entry
+// (a DNS name is at most 253 bytes, plus ":port").
+const (
+	maxKnownPeers  = 4096
+	maxPeerAddrLen = 262
+)
+
+// sample returns up to n known addresses, in no particular order.
+func (pb *peerbook) sample(n int) []string {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+	out := make([]string, 0, min(n, len(pb.known)))
+	for a := range pb.known {
+		if len(out) >= n {
+			break
+		}
+		out = append(out, a)
+	}
+	return out
 }
 
 // noteSelf records an address that turned out to be this node, so it is never

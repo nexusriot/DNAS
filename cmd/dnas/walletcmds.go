@@ -585,6 +585,15 @@ func backupRestore(args []string) {
 	if bundle.Network != "" && bundle.Network != core.NetworkName() {
 		fmt.Printf("note: this backup was taken on %s\n", bundle.Network)
 	}
+	// A bundle names its files, and the names are joined onto -d. A backup only
+	// ever holds plain file names; anything with a path in it ("../.bashrc",
+	// "/home/u/.ssh/authorized_keys") would write outside the directory asked
+	// for, so the whole restore is refused.
+	for _, name := range sortedNames(bundle) {
+		if !safeBackupName(name) {
+			log.Fatalf("backup names a file %q that is not a plain file name; refusing to restore it", name)
+		}
+	}
 	// Refuse the whole restore if anything is in the way, rather than restoring
 	// half of it: overwriting a live key file with an older one loses whatever the
 	// live one held, and a partial restore leaves a directory nobody can reason
@@ -604,10 +613,17 @@ func backupRestore(args []string) {
 	for _, name := range sortedNames(bundle) {
 		// Key material comes back 0600 whatever it was; the mode is not in the
 		// bundle, and the safe assumption for a restored key file is the strict one.
-		if err := os.WriteFile(filepath.Join(*dir, name), []byte(bundle.Files[name]), 0o600); err != nil {
+		if err := wallet.WriteFileAtomic(filepath.Join(*dir, name), []byte(bundle.Files[name]), 0o600); err != nil {
 			log.Fatalf("write %s: %v", name, err)
 		}
 		fmt.Printf("restored %s\n", name)
 	}
 	fmt.Printf("%d file(s) restored into %s. The chain re-syncs on its own.\n", len(bundle.Files), *dir)
+}
+
+// safeBackupName reports whether name is a plain file name that stays inside
+// the directory it is joined onto.
+func safeBackupName(name string) bool {
+	return name != "" && name != "." && name != ".." &&
+		name == filepath.Base(name) && !strings.ContainsAny(name, `/\`)
 }

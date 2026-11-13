@@ -139,7 +139,7 @@ func VerifyStore(path string) (VerifyReport, error) {
 			}
 			headers[i] = blocks[i].Header()
 		}
-		seeded, err := NewFromSnapshot(snap, headers)
+		seeded, err := NewFromSnapshotWithBodies(snap, headers, recentBodies(blocks, snap.Height))
 		if err != nil {
 			rep.BadAt = int(snap.Height)
 			rep.Problem = fmt.Sprintf("state snapshot: %v", err)

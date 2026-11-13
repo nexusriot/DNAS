@@ -145,7 +145,7 @@ func TestMempoolSelectSkipsLockedVaultSpend(t *testing.T) {
 	bc := NewBlockchain()
 	hot, _ := wallet.New()
 	cold, _ := wallet.New()
-	unlock := uint64(1_000_000)
+	unlock := uint64(20) // inside MaxMempoolLockAhead of the tip: queueable, not yet minable
 	addr, err := wallet.VaultAddress(hot.PublicKeyHex(), cold.PublicKeyHex(), unlock)
 	if err != nil {
 		t.Fatal(err)
@@ -171,7 +171,7 @@ func TestVaultRescueDisplacesAJammedNonce(t *testing.T) {
 	bc := NewBlockchain()
 	hot, _ := wallet.New()
 	cold, _ := wallet.New()
-	unlock := uint64(1_000_000)
+	unlock := uint64(20) // inside MaxMempoolLockAhead of the tip: queueable, not yet minable
 	addr, err := wallet.VaultAddress(hot.PublicKeyHex(), cold.PublicKeyHex(), unlock)
 	if err != nil {
 		t.Fatal(err)
@@ -222,5 +222,28 @@ func TestMineableTransactionStillNeedsAHigherFee(t *testing.T) {
 	}
 	if _, ok := mp.Get(first.Hash()); !ok {
 		t.Fatal("the original was dropped anyway")
+	}
+}
+
+// A spend locked far beyond MaxMempoolLockAhead is refused outright: it could
+// sit in the pool for free (it is never mined, so its fee is never paid).
+func TestMempoolRefusesASpendLockedFarAhead(t *testing.T) {
+	withUpgrade(t, UpgradeVault)
+	bc := NewBlockchain()
+	hot, _ := wallet.New()
+	cold, _ := wallet.New()
+	unlock := uint64(1_000_000)
+	addr, err := wallet.VaultAddress(hot.PublicKeyHex(), cold.PublicKeyHex(), unlock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	miner := fundVault(t, bc, addr, 10*testFee)
+	mp := NewMempool().UseAccounts(bc)
+	jam := vaultSpend(t, hot, hot.PublicKeyHex(), cold.PublicKeyHex(), unlock, miner.Address(), testFee, 5*testFee, 0)
+	if added, err := mp.Add(jam); added || err == nil {
+		t.Fatalf("a spend locked ~1e6 blocks out was queued: added=%v err=%v", added, err)
+	}
+	if mp.Size() != 0 {
+		t.Fatal("the pool holds the far-locked spend")
 	}
 }

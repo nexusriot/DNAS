@@ -106,6 +106,12 @@ func LoadEncryptedBlob(path, passphrase string) (plaintext []byte, kind string, 
 	return out, f.Kind, nil
 }
 
+// WriteFileAtomic is writeFileAtomic for callers outside this package that
+// write key material (restoring a backup, for one).
+func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
+	return writeFileAtomic(path, data, perm)
+}
+
 // writeFileAtomic writes data to a temporary file in the same directory and
 // renames it into place, so a reader never sees a half-written file and a crash
 // never destroys the previous contents.

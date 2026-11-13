@@ -178,7 +178,9 @@ func writeChannel(path string, c *channelFile) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, append(data, '\n'), 0o600)
+	// Atomic: a channel file holds the latest signed state, and a torn write
+	// would leave only an older one to close the channel with.
+	return wallet.WriteFileAtomic(path, append(data, '\n'), 0o600)
 }
 
 // readChannel loads a channel and switches this process to its network, so every

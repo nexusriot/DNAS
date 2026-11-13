@@ -30,18 +30,22 @@ func TestVaultColdKeySweepsImmediately(t *testing.T) {
 		t.Fatalf("vault balance = %d, want %d", bal, 5*Coin)
 	}
 
-	// A hot-key spend this far below the unlock height is admitted to the mempool
-	// and simply never mined — the thief parks it at the vault's nonce.
-	early := n.cli("vault", "spend", "-api", n.apiAddr, "-wallet", "hot.json",
+	// A hot-key spend this far below the unlock height is REFUSED by the mempool:
+	// a transaction no block will accept for ~1000 blocks would sit in the pool
+	// for free (MaxMempoolLockAhead), and here it would also park the thief at
+	// the vault's nonce. Refusing it is both the DoS bound and the better vault.
+	early := n.cliAllowFail("vault", "spend", "-api", n.apiAddr, "-wallet", "hot.json",
 		"-cold", coldPub, "-unlock", itoa(unlock), "-to", coldAddr, "-fee", itoa(testFee))
-	mustContain(t, early, "submitted hot-key sweep", "hot-key spend")
+	if early.err == nil {
+		t.Fatalf("a hot-key spend 1000 blocks before unlock was accepted:\n%s", early.out)
+	}
+	mustContain(t, early.out, "not minable", "hot-key spend refused")
 	n.generate(2)
 	if bal := n.balance(vaultAddr); bal != 5*Coin {
-		t.Fatalf("vault balance = %d after two blocks, want the hot-key spend to be unmineable", bal)
+		t.Fatalf("vault balance = %d after two blocks, want it untouched", bal)
 	}
 
-	// The cold key rescues it. It shares the thief's nonce, so it must out-bid
-	// them (replace-by-fee) — which it always can, sweeping the whole balance.
+	// The cold key sweeps it at once, with nothing in its way.
 	sweep := n.cli("vault", "spend", "-api", n.apiAddr, "-wallet", "cold.json",
 		"-hot", hotPub, "-unlock", itoa(unlock), "-to", coldAddr, "-fee", itoa(4*testFee))
 	mustContain(t, sweep, "submitted cold-key sweep", "vault cold sweep")

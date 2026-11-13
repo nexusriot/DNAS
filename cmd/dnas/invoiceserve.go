@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/nexusriot/DNAS/core"
+	"github.com/nexusriot/DNAS/wallet"
 )
 
 // `dnas invoice serve` — the watch-only daemon.
@@ -122,11 +123,7 @@ func (st *invoiceState) save(path string) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return wallet.WriteFileAtomic(path, data, 0o600)
 }
 
 // statusOf turns a scan result into the status an invoice is now in.

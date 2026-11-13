@@ -578,7 +578,10 @@ dnas faucet -api localhost:8080 -address <your-address>
 ```
 
 One payout per address and per requesting client per cooldown (`-faucetcooldown`,
-default 60 s); `-faucetamount` sets the size.
+default 60 s); `-faucetamount` sets the size. `/faucet` is a write endpoint, so a
+node with `DNAS_API_TOKEN` set wants the token — but `dnas faucet` sends it only
+to a node on this machine, since the faucet is the command most often pointed
+at someone else's node.
 
 ## 8d5. Someone else pays your fee
 
@@ -620,10 +623,11 @@ dnas vault spend -wallet cold.json -hot HOT_PUB  -unlock 5000 -to <addr>   # wor
 dnas vault spend -wallet hot.json  -cold COLD_PUB -unlock 5000 -to <addr>  # only from 5000
 ```
 
-One wrinkle worth knowing: an early hot-key spend is *accepted into the mempool*
-and simply never mined, so a thief can park one at the vault's nonce. The cold
-key's rescue uses that same nonce, so it has to out-bid it (replace-by-fee) —
-pass a higher `-fee`. It always can, since it is sweeping the whole balance.
+One wrinkle worth knowing: a hot-key spend more than `MaxMempoolLockAhead` (24)
+blocks before the unlock height is *refused* by the mempool outright, so a thief
+cannot park one at the vault's nonce. One closer to the unlock is queued but not
+mined until then, and a cold-key rescue displaces it for free — a mineable
+transaction always takes the slot of one that cannot go in the next block.
 
 ## 8d7. Address history from the node
 
@@ -894,6 +898,9 @@ dnas invoice new   -amount 2.5 -memo "two coffees" -key shop.json
 dnas invoice watch -in invoice.json -wait     # exits 0 when it is settled
 dnas invoice pay   -in invoice.json -key mine.json    # the payer's side
 ```
+
+`invoice pay` shows the amount, the fee and the total before it asks, and the
+fee it shows is the one it signs: the node's estimate (capped), or `-fee`.
 
 **Paying a pasted URI.** The payer usually gets the URI, not the file. Every
 client reads one, so nothing has to be retyped — which matters most for the

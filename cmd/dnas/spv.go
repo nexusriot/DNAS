@@ -146,6 +146,11 @@ func verifyHeaderChain(headers []core.Header) (uint64, *big.Int, error) {
 	if err := core.ValidateHeaderChain(headers[1:], headers[0].Hash, 0); err != nil {
 		return 0, nil, err
 	}
+	// Each header's own target is self-declared; require the one the chain's
+	// retarget demands, or a server can forge the chain at the easiest target.
+	if err := core.ValidateHeaderDifficulty(headers, 1); err != nil {
+		return 0, nil, err
+	}
 	work := new(big.Int)
 	for _, h := range headers {
 		work.Add(work, core.BlockWork(h.Bits))
@@ -467,7 +472,7 @@ func spvHistory(base, addr string) error {
 
 	// Cross-check the reconstructed net against a trustless state-root proof.
 	if p, err := fetchStateProof(base, addr); err == nil && int(p.BlockIndex) < len(headers) {
-		if valid, present := core.VerifyAccountProof(p, headers[p.BlockIndex].StateRoot); valid && present {
+		if valid, present := core.VerifyAccountProofFor(addr, p, headers[p.BlockIndex].StateRoot); valid && present {
 			fmt.Printf("  state proof: balance %s (verified against the header state root)\n", core.FormatAmount(p.Account.Balance))
 		}
 	}
@@ -504,10 +509,8 @@ func spvBalance(base, addr string) error {
 	if err != nil {
 		return err
 	}
-	if !p.Found {
-		fmt.Printf("no on-chain account for %s (an absent balance can't be proven; treat as 0)\n", addr)
-		return nil
-	}
+	// No shortcut for "not found": absence is provable (below), so a server's
+	// word that an account does not exist is checked like any other claim.
 	if p.BlockIndex >= uint64(len(headers)) {
 		return fmt.Errorf("proof references a block beyond the verified chain")
 	}
@@ -515,9 +518,9 @@ func spvBalance(base, addr string) error {
 	if p.StateRoot != hdr.StateRoot {
 		return fmt.Errorf("proof state root does not match the verified header")
 	}
-	valid, present := core.VerifyAccountProof(p, hdr.StateRoot)
+	valid, present := core.VerifyAccountProofFor(addr, p, hdr.StateRoot)
 	if !valid {
-		return fmt.Errorf("state proof does not fold to the header's state root")
+		return fmt.Errorf("state proof is not a proof for %s against the header's state root", addr)
 	}
 	// An absence proof is a RESULT, not a failure. The trie's key position is
 	// fixed by the address, so "nothing is here" is provable — which is what

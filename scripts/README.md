@@ -9,8 +9,10 @@ each script also runs standalone from the repo root.
 `./scripts/demo.sh` builds the binary and runs a three-node network end to end:
 wrong-`netkey` rejection, peer discovery, a signed transfer converging on every
 node, transaction expiry, the dynamic fee floor, a derived multisig address, a
-generated HD wallet, and a Python light-client SPV verification. Edit the `190xx`
-ports at the top if they are taken.
+generated HD wallet, and a light-client SPV verification with
+`dnas spv -cache "" verify` — the binary's own verifier, not a script-side copy of
+the header rules (a Python one used to live here and drifted when BIP9 changed the
+header). Edit the `190xx` ports at the top if they are taken.
 
 ## htlc-demo.sh
 
@@ -81,3 +83,43 @@ Env: `ARCHES` (`amd64`/`arm64`), `VERSION`, `OUT` (default `dist`), `GO`,
 `MAINTAINER`. The Debian version is derived from `VERSION` (leading `v` stripped,
 sanitized to a valid version); since it carries no Debian revision, packages are
 built as *native* (changelog named `changelog.gz`).
+
+## build-rpm.sh
+
+Builds an RPM (`make rpm`) from [packaging/dnas.spec](packaging/dnas.spec).
+Unlike `build-deb.sh` it does **not** cross-compile: rpmbuild runs the build
+itself, and an RPM built for another architecture from here would claim an
+`%{_arch}` it was not built for. Build on the target, or in a container for it.
+
+```sh
+./scripts/build-rpm.sh                  # this machine's architecture
+VERSION=1.2.3 ./scripts/build-rpm.sh    # stamp an explicit version
+```
+
+## verify-reproducible.sh
+
+Builds the release twice, from two different working directories, and checks
+every artifact comes out byte-identical (`make verify-reproducible`). A published
+checksum is only a claim anyone can *check* if two people building the same
+commit get the same bytes; building in two paths is the important part, since the
+build path is the usual thing that leaks into a binary.
+
+```sh
+./scripts/verify-reproducible.sh
+PLATFORMS="linux/amd64" ./scripts/verify-reproducible.sh
+```
+
+## bench.sh
+
+Runs the performance benchmarks and optionally holds them to a recorded baseline
+(`make bench`, `make bench-update`, `make bench-check`). Correctness tests use tiny
+chains, so a cost that grows with the ledger never shows in one; a recorded
+number does not have that blind spot. The regression threshold is deliberately
+loose — it runs on developer machines, so the signal worth catching is "several
+times slower", not "10% slower".
+
+```sh
+./scripts/bench.sh            # run, print results
+./scripts/bench.sh --update   # run and overwrite the baseline
+./scripts/bench.sh --check    # run and fail if anything regressed
+```

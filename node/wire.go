@@ -130,6 +130,42 @@ func peekBinaryType(r *bufio.Reader, length int) (MsgType, bool) {
 	return MsgType(full[tagAndLen:]), true
 }
 
+// jsonTypePrefix is how every JSON Message payload begins once its opening
+// brace has been moved into the format byte: encoding/json writes struct fields
+// in declaration order, and Type is Message's first field and never omitted.
+const jsonTypePrefix = `"type":"`
+
+// peekJSONType is peekBinaryType for the JSON format: it reads the type name
+// off the head of the frame without consuming it. A head that does not match
+// returns false.
+func peekJSONType(r *bufio.Reader, length int) (MsgType, bool) {
+	const maxName = 32
+	want := len(jsonTypePrefix) + maxName + 1
+	if want > length {
+		want = length
+	}
+	if want <= len(jsonTypePrefix) {
+		return "", false
+	}
+	head, err := r.Peek(want)
+	if err != nil || string(head[:len(jsonTypePrefix)]) != jsonTypePrefix {
+		return "", false
+	}
+	name := head[len(jsonTypePrefix):]
+	for i, c := range name {
+		if c == '"' {
+			if i == 0 {
+				return "", false
+			}
+			return MsgType(name[:i]), true
+		}
+		if c < 'a' || c > 'z' {
+			return "", false
+		}
+	}
+	return "", false
+}
+
 // msgReader reads framed messages from a peer.
 type msgReader struct{ r *bufio.Reader }
 
@@ -155,13 +191,27 @@ func (mr *msgReader) Decode(m *Message) error {
 	// the buffered reader while the rest of the frame is still on the socket —
 	// which is the difference between refusing a 64 MiB `ping` and allocating
 	// for it first (see framecap.go).
-	if hdr[0] == wireBinary {
-		if t, ok := peekBinaryType(mr.r, int(length)); ok {
-			if cap := maxPayloadFor(t); int(length) > cap {
-				return fmt.Errorf("peer announced a %d-byte %s message, over the %d cap for that type",
-					length, t, cap)
-			}
+	var (
+		t     MsgType
+		known bool
+	)
+	switch hdr[0] {
+	case wireBinary:
+		t, known = peekBinaryType(mr.r, int(length))
+	case wireJSON:
+		t, known = peekJSONType(mr.r, int(length))
+	}
+	if known {
+		if cap := maxPayloadFor(t); int(length) > cap {
+			return fmt.Errorf("peer announced a %d-byte %s message, over the %d cap for that type",
+				length, t, cap)
 		}
+	} else if hdr[0] == wireJSON && int(length) > smallMsgCap {
+		// A JSON frame whose head is not the layout this node writes (`"type"`
+		// first, as encoding/json emits Message's first field) has no type to
+		// be bounded by. Only a small one is worth decoding to find out; a large
+		// one with an unreadable head is not something any node sends.
+		return fmt.Errorf("peer announced a %d-byte JSON message with no leading type", length)
 	}
 	payload := make([]byte, length)
 	if _, err := io.ReadFull(mr.r, payload); err != nil {

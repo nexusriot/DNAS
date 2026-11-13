@@ -283,3 +283,61 @@ func TestCoinbaseShapeChecksHeightBinding(t *testing.T) {
 		t.Error("a coinbase bound to the wrong height was accepted")
 	}
 }
+
+// A reorg's suffix must be judged by the votes ITS branch cast. The chain being
+// replaced locked a rule in; the rival never voted, so on the rival the rule is
+// off and its pre-rule coinbases are valid. Validating the rival against the
+// replaced chain's table refused a branch every node that synced it straight
+// would have accepted — a permanent split along the vote.
+func TestReorgSuffixIsJudgedByItsOwnVotes(t *testing.T) {
+	t.Cleanup(func() { ClearDeployments(); restoreUpgrades() })
+	ClearDeployments()
+	ClearUpgrades()
+
+	d := Deployment{Name: UpgradeUniqueCoinbase, Bit: 7, Start: 1, Timeout: 1000, Window: 3, Threshold: 3}
+	if err := RegisterDeployment(d); err != nil {
+		t.Fatal(err)
+	}
+	miner, _ := wallet.New()
+
+	// The rival first, while no vote has been cast anywhere: its coinbases are
+	// the pre-rule shape at every height.
+	rival := NewBlockchain()
+	for h := uint64(1); h <= 9; h++ {
+		mustAdd(t, rival, mineVersioned(t, rival, miner.Address(), 0, nil))
+	}
+
+	// The original chain votes the rule in (activation 7) and builds past it.
+	bc := NewBlockchain()
+	for h := uint64(1); h <= 8; h++ {
+		mustAdd(t, bc, mineVersioned(t, bc, miner.Address(), SignalVersion(d.Bit), nil))
+	}
+	if !IsUpgradeActive(UpgradeUniqueCoinbase, 7) {
+		t.Fatal("precondition: the original chain should have locked the rule in")
+	}
+
+	replaced, _, err := bc.ReplaceChain(rival.Blocks())
+	if err != nil {
+		t.Fatalf("the rival was judged by the replaced chain's votes: %v", err)
+	}
+	if !replaced {
+		t.Fatal("the longer rival was not adopted")
+	}
+	if IsUpgradeActive(UpgradeUniqueCoinbase, 7) {
+		t.Fatal("the rule is still active after adopting a chain that never voted")
+	}
+
+	// And a refused reorg leaves the table as the kept chain implies.
+	bc2 := NewBlockchain()
+	for h := uint64(1); h <= 8; h++ {
+		mustAdd(t, bc2, mineVersioned(t, bc2, miner.Address(), SignalVersion(d.Bit), nil))
+	}
+	bad := append([]Block(nil), rival.Blocks()...)
+	bad[9].Nonce++ // breaks the tip's proof of work
+	if _, _, err := bc2.ReplaceChain(bad); err == nil {
+		t.Fatal("a rival with a broken block was adopted")
+	}
+	if !IsUpgradeActive(UpgradeUniqueCoinbase, 7) {
+		t.Fatal("a refused reorg left the rival's activation table installed")
+	}
+}

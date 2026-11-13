@@ -70,9 +70,35 @@ type shareLedger struct {
 	stale     uint64
 	blocks    uint64
 	byMiner   map[string]*MinerShares
+	// seenTip / seenHashes remember which share hashes were already credited on
+	// the current tip. A share is a proof of work done ONCE; without this a
+	// miner could resubmit one valid share thousands of times, each credited at
+	// full weight, and crowd every honest share out of the PPLNS window. Reset
+	// whenever the tip moves, since a share for an older tip is stale anyway.
+	seenTip    string
+	seenHashes map[string]struct{}
 }
 
+// maxSeenSharesPerTip bounds the duplicate filter. Past it, further shares on
+// the same tip are refused rather than accepted unchecked.
+const maxSeenSharesPerTip = 1 << 16
+
 func newShareLedger() *shareLedger { return &shareLedger{byMiner: map[string]*MinerShares{}} }
+
+// claim marks a share hash as credited on tip, reporting false if it already
+// was (or the filter is full).
+func (l *shareLedger) claim(tip, hash string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.seenTip != tip || l.seenHashes == nil {
+		l.seenTip, l.seenHashes = tip, map[string]struct{}{}
+	}
+	if _, dup := l.seenHashes[hash]; dup || len(l.seenHashes) >= maxSeenSharesPerTip {
+		return false
+	}
+	l.seenHashes[hash] = struct{}{}
+	return true
+}
 
 func (l *shareLedger) record(addr string, height uint64, isBlock bool) uint64 {
 	l.mu.Lock()
@@ -181,6 +207,9 @@ func (n *Node) submitShareChecked(b core.Block, shareBits uint32, creditTo strin
 	}
 	if !core.MeetsShareTarget(b.Hash, shareBits) {
 		return ShareResult{}, errors.New("hash does not meet the share target")
+	}
+	if !n.shares.claim(tip.Hash, b.Hash) {
+		return ShareResult{}, errors.New("duplicate share: this work was already credited")
 	}
 
 	// A share that also clears the real target is a block. If the chain refuses it

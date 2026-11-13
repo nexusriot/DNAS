@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -369,6 +370,9 @@ func (m *Mempool) Add(tx Transaction) (bool, error) {
 		return false, fmt.Errorf("fee %d below current relay floor %d/byte × %d bytes = %d",
 			tx.Fee, floor, size, floor*uint64(size))
 	}
+	if err := canonicalScriptHex(tx); err != nil {
+		return false, err
+	}
 	h := tx.Hash()
 	if _, ok := m.Get(h); ok {
 		return false, nil
@@ -377,6 +381,9 @@ func (m *Mempool) Add(tx Transaction) (bool, error) {
 		return false, err
 	}
 	if err := m.verify(tx); err != nil {
+		return false, err
+	}
+	if err := m.minableSoon(tx); err != nil {
 		return false, err
 	}
 
@@ -489,6 +496,53 @@ func (m *Mempool) unmineableLocked(tx Transaction) bool {
 		return false
 	}
 	return checkTxAtHeight(tx, m.chainHeight()+1) != nil
+}
+
+// MaxMempoolLockAhead is how many blocks past the next one a transaction may
+// still be waiting on a height rule (LockUntil, an HTLC refund timeout, a vault
+// unlock, a script's height constraint) and be queued.
+//
+// A pool slot held by a transaction no block will accept is free to its owner:
+// the fee is never paid, because it is never mined. Without a bound, a handful
+// of funded addresses could fill the pool with high-fee transactions locked a
+// billion blocks out, outbidding every honest payment for eviction forever —
+// and every block template would re-run their height checks (scripts
+// included). Queuing a little ahead is still useful (an HTLC refund broadcast
+// shortly before its timeout); queuing indefinitely is the attack.
+const MaxMempoolLockAhead = 24
+
+// minableSoon refuses a transaction that no block in the next
+// MaxMempoolLockAhead+1 heights could contain: one whose height rules open too
+// far ahead, or that has already expired. A pool with no chain height (isolated
+// tests) admits everything, as before.
+func (m *Mempool) minableSoon(tx Transaction) error {
+	if m.chainHeight == nil {
+		return nil
+	}
+	next := m.chainHeight() + 1
+	first := checkTxAtHeight(tx, next)
+	if first == nil {
+		return nil
+	}
+	// Only the TIME-LOCK rules are bounded here: their opening height is chosen
+	// by whoever signed the transaction. An upgrade that is not active yet is an
+	// operator's schedule, not an attacker's, and queuing ahead of it is allowed.
+	if !waitingOnTimeLock(tx, next) {
+		return nil
+	}
+	for h := next + 1; h <= next+MaxMempoolLockAhead; h++ {
+		if checkTxAtHeight(tx, h) == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("not minable within the next %d blocks (%v)", MaxMempoolLockAhead+1, first)
+}
+
+// waitingOnTimeLock reports whether a signer-chosen height rule keeps tx out of
+// the block at height h.
+func waitingOnTimeLock(tx Transaction, h uint64) bool {
+	return tx.IsExpiredAt(h) || tx.IsLockedAt(h) || tx.HTLCRefundNotReady(h) ||
+		tx.VaultHotNotReady(h) || tx.ScriptNotReady(h)
 }
 
 // txRate is a transaction's fee per byte, used only to rank and evict within the
@@ -1058,4 +1112,31 @@ func (m *Mempool) Select(bc *Blockchain, max int) []Transaction {
 		ops += best.ops
 	}
 	return selected
+}
+
+// canonicalScriptHex is relay policy against witness malleability: a script
+// spend's predicate and witness items must be lowercase hex.
+//
+// Hex is case-insensitive when decoded, so "ab" and "AB" are the same witness
+// to the script VM — but the txid hashes the text, and the witness is not
+// covered by the signature (it cannot be: it CONTAINS the signature). So
+// anyone relaying a script spend could flip the case of a witness item and
+// produce a second, equally valid transaction with a different id, which
+// breaks anything that tracks a payment by txid. Every wallet here writes
+// lowercase; refusing anything else at the mempool stops honest nodes from
+// relaying the mutated copy. It is policy rather than consensus, so blocks
+// already mined are unaffected.
+func canonicalScriptHex(tx Transaction) error {
+	if tx.Script == nil {
+		return nil
+	}
+	if tx.Script.Script != strings.ToLower(tx.Script.Script) {
+		return errors.New("non-canonical script: hex must be lowercase")
+	}
+	for i, a := range tx.Script.Args {
+		if a != strings.ToLower(a) {
+			return fmt.Errorf("non-canonical witness item %d: hex must be lowercase", i)
+		}
+	}
+	return nil
 }

@@ -12,6 +12,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -19,16 +20,42 @@ const (
 	handshakeTimeout = 10 * time.Second
 	maxFrame         = 64 << 20 // 64 MiB, an upper bound on a single message
 	handshakeLen     = 32 + 16 + 32
+
+	// maxSecureChunk is the most plaintext one encrypted frame carries. A
+	// message larger than this is split across several frames by Write and
+	// reassembled by the byte stream Read serves, so no frame — and therefore
+	// no allocation made on the strength of a frame's length prefix — is ever
+	// bigger than this, whatever the message is.
+	//
+	// The length prefix is read and believed BEFORE anything is authenticated,
+	// so this bound is what an anonymous connection can make the node allocate
+	// per frame. It used to be maxFrame (64 MiB), on a connection that had not
+	// yet even proven its identity.
+	maxSecureChunk = 1 << 20
+	// secureOverhead is the nonce plus the GCM tag.
+	secureOverhead = 12 + 16
 )
 
 // secureConn is an authenticated, encrypted message stream layered over a raw
 // net.Conn. Each Write becomes one AES-256-GCM frame; Read serves the decrypted
 // bytes of one frame at a time, so a json.Encoder/Decoder pair works over it
 // transparently.
+//
+// Each direction has its own key, and each frame's nonce is that direction's
+// frame counter rather than random bytes. The receiver requires the exact next
+// counter, so a frame cannot be replayed, dropped or reordered on the wire
+// without the stream failing, and — because the two directions' keys differ —
+// a frame cannot be reflected back at the peer that sent it. With one shared
+// key and random nonces, an on-path attacker could do all three: every frame
+// either side ever sent was a valid frame in both directions, forever.
 type secureConn struct {
 	conn net.Conn
-	gcm  cipher.AEAD
+	send cipher.AEAD
+	recv cipher.AEAD
+	wseq uint64 // counter of the next frame written
+	rseq uint64 // counter the next frame read must carry
 	rbuf []byte // decrypted bytes of the current frame not yet consumed by Read
+	wmu  sync.Mutex
 }
 
 // secureHandshake performs an X25519 key exchange, optionally authenticated by a
@@ -87,15 +114,38 @@ func secureHandshake(conn net.Conn, psk []byte) (*secureConn, []byte, error) {
 	}
 
 	key := deriveKey(shared, psk, salt, peerSalt)
-	block, err := aes.NewCipher(key)
+	send, err := directionCipher(key, pub, salt)
 	if err != nil {
 		return nil, nil, err
 	}
-	gcm, err := cipher.NewGCM(block)
+	recv, err := directionCipher(key, peerPub, peerSalt)
 	if err != nil {
 		return nil, nil, err
 	}
-	return &secureConn{conn: conn, gcm: gcm}, sessionID(pub, peerPub, salt, peerSalt), nil
+	return &secureConn{conn: conn, send: send, recv: recv}, sessionID(pub, peerPub, salt, peerSalt), nil
+}
+
+// directionCipher derives the AEAD for the traffic SENT by the side whose
+// handshake contribution is (pub, salt). Both peers compute both directions'
+// keys, so each side's send key is the other's receive key, and the two keys
+// differ because the two contributions do.
+func directionCipher(sessionKey, pub, salt []byte) (cipher.AEAD, error) {
+	h := hmac.New(sha256.New, sessionKey)
+	h.Write([]byte("dnas-direction-v2"))
+	h.Write(pub)
+	h.Write(salt)
+	block, err := aes.NewCipher(h.Sum(nil))
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(block)
+}
+
+// counterNonce is the 12-byte GCM nonce for frame number seq.
+func counterNonce(seq uint64) []byte {
+	n := make([]byte, 12)
+	binary.BigEndian.PutUint64(n[4:], seq)
+	return n
 }
 
 // sessionID deterministically derives a per-session identifier from the
@@ -109,7 +159,7 @@ func sessionID(pubA, pubB, saltA, saltB []byte) []byte {
 		saltA, saltB = saltB, saltA
 	}
 	h := sha256.New()
-	h.Write([]byte("dnas-session-v1"))
+	h.Write([]byte("dnas-session-v2"))
 	h.Write(pubA)
 	h.Write(pubB)
 	h.Write(saltA)
@@ -141,45 +191,64 @@ func deriveKey(shared, psk, saltA, saltB []byte) []byte {
 	return h.Sum(nil)
 }
 
-// Write encrypts p as a single length-prefixed frame: [4-byte length][nonce][ciphertext].
+// Write encrypts p as one or more length-prefixed frames, each
+// [4-byte length][nonce][ciphertext] carrying at most maxSecureChunk bytes of
+// plaintext. Writes are serialized so the frame counter and the order frames
+// reach the socket cannot disagree.
 func (s *secureConn) Write(p []byte) (int, error) {
-	nonce := make([]byte, s.gcm.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return 0, err
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	written := 0
+	for {
+		chunk := p[written:]
+		if len(chunk) > maxSecureChunk {
+			chunk = chunk[:maxSecureChunk]
+		}
+		nonce := counterNonce(s.wseq)
+		s.wseq++
+		ct := s.send.Seal(nil, nonce, chunk, nil)
+		frame := make([]byte, 4+len(nonce)+len(ct))
+		binary.BigEndian.PutUint32(frame[:4], uint32(len(nonce)+len(ct)))
+		copy(frame[4:], nonce)
+		copy(frame[4+len(nonce):], ct)
+		if _, err := s.conn.Write(frame); err != nil {
+			return written, err
+		}
+		written += len(chunk)
+		if written >= len(p) {
+			return written, nil
+		}
 	}
-	ct := s.gcm.Seal(nil, nonce, p, nil)
-	frame := make([]byte, 4+len(nonce)+len(ct))
-	binary.BigEndian.PutUint32(frame[:4], uint32(len(nonce)+len(ct)))
-	copy(frame[4:], nonce)
-	copy(frame[4+len(nonce):], ct)
-	if _, err := s.conn.Write(frame); err != nil {
-		return 0, err
-	}
-	return len(p), nil
 }
 
 // Read serves decrypted bytes, reading and decrypting the next frame when the
 // current one is exhausted.
 func (s *secureConn) Read(p []byte) (int, error) {
-	if len(s.rbuf) == 0 {
+	for len(s.rbuf) == 0 {
 		var lenBuf [4]byte
 		if _, err := io.ReadFull(s.conn, lenBuf[:]); err != nil {
 			return 0, err
 		}
 		n := binary.BigEndian.Uint32(lenBuf[:])
-		ns := s.gcm.NonceSize()
-		if int(n) < ns+s.gcm.Overhead() || uint64(n) > maxFrame {
+		ns := s.recv.NonceSize()
+		if int(n) < ns+s.recv.Overhead() || int(n) > maxSecureChunk+secureOverhead {
 			return 0, errors.New("invalid frame length")
 		}
 		buf := make([]byte, n)
 		if _, err := io.ReadFull(s.conn, buf); err != nil {
 			return 0, err
 		}
-		pt, err := s.gcm.Open(nil, buf[:ns], buf[ns:], nil)
+		if !bytes.Equal(buf[:ns], counterNonce(s.rseq)) {
+			return 0, errors.New("frame out of sequence (replayed, dropped or reordered)")
+		}
+		pt, err := s.recv.Open(nil, buf[:ns], buf[ns:], nil)
 		if err != nil {
 			return 0, errors.New("frame decryption failed")
 		}
+		s.rseq++
 		s.rbuf = pt
+		// An empty frame carries nothing; keep reading rather than returning
+		// (0, nil), which io.Reader callers may treat as a stall.
 	}
 	n := copy(p, s.rbuf)
 	s.rbuf = s.rbuf[n:]

@@ -443,6 +443,7 @@ func invoicePay(args []string) {
 	keyFile := fs.String("key", "wallet.json", "key file to pay from")
 	stateFile := fs.String("f", "spvwallet.json", "light wallet state file")
 	yes := fs.Bool("y", false, "do not ask for confirmation")
+	feeArg := fs.String("fee", "", "fee in DNAS (default: the node's estimate, capped)")
 	_ = fs.Parse(args)
 
 	// A URI may be given with -uri or as a bare argument, because a payer who
@@ -490,7 +491,25 @@ func invoicePay(args []string) {
 		}
 	}
 
+	// The fee is settled BEFORE the prompt and passed through explicitly, so the
+	// number the payer agrees to is the number that is signed. It used to be
+	// estimated after the "send it?" answer, from the node's word, unseen.
+	var fee uint64
+	if *feeArg != "" {
+		f, err := core.ParseAmount(*feeArg)
+		if err != nil {
+			log.Fatalf("bad -fee: %v", err)
+		}
+		fee = f
+	} else {
+		f, err := resolveFee(base, nil)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fee = f
+	}
 	fmt.Printf("paying %s to %s\n", core.FormatAmount(inv.Amount), inv.Address)
+	fmt.Printf("  fee %s, total %s\n", core.FormatAmount(fee), core.FormatAmount(inv.Amount+fee))
 	if inv.Memo != "" {
 		fmt.Printf("  for %q\n", inv.Memo)
 	}
@@ -509,7 +528,8 @@ func invoicePay(args []string) {
 	// nonce and balance come from a state proof rather than the node's word.
 	sw := loadSPVWallet(*stateFile)
 	amount := strings.TrimSuffix(core.FormatAmount(inv.Amount), " "+core.Ticker)
-	sw.send(base, *keyFile, "", []string{inv.Address, amount},
+	feeText := strings.TrimSuffix(core.FormatAmount(fee), " "+core.Ticker)
+	sw.send(base, *keyFile, "", []string{inv.Address, amount, feeText},
 		sendOptions{Memo: inv.Memo}, func() {
 			if err := sw.save(*stateFile); err != nil {
 				log.Printf("could not save %s: %v", *stateFile, err)

@@ -82,7 +82,20 @@ func runFastSync(args []string) {
 		fmt.Printf("snapshot at %d is %s, not the trusted checkpoint %s\n", snapHeight, short(snap.Header.Hash), short(wantHash))
 		return
 	}
-	bc, err := core.NewFromSnapshot(snap, headers[:snapHeight+1])
+	// The last few bodies at and below the snapshot are needed too: coinbase
+	// maturity and the base fee of the first block above the snapshot read them,
+	// and placeholders there would validate that block differently from every
+	// full node. Each is checked against the PoW-verified header it claims to be.
+	var recent []core.Block
+	for h := core.SnapshotBodiesFrom(snapHeight); h <= snapHeight && h >= 1; h++ {
+		b, err := fetchBlock(base, h)
+		if err != nil {
+			fmt.Printf("fetch block %d below the snapshot: %v\n", h, err)
+			return
+		}
+		recent = append(recent, b)
+	}
+	bc, err := core.NewFromSnapshotWithBodies(snap, headers[:snapHeight+1], recent)
 	if err != nil {
 		fmt.Println("seed from snapshot:", err)
 		return

@@ -47,6 +47,7 @@ type Server struct {
 	node    *node.Node
 	token   string
 	limiter *limiter // per-client request budget; nil disables the limit
+	streams streamGate
 }
 
 // New returns an API server bound to n, reading the optional bearer token from
@@ -187,8 +188,26 @@ func (s *Server) explorer(w http.ResponseWriter, r *http.Request) {
 // Start blocks serving the API on addr.
 func (s *Server) Start(addr string) {
 	node.Infof("API listening", "url", "http://"+addr)
-	if err := http.ListenAndServe(addr, s.Handler()); err != nil {
+	if err := s.HTTPServer(addr).ListenAndServe(); err != nil {
 		log.Fatalf("api: %v", err)
+	}
+}
+
+// HTTPServer is the http.Server Start runs: the API handler with timeouts.
+//
+// http.ListenAndServe sets none, so a client that opened connections and then
+// sent its headers a byte at a time (slowloris) held a goroutine and a socket
+// each, forever. There is deliberately no WriteTimeout: /events and the
+// long-polling /blocktemplate are meant to stay open, and they are bounded by
+// their own caps instead.
+func (s *Server) HTTPServer(addr string) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    64 << 10,
 	}
 }
 
@@ -676,6 +695,13 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "streaming unsupported")
 		return
 	}
+	release, ok := s.acquireStream(clientKey(r))
+	if !ok {
+		w.Header().Set("Retry-After", "5")
+		writeErr(w, http.StatusTooManyRequests, "too many open event streams")
+		return
+	}
+	defer release()
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")

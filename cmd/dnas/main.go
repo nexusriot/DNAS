@@ -114,9 +114,10 @@ func usageTo(w io.Writer) {
 
 Usage:
   dnas node [flags]              run a node (default)
-  dnas wallet new [-o FILE]      create a wallet
+  dnas wallet new [-o FILE] [-force]   create a wallet
   dnas wallet address|pubkey [-o FILE]
   dnas wallet mnemonic|restore|addresses      BIP39 backup + HD addresses
+  dnas wallet bech32 <address>        convert an address between its two spellings
   dnas wallet multisig -threshold M -pubkeys a,b,c   M-of-N multisig address
   dnas spv [-api URL] [-peers LIST] [-netkey KEY] sync
                                       verify the header chain (light client)
@@ -126,7 +127,7 @@ Usage:
   dnas spv [-api URL] balance <addr>  prove an address's balance (state proof)
   dnas spv [-api URL] [-peers LIST] history <addr>
                                       reconstruct an address's history (light wallet)
-  dnas spv [-api URL] wallet ...      persistent light wallet (add/update/status/watch)
+  dnas spv [-api URL] wallet ...      persistent light wallet (add/update/status/list; -watch follows new blocks)
   dnas spv [-api URL] wallet -key F new|send <to> <amount>   self-custodial light wallet (signs locally)
   dnas spv [-api URL] wallet -key F sendmany <addr:amt>...    pay many addresses in one transaction
   dnas fastsync [-api URL] [-peers LIST] [-netkey KEY] [-checkpoint H:HASH]
@@ -140,17 +141,21 @@ Usage:
   dnas faucet -address ADDR           ask a testnet/regtest node for coin
   dnas sponsor request|pay            have someone else pay a transaction's fee
   dnas multisig propose|sign|submit   spend FROM an M-of-N multisig account
-  dnas anchor add|verify              timestamp a file's hash on the chain
-  dnas escrow new|release|refund      2-of-3 buyer/seller/arbiter escrow
+  dnas multisig address|inspect       derive the address / show who has signed a spend file
+  dnas anchor hash|add|verify         timestamp a file's hash on the chain
+  dnas escrow new|show|release|refund 2-of-3 buyer/seller/arbiter escrow
   dnas wallet sign|verify             prove you control an address, off-chain
   dnas wallet passphrase              change (or remove) a key file's passphrase
   dnas backup save|list|restore       encrypt the files a re-sync cannot replace
   dnas tx inspect|verify              decode and check a transaction before submitting
+  dnas tx export -address A [-o F]    an address's history as CSV or JSON
   dnas assets [show ID]               what assets exist, and who holds them
   dnas script new -type TYPE          build a spending condition and its address
+  dnas script inspect|spend           disassemble a script / spend from its address
   dnas name resolve NAME              resolve a name, proving it against the chain
   dnas name register NAME -key W      claim a name (register|renew|transfer|release|list)
-  dnas invoice new|watch|pay          ask to be paid, and verify that you were
+  dnas invoice new|show|watch|pay     ask to be paid, and verify that you were
+  dnas invoice serve -dir D           watch a directory of invoices, settle each once
   dnas db <info|verify|export|import|compact>  inspect, check, move and shrink a chain store
   dnas peers [list|bans|unban|add|drop]  inspect and manage peers and bans
   dnas stats [-window N]              hashrate, block timing, fee flow, miners
@@ -218,6 +223,7 @@ func runWallet(args []string) {
 	if len(args) == 0 {
 		fmt.Println(`usage: dnas wallet <cmd> [-o FILE] [flags]   (set DNAS_WALLET_PASSPHRASE to encrypt at rest)
   new                       create a random wallet
+  bech32    <address>       convert an address between its two spellings
   address                   print a wallet file's address
   pubkey                    print a wallet file's public key (for multisig/HTLC)
   mnemonic                  create an HD wallet, print its BIP39 backup phrase
@@ -226,7 +232,9 @@ func runWallet(args []string) {
   multisig  -threshold M -pubkeys a,b,c   print an M-of-N multisig address
   sign      -m TEXT | -file F   sign a message, proving you hold the address
   verify    -in SIG [-address A]          check such a signature
-  passphrase [-remove]      re-encrypt this key file under a new passphrase`)
+  passphrase [-remove]      re-encrypt this key file under a new passphrase
+new, mnemonic and restore refuse to overwrite a key file holding a DIFFERENT key
+unless -force is given; -index and -account must be below 2^31.`)
 		return
 	}
 	// The subcommands that take flags of their own are dispatched before the
@@ -260,8 +268,14 @@ func runWallet(args []string) {
 	count := fs.Int("n", 5, "number of HD addresses to list")
 	threshold := fs.Int("threshold", 2, "multisig signature threshold (M)")
 	pubkeys := fs.String("pubkeys", "", "comma-separated member public keys (hex) for multisig")
+	force := fs.Bool("force", false, "with new|mnemonic|restore: overwrite an existing key file holding a DIFFERENT key")
 	_ = fs.Parse(args[1:])
 	pass := walletPassphrase()
+	// Every level of SLIP-0010 derivation is hardened, which takes the top bit;
+	// a value at or past 2^31 would wrap onto a lower index rather than fail.
+	if *index >= 1<<31 || *account >= 1<<31 {
+		log.Fatal("-index and -account must be below 2147483648")
+	}
 
 	// loadFile opens the existing wallet key file, honouring the passphrase.
 	loadFile := func() *wallet.Wallet {
@@ -281,6 +295,23 @@ func runWallet(args []string) {
 	}
 
 	save := func(w *wallet.Wallet) {
+		// -o defaults to wallet.json, the same file a node mines to. Writing a
+		// fresh key over it destroys the only copy of a funded key, so an existing
+		// file is replaced only when it already holds THIS key (re-running a
+		// restore is harmless) or with -force.
+		if _, statErr := os.Stat(*out); statErr == nil && !*force {
+			var existing *wallet.Wallet
+			var lerr error
+			if pass != "" {
+				existing, lerr = wallet.LoadEncrypted(*out, pass)
+			} else {
+				existing, lerr = wallet.Load(*out)
+			}
+			if lerr != nil || existing.Address() != w.Address() {
+				log.Fatalf("%s already exists and holds a different key; refusing to overwrite it "+
+					"(choose another -o, or pass -force if that key is backed up or empty)", *out)
+			}
+		}
 		var err error
 		if pass != "" {
 			err = w.SaveEncrypted(*out, pass)

@@ -46,6 +46,30 @@ const storeRecordV4 byte = 0x04
 // why this is a new version rather than an optional tail on V4.
 const storeRecordV5 byte = 0x05
 
+// storeRecordV6 is V5 plus the three transaction fields V5 never carried: a
+// script authorization (Transaction.Script), a name-service operation
+// (Transaction.Name) and an NFT issuance's metadata commitment
+// (AssetIssue.Metadata). All three are inside the transaction's hash, so a V5
+// record of a transaction using them decoded to a DIFFERENT transaction — and,
+// because this codec is also the peer wire format, every node receiving such a
+// block over a binary connection saw a merkle-root mismatch and refused it.
+//
+// A record is written as V6 only when it holds one of those fields (see
+// recordVersionFor). Every other block keeps its V5 bytes, so a store or peer
+// that never sees the new features is byte-for-byte unchanged.
+const storeRecordV6 byte = 0x06
+
+// recordVersionFor is the oldest record version that carries every field of
+// these transactions.
+func recordVersionFor(txs []Transaction) byte {
+	for _, t := range txs {
+		if t.Script != nil || t.Name != nil || (t.Issue != nil && t.Issue.Metadata != "") {
+			return storeRecordV6
+		}
+	}
+	return storeRecordV5
+}
+
 // hexish marks a string that is expected to be lowercase hex. Storing it as raw
 // bytes halves it; anything that does not decode is kept verbatim so a
 // hand-edited or unusual value is never lost.
@@ -238,12 +262,19 @@ func encodeBlockV4(b Block) []byte {
 	return s.b
 }
 
-// encodeBlockV5 writes a block in the current compact store format.
-func encodeBlockV5(b Block) []byte {
+// encodeBlockV5 writes a block in the V5 compact store format. It cannot carry
+// script, name or NFT-metadata fields; encodeBlockCurrent picks V6 for those.
+func encodeBlockV5(b Block) []byte { return encodeBlockAt(b, storeRecordV5) }
+
+// encodeBlockCurrent writes a block in the oldest record version that holds
+// all of it (see recordVersionFor). This is what the store and the wire use.
+func encodeBlockCurrent(b Block) []byte { return encodeBlockAt(b, recordVersionFor(b.Transactions)) }
+
+func encodeBlockAt(b Block, version byte) []byte {
 	s := &sbuf{}
-	s.byte(storeRecordV5)
+	s.byte(version)
 	s.u32(b.Version)
-	encodeBlockBody(s, b, storeRecordV5)
+	encodeBlockBody(s, b, version)
 	return s.b
 }
 
@@ -290,6 +321,9 @@ func encodeTxV2(s *sbuf, t Transaction, version byte) {
 	if t.Issue != nil {
 		s.str(t.Issue.Ticker)
 		s.u64(t.Issue.Supply)
+		if version >= storeRecordV6 {
+			s.str(t.Issue.Metadata)
+		}
 	}
 	if version >= storeRecordV4 {
 		s.optional(t.AssetOp != nil)
@@ -330,6 +364,21 @@ func encodeTxV2(s *sbuf, t Transaction, version byte) {
 	s.str(t.FeePayer)
 	s.str(t.FeePayerPubKey)
 	s.str(t.FeePayerSig)
+
+	if version >= storeRecordV6 {
+		s.optional(t.Script != nil)
+		if t.Script != nil {
+			s.str(t.Script.Script)
+			s.strs(t.Script.Args)
+		}
+		s.optional(t.Name != nil)
+		if t.Name != nil {
+			s.str(t.Name.Op)
+			s.str(t.Name.Name)
+			s.str(t.Name.Target)
+			s.u32(t.Name.Periods)
+		}
+	}
 }
 
 // decodeBlockV2 parses a pre-Version compact store record.
@@ -365,14 +414,19 @@ func decodeBlockV4(data []byte) (Block, error) {
 	return b, err
 }
 
-// decodeBlockV5 parses the current compact store record.
-func decodeBlockV5(data []byte) (Block, error) {
+// decodeBlockV5 parses a V5 compact store record.
+func decodeBlockV5(data []byte) (Block, error) { return decodeBlockAt(data, storeRecordV5) }
+
+// decodeBlockV6 parses the current compact store record.
+func decodeBlockV6(data []byte) (Block, error) { return decodeBlockAt(data, storeRecordV6) }
+
+func decodeBlockAt(data []byte, want byte) (Block, error) {
 	r := &srdr{b: data}
-	if tag := r.byte(); tag != storeRecordV5 {
-		return Block{}, fmt.Errorf("not a v5 store record (tag %#x)", tag)
+	if tag := r.byte(); tag != want {
+		return Block{}, fmt.Errorf("not a v%d store record (tag %#x)", want, tag)
 	}
 	version := r.u32()
-	b, err := decodeBlockBody(r, storeRecordV5)
+	b, err := decodeBlockBody(r, want)
 	b.Version = version
 	return b, err
 }
@@ -451,6 +505,9 @@ func decodeTxV2(r *srdr, version byte) Transaction {
 	t.AssetID = r.str()
 	if r.optional() {
 		t.Issue = &AssetIssue{Ticker: r.str(), Supply: r.u64()}
+		if version >= storeRecordV6 {
+			t.Issue.Metadata = r.str()
+		}
 	}
 	if version >= storeRecordV4 && r.optional() {
 		t.AssetOp = &AssetOp{Op: r.str(), Amount: r.u64(), Ticker: r.str(), IssueNonce: r.u64()}
@@ -479,6 +536,15 @@ func decodeTxV2(r *srdr, version byte) Transaction {
 	t.FeePayer = r.str()
 	t.FeePayerPubKey = r.str()
 	t.FeePayerSig = r.str()
+
+	if version >= storeRecordV6 {
+		if r.optional() {
+			t.Script = &ScriptAuth{Script: r.str(), Args: r.strs()}
+		}
+		if r.optional() {
+			t.Name = &NameOp{Op: r.str(), Name: r.str(), Target: r.str(), Periods: r.u32()}
+		}
+	}
 	return t
 }
 

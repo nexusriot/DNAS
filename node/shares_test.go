@@ -165,3 +165,25 @@ func TestWaitForTip(t *testing.T) {
 		t.Fatal("WaitForTip did not wake when the tip changed")
 	}
 }
+
+// One unit of work is credited once: resubmitting the same share must not
+// inflate the miner's count (and push honest shares out of a PPLNS window).
+func TestDuplicateShareIsCreditedOnce(t *testing.T) {
+	n, _, w := fundedNode(t)
+	tmpl, err := n.BuildTemplate(w.Address())
+	if err != nil {
+		t.Fatalf("template: %v", err)
+	}
+	share := mineToShare(t, tmpl, n.ShareBits())
+	if _, err := n.SubmitShare(share); err != nil {
+		t.Fatalf("first submit: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		if _, err := n.SubmitShare(share); err == nil || !strings.Contains(err.Error(), "duplicate") {
+			t.Fatalf("resubmission %d: err = %v, want a duplicate-share refusal", i, err)
+		}
+	}
+	if r := n.Shares(); r.Accepted != 1 || len(r.Miners) != 1 || r.Miners[0].Shares != 1 {
+		t.Fatalf("report = %+v, want exactly one credited share", r)
+	}
+}

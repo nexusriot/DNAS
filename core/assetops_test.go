@@ -301,3 +301,36 @@ func TestAssetOpIsSigned(t *testing.T) {
 		t.Fatal("changing the operation did not change the txid")
 	}
 }
+
+// Mint to the cap, hand it all to one holder, mint again: the second transfer
+// must be refused rather than push the holder's balance past MaxAssetSupply
+// (and, a few rounds later, wrap it mod 2^64).
+func TestAssetCreditCannotPassTheSupplyCap(t *testing.T) {
+	t.Cleanup(restoreUpgrades)
+	ClearUpgrades()
+	SetUpgradeHeight(UpgradeAssetOps, 0)
+
+	bc, issuer, id := issuedChain(t)
+	holder, _ := wallet.New()
+	xfer := func(amount, nonce uint64) Transaction {
+		tx := Transaction{From: issuer.Address(), To: holder.Address(), AssetID: id, Amount: amount, Fee: testFee, Nonce: nonce}
+		if err := tx.Sign(issuer); err != nil {
+			t.Fatal(err)
+		}
+		return tx
+	}
+	mustAdd(t, bc, mineOn(t, bc, issuer.Address(), []Transaction{opTx(t, issuer, id, AssetOpMint, MaxAssetSupply-1000, 1)}))
+	mustAdd(t, bc, mineOn(t, bc, issuer.Address(), []Transaction{xfer(MaxAssetSupply, 2)}))
+	if got := bc.Account(holder.Address()).Assets[id]; got != MaxAssetSupply {
+		t.Fatalf("holder has %d, want the cap", got)
+	}
+	// The issuer's holding is empty again, so the mint itself passes...
+	mustAdd(t, bc, mineOn(t, bc, issuer.Address(), []Transaction{opTx(t, issuer, id, AssetOpMint, 5, 3)}))
+	// ...but crediting the holder past the cap does not.
+	if err := bc.AddBlock(mineOn(t, bc, issuer.Address(), []Transaction{xfer(5, 4)})); err == nil {
+		t.Fatal("a transfer took a holding past MaxAssetSupply")
+	}
+	if got := bc.Account(holder.Address()).Assets[id]; got != MaxAssetSupply {
+		t.Fatalf("holder balance moved to %d", got)
+	}
+}

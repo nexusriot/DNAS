@@ -19,7 +19,7 @@ import (
 // the OpenAPI document (openapi.go), so the two cannot disagree: a route added
 // without an entry here is not served, and an entry whose response type changes
 // changes the published schema in the same commit. A test walks the table and
-// fails on anything undocumented (routes_test.go).
+// fails on anything undocumented (routes_internal_test.go).
 
 // param is one path or query parameter.
 type param struct {
@@ -190,9 +190,9 @@ func (s *Server) routes() []route {
 				"one its own chain commits to cannot recover by syncing, so a caller that " +
 				"only reads the status code must not mistake it for healthy. " +
 				"TOKEN-GUARDED despite being a read: it is O(ledger) — strictly more " +
-				"expensive than /snapshot — and the flat per-client bucket does not price " +
-				"that, so leaving it open would be a way to spend a node's CPU from a " +
-				"laptop. The RESULT is public via /health and /metrics, which is what a " +
+				"expensive than /snapshot — and even at the limiter's 30-token price the " +
+				"default rate admits one every second and a half per client, so leaving " +
+				"it open would be a way to spend a node's CPU from a laptop. The RESULT is public via /health and /metrics, which is what a " +
 				"monitor needs; running one on demand is the operator's.").
 			out(core.StateAudit{}).
 			guarded().
@@ -250,7 +250,9 @@ func (s *Server) routes() []route {
 			does(s.guard(s.generate)),
 		get("/blocktemplate", "A candidate block for an external miner").
 			query(queryParam("address", "string", "address the coinbase should pay"),
-				queryParam("longpoll", "string", "tip hash to wait for a change from")).
+				queryParam("longpoll", "boolean", "wait until the tip moves off prev (1/true)"),
+				queryParam("prev", "string", "tip hash to wait for a change from (with longpoll)"),
+				queryParam("timeout", "integer", "longpoll wait in seconds (bounded server-side)")).
 			out(blockTemplateResponse{}).
 			does(s.blockTemplate),
 		post("/submitblock", "Submit a mined block").

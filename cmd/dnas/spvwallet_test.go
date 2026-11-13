@@ -371,3 +371,14 @@ func heightServer(t *testing.T, height uint64) string {
 	t.Cleanup(srv.Close)
 	return srv.URL
 }
+
+// The node's fee estimate is multiplied into a fee the wallet signs unasked, so
+// a hostile estimate must not be able to spend the balance as fee.
+func TestNodeFeeEstimateIsCapped(t *testing.T) {
+	if got := clampFeePerByte(core.DefaultMinRelayFee); got != core.DefaultMinRelayFee {
+		t.Fatalf("an ordinary rate was changed to %d", got)
+	}
+	if got := clampFeePerByte(1 << 40); got != maxAutoFeePerByte {
+		t.Fatalf("a hostile rate became %d, want the cap %d", got, maxAutoFeePerByte)
+	}
+}

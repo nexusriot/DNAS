@@ -63,6 +63,41 @@ func VerifySnapshot(s Snapshot) error {
 // reorgs below the snapshot are refused by the finality guards (MaxReorgDepth /
 // checkpoints), the pruned bodies below it are never needed.
 func NewFromSnapshot(s Snapshot, headers []Header) (*Blockchain, error) {
+	return NewFromSnapshotWithBodies(s, headers, nil)
+}
+
+// SnapshotBodiesFrom is the first height whose body a chain bootstrapped from a
+// snapshot at `height` needs in order to validate the next block exactly as a
+// full node would: the range SnapshotBodiesFrom(height)..height.
+//
+// Two consensus rules read BODIES below the block being validated, not just
+// headers. The coinbase-maturity reserve sums the coinbases of the last
+// CoinbaseMaturity blocks, and the base fee is derived from the parent's
+// fullness. A header-only placeholder answers both with "nothing": an immature
+// coinbase reads as mature (so a block spending it is accepted here and
+// refused everywhere else) and a non-empty parent reads as empty (so the next
+// base fee is derived differently and the network's next block is refused
+// here). Either is a fork off the network on the very first block above the
+// snapshot.
+func SnapshotBodiesFrom(height uint64) uint64 {
+	if height+1 <= CoinbaseMaturity {
+		return 1 // genesis has no coinbase to reserve and is never a parent body that matters
+	}
+	return height + 1 - CoinbaseMaturity
+}
+
+// NewFromSnapshotWithBodies is NewFromSnapshot with the recent block bodies a
+// faithful bootstrap needs (see SnapshotBodiesFrom): `recent` must be exactly
+// the blocks SnapshotBodiesFrom(s.Height)..s.Height, in order. Each is checked
+// against the proof-of-work-verified header at its height — same header, and
+// transactions that hash to its merkle root — so a body is exactly as
+// trustworthy as the header chain, and installed in place of the placeholder.
+//
+// nil is accepted for callers that have no bodies to give, and yields the old
+// placeholder-only chain: correct for answering balance queries at the
+// snapshot, but not guaranteed to validate the next few blocks the way the rest
+// of the network does.
+func NewFromSnapshotWithBodies(s Snapshot, headers []Header, recent []Block) (*Blockchain, error) {
 	if err := VerifySnapshot(s); err != nil {
 		return nil, err
 	}
@@ -85,6 +120,26 @@ func NewFromSnapshot(s Snapshot, headers []Header) (*Blockchain, error) {
 	for i, h := range headers {
 		blocks[i] = BlockFromHeader(h) // header-only placeholder (pruned body)
 		work.Add(work, BlockWork(h.Bits))
+	}
+	if recent != nil {
+		from := SnapshotBodiesFrom(s.Height)
+		want := 0
+		if s.Height >= from {
+			want = int(s.Height - from + 1)
+		}
+		if len(recent) != want {
+			return nil, fmt.Errorf("need the %d block bodies %d..%d below the snapshot, got %d", want, from, s.Height, len(recent))
+		}
+		for i, b := range recent {
+			h := from + uint64(i)
+			if b.Index != h || b.Header() != headers[h] {
+				return nil, fmt.Errorf("body at height %d does not match the verified header there", h)
+			}
+			if len(b.Transactions) == 0 || MerkleRoot(b.Transactions) != b.MerkleRoot {
+				return nil, fmt.Errorf("body at height %d: transactions do not hash to the header's merkle root", h)
+			}
+			blocks[h] = b
+		}
 	}
 	state := cloneState(memStateOf(s.Accounts))
 	// The bodies below the snapshot are pruned, so the burn they contain cannot be

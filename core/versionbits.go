@@ -274,7 +274,11 @@ func (bc *Blockchain) deploymentStatusesLocked() []DeploymentStatus {
 // strength of a discarded branch would have this node validating against a chain
 // nobody else is on.
 func (bc *Blockchain) refreshDeploymentsLocked() {
-	for _, st := range bc.deploymentStatusesLocked() {
+	installDeploymentStatuses(bc.deploymentStatusesLocked())
+}
+
+func installDeploymentStatuses(sts []DeploymentStatus) {
+	for _, st := range sts {
 		switch st.State {
 		case DeploymentLockedIn, DeploymentActive:
 			SetUpgradeHeight(st.Name, st.Activation)
@@ -282,4 +286,32 @@ func (bc *Blockchain) refreshDeploymentsLocked() {
 			ClearUpgradeHeight(st.Name)
 		}
 	}
+}
+
+// installDeploymentsFor installs the activation heights the given candidate
+// chain implies, for validating the block that would extend it.
+//
+// A reorg validates its suffix block by block, and every rule asks
+// IsUpgradeActive — which read the table derived from the chain being
+// REPLACED. So a suffix was judged by votes the losing branch cast: a rule
+// locked in only there would be enforced on the winner, and a rule the winner
+// locked in would be ignored, and a node could refuse (or accept) a branch
+// every node that synced it straight would accept (or refuse). Calling this
+// before each suffix block makes the suffix judged by its own history. The
+// caller restores the real chain's table afterwards (refreshDeploymentsLocked).
+//
+// headers is the candidate's headers from genesis. It returns false, and does
+// nothing, when no deployment is registered — the common case, which costs
+// nothing.
+func installDeploymentsFor(headers []Header) bool {
+	regd := Deployments()
+	if len(regd) == 0 {
+		return false
+	}
+	out := make([]DeploymentStatus, 0, len(regd))
+	for _, d := range regd {
+		out = append(out, evaluateDeployment(headers, d))
+	}
+	installDeploymentStatuses(out)
+	return true
 }

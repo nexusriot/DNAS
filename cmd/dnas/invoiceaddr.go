@@ -97,11 +97,11 @@ func writeInvoiceSeed(path string, sf *invoiceSeedFile) error {
 	// Written through a temp file and renamed: a crash partway through a write
 	// would otherwise leave a seed file that parses as nothing, and the next run
 	// would mint a NEW mnemonic and quietly orphan every address handed out.
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, append(data, '\n'), 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	// The temp file is synced before the rename, and the directory after it:
+	// this file holds the MNEMONIC, and a rename that reaches the disk ahead of
+	// the contents leaves an empty seed — the failure the comment above exists
+	// to prevent, moved to a power cut.
+	return wallet.WriteFileAtomic(path, append(data, '\n'), 0o600)
 }
 
 // nextInvoiceAddress derives the next unused address and advances the counter.

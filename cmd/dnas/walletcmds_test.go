@@ -259,3 +259,15 @@ func TestBackupBundleRoundTripThroughEncryption(t *testing.T) {
 		t.Fatal("a bundle of another kind was read as a backup")
 	}
 }
+
+func TestSafeBackupName(t *testing.T) {
+	for name, want := range map[string]bool{
+		"wallet.json": true, "nodekey.json": true, "chain.db.state": true,
+		"": false, ".": false, "..": false, "../x": false, "/etc/passwd": false,
+		"a/b": false, `..\x`: false,
+	} {
+		if got := safeBackupName(name); got != want {
+			t.Errorf("safeBackupName(%q) = %v, want %v", name, got, want)
+		}
+	}
+}

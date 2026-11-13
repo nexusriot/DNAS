@@ -1,6 +1,7 @@
 package wallet
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/binary"
@@ -36,7 +37,9 @@ func VaultAddress(hotHex, coldHex string, unlock uint64) (string, error) {
 	}
 	// Two distinct keys, or the vault is just a slower single-key account with a
 	// confusing name: one key holding both roles can always spend immediately.
-	if hotHex == coldHex {
+	// Compared as KEYS, not as text: hex is case-insensitive, so "ab…" and
+	// "AB…" are the same key and a string comparison let it through.
+	if bytes.Equal(hot, cold) {
 		return "", errors.New("hot and cold keys must differ")
 	}
 	h := sha256.New()

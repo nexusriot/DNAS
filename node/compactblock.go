@@ -122,11 +122,19 @@ func (a *blockAssembly) put(hash string, pb *pendingBlock, now time.Time) {
 }
 
 // take removes and returns a reconstruction, if it is still waiting.
-func (a *blockAssembly) take(hash string, now time.Time) (*pendingBlock, bool) {
+//
+// Only the peer the transactions were requested FROM may complete a
+// reconstruction (from == nil skips the check, for tests). Any peer could
+// otherwise take another's pending block by hash with junk transactions and
+// have the fallback full-block request sent to itself instead.
+func (a *blockAssembly) take(hash string, now time.Time, from ...*peer) (*pendingBlock, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	pb, ok := a.pending[hash]
 	if !ok {
+		return nil, false
+	}
+	if len(from) == 1 && from[0] != nil && pb.from != nil && pb.from != from[0] {
 		return nil, false
 	}
 	delete(a.pending, hash)
@@ -185,10 +193,22 @@ func (n *Node) onCompactBlock(p *peer, cb *CompactBlock) {
 	if n.seenBlk.has(hash) {
 		return
 	}
-	// Nothing below this point trusts the peer: the header's own proof of work is
+	// Nothing below this point trusts the peer: the header's proof of work is
 	// checked first, so reconstructing a block costs an attacker real hashing
 	// rather than a cheap message.
-	if !cb.Header.HasValidPoW() {
+	//
+	// HasValidPoW alone checks the hash against the target the header itself
+	// CLAIMS, so a forger simply claims the easiest one. The work only means
+	// something against the target the chain expects next, which this node
+	// knows only for a block extending its own tip. Anything else (a fork, a
+	// block we are behind on) is left to the ordinary full-block path, which
+	// validates it in context — compact relay is an optimisation, not a route.
+	tip := n.chain.Tip()
+	if cb.Header.PrevHash != tip.Hash || cb.Header.Index != tip.Index+1 {
+		p.send(Message{Type: MsgGetData, Index: cb.Header.Index})
+		return
+	}
+	if cb.Header.Bits != n.chain.NextBits() || !cb.Header.HasValidPoW() {
 		if n.bans.add(p.id, banInvalidBlock) {
 			Warnf("peer banned", "peer", short(p.id), "reason", "compact block with invalid proof of work")
 		}
@@ -251,7 +271,7 @@ func (n *Node) onGetBlockTxn(p *peer, index uint64, hash string, indexes []uint3
 
 // onBlockTxn fills the holes in a reconstruction and finishes it.
 func (n *Node) onBlockTxn(p *peer, hash string, txs []core.Transaction) {
-	pb, ok := n.assembly.take(hash, time.Now())
+	pb, ok := n.assembly.take(hash, time.Now(), p)
 	if !ok {
 		return
 	}

@@ -1,6 +1,8 @@
 package core
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"testing"
 
@@ -227,3 +229,24 @@ func TestCommitCostIsIndependentOfLedgerSize(t *testing.T) {
 		t.Fatalf("one-account update wrote %d nodes at 4096 accounts vs %d at 64: cost is tracking ledger size", large, small)
 	}
 }
+
+// A proof is untrusted input: an oversized sibling list must be refused, not
+// index past the end of the key.
+func TestVerifyTrieProofRejectsOversizedProofWithoutPanicking(t *testing.T) {
+	sibs := make([]string, trieKeyBits+44)
+	for i := range sibs {
+		sibs[i] = emptyNodeHash
+	}
+	key := hexSum("dnasanything")
+	for _, p := range []TrieProof{
+		{Key: key, Siblings: sibs},
+		{Key: key, Found: true, Value: "00", Siblings: sibs},
+		{Key: key, OtherKey: hexSum("dnasother"), OtherValue: "00", Siblings: sibs},
+	} {
+		if valid, _ := VerifyTrieProof(p, emptyNodeHash); valid {
+			t.Fatal("an oversized proof verified")
+		}
+	}
+}
+
+func hexSum(s string) string { h := sha256.Sum256([]byte(s)); return hex.EncodeToString(h[:]) }

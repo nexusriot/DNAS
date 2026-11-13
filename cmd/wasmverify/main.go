@@ -141,7 +141,8 @@ func checkHeader(this js.Value, args []js.Value) any {
 }
 
 // validateHeaderChain checks a run of headers: contiguous indexes, correct
-// linkage, and valid work on each.
+// linkage, valid work on each, and — where the run holds the retarget window
+// beneath a header — the difficulty the chain requires there.
 func validateHeaderChain(this js.Value, args []js.Value) any {
 	var hs []core.Header
 	if err := decode(arg(args, 0), &hs); err != nil {
@@ -157,7 +158,17 @@ func validateHeaderChain(this js.Value, args []js.Value) any {
 	if err := core.ValidateHeaderChain(hs[1:], hs[0].Hash, hs[0].Index); err != nil {
 		return map[string]any{"ok": true, "valid": false, "error": err.Error()}
 	}
-	return map[string]any{"ok": true, "valid": true, "count": len(hs)}
+	// Work alone is checked against the target each header STATES, whose only
+	// floor is PowLimit, so a run forged at the easiest target passes the
+	// check above in a fraction of a second. Bind each header's Bits to the
+	// retarget too, for every header the run holds enough history beneath.
+	// difficulty_checked says how many that was: the first lwmaWindow+1 of a
+	// run anchored mid-chain cannot be, and the caller should know.
+	checked, err := core.ValidateHeaderRunDifficulty(hs)
+	if err != nil {
+		return map[string]any{"ok": true, "valid": false, "error": err.Error()}
+	}
+	return map[string]any{"ok": true, "valid": true, "count": len(hs), "difficulty_checked": checked}
 }
 
 func difficulty(this js.Value, args []js.Value) any {
@@ -189,8 +200,16 @@ func verifyAccountProof(this js.Value, args []js.Value) any {
 	if err := decode(arg(args, 0), &p); err != nil {
 		return fail("proof: %v", err)
 	}
-	valid, present := core.VerifyAccountProof(p, arg(args, 1))
-	return map[string]any{"ok": true, "valid": valid, "present": present}
+	// An optional third argument names the address the caller asked about. The
+	// proof's own Address is server-supplied, so without it a valid proof of a
+	// different account would verify; callers should always pass it.
+	var valid, present bool
+	if want := arg(args, 2); want != "" {
+		valid, present = core.VerifyAccountProofFor(want, p, arg(args, 1))
+	} else {
+		valid, present = core.VerifyAccountProof(p, arg(args, 1))
+	}
+	return map[string]any{"ok": true, "valid": valid, "present": present, "address": p.Address}
 }
 
 // verifyAncestryProof checks that a block is in the history a later header

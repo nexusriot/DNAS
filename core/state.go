@@ -189,6 +189,17 @@ func (bc *Blockchain) ProveAccount(addr string) (AccountProof, bool) {
 //
 // The address is re-derived into a trie key here rather than trusted from the
 // proof, so a prover cannot answer about one address while claiming another.
+// VerifyAccountProofFor is VerifyAccountProof for the address the caller ASKED
+// about. VerifyAccountProof derives the trie key from p.Address, which the
+// server supplies — so a valid proof of a different (say, richer) address
+// verifies perfectly and was being printed as the balance of the one queried.
+func VerifyAccountProofFor(addr string, p AccountProof, root string) (valid, present bool) {
+	if p.Address != addr {
+		return false, false
+	}
+	return VerifyAccountProof(p, root)
+}
+
 func VerifyAccountProof(p AccountProof, root string) (valid, present bool) {
 	key := trieKeyFor(p.Address)
 	if p.Proof.Key != hexKey(key) {

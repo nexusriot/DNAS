@@ -72,7 +72,9 @@ Module `github.com/nexusriot/DNAS/node` — the peer-to-peer daemon.
   redialing rather than leaving loops running. It is idempotent, so a daemon that
   shuts down on a signal and a test that registers it as cleanup can both call it.
 - `secure.go` — `secureConn`: an X25519 handshake + AES-256-GCM encrypted,
-  length-framed message stream. **Permissionless by default** — with no network key
+  length-framed message stream, with a key per direction, counter nonces the
+  reader requires in order, and frames of at most 1 MiB (a longer message
+  spans several). **Permissionless by default** — with no network key
   the handshake is anonymous (anyone may connect); a non-empty key authenticates a
   private net (HMAC-gated). Returns a session id used to bind node identities.
 - Node identity: after the encrypted handshake, each side signs the session id
@@ -89,7 +91,9 @@ Module `github.com/nexusriot/DNAS/node` — the peer-to-peer daemon.
 - Keepalive: an established connection is pinged (`ping`/`pong`) and dropped if it
   falls silent past an idle read deadline, so a dead peer doesn't leak a slot.
 - `peerbook.go` — known-peer bookkeeping for discovery: dedup, self-exclusion
-  and an outbound-dial cap.
+  and an outbound-dial cap. The book is capped (4096 entries, addresses ≤ 262
+  bytes) and `getpeers` answers a bounded sample, so gossip cannot grow it
+  without bound.
 - `addrman.go` — the outbound **address manager**: tried/new tables (a handshake
   promotes an address to `tried`, which selection prefers), bounded and bucketed
   by network group, and a cap on how many LIVE outbound connections may share one
@@ -101,7 +105,10 @@ Module `github.com/nexusriot/DNAS/node` — the peer-to-peer daemon.
   when the node is short of addresses of its own. Seed results are ordinary `new`
   entries under the same diversity cap; a single seed could otherwise eclipse a
   starting node, so configure more than one.
-- `seen.go` — bounded FIFO `seenSet` for gossip de-duplication.
+- `seen.go` — bounded FIFO `seenSet` for gossip de-duplication. A block's hash
+  is marked seen only **after** it validates: marking it on arrival let a peer
+  send an empty body under the real next block's hash and have this node ignore
+  the real one when it came.
 - Fork sync uses a **block locator**: `getheaders` carries locator hashes, the
   peer replies from the last common block, and only the divergent suffix is
   pulled and applied via `ReorgFrom`. `getchain`/`chain` remains a deep-fork /
@@ -113,7 +120,44 @@ Module `github.com/nexusriot/DNAS/node` — the peer-to-peer daemon.
   binary. Block, header and transaction bytes come from `core` rather than
   being re-encoded here. Every length is checked against the bytes remaining
   before it is used to allocate — these are bytes from a peer that has proved
-  nothing.
+  nothing. Every send has a 20s write deadline (`peerWriteTimeout`): a peer
+  that stops reading is disconnected instead of blocking relay node-wide.
+- `framecap.go` — **per-message-type frame caps**. A flat 64 MiB ceiling let a
+  peer announce a 64 MiB `ping` and have it allocated; the binary format puts the
+  type first, so a short peek identifies it and an oversized frame is refused
+  while its body is still on the socket. JSON frames keep the global ceiling for
+  the allocation and are checked against the per-type cap once decoded.
+- `compactblock.go` — **compact block relay** (BIP152-shaped): a header, the
+  coinbase and 8-byte short ids resolved against the mempool, asking only for
+  what is missing. A compact block is only reconstructed if it extends our tip
+  with the expected `Bits` — a self-declared easy target is not accepted — and
+  only the peer asked can complete a reconstruction; anything else takes the
+  full-block path. A reconstruction that does not reproduce the merkle root
+  falls back to a full fetch.
+- `txrelay.go` — announcement-based transaction relay (`txinv`): announce the
+  id, let a peer pull what it lacks. An announcement is not recorded as seen, so
+  a peer that announces and never delivers cannot suppress the transaction.
+- `cfilterwire.go` / `lightclient.go` — compact filters on the peer wire, and a
+  light client that speaks the peer protocol (`FetchCFHeaders`,
+  `CompareCFHeaderChains`) so `dnas spv -peers` can ask several nodes and a
+  filter non-match has a second opinion rather than one HTTP server's word.
+- `nettime.go` — the bounded median of peers' clock offsets, recomputed
+  periodically, which timestamp validation adds to the local clock (see
+  `core/nettime.go`).
+- `stratum.go` — a Stratum-shaped mining server (`-stratum ADDR`): one long TCP
+  connection, jobs pushed when the tip moves, line-delimited JSON-RPC
+  subscribe/authorize/notify/submit. The framing is Stratum's; the job is a DNAS
+  candidate block, so it is not Bitcoin-miner compatible and does not pretend to be.
+  Sessions are capped (1024 overall, 64 per address), must authorize within 30s
+  and are dropped after 10 minutes of silence.
+- `pool.go` — pool accounting: per-miner vardiff share targets and a PPLNS
+  payout window (`/pool`), persisted with the node's soft state. The share
+  ledger (`shares.go`) rejects a duplicate share on the same tip, so a miner
+  cannot inflate its PPLNS weight by resubmitting.
+- `audit.go` — the periodic self-audit (`-audit N`): runs `core`'s `StateAudit`
+  on a schedule, logs a failure loudly with the remedy (`dnas db verify` or a
+  resync — a diverged node cannot recover by syncing), fails `/health`, and
+  counts failures monotonically.
 - `protocol.go` — the message envelope and message types: `identity`,
   `version` (protocol version + capability negotiation), `hello`,
   `getpeers`/`peers`, `tx` (with a Dandelion++ `stem` flag),

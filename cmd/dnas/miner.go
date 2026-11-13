@@ -88,7 +88,7 @@ func submitWinner(base string, b core.Block, shares bool) error {
 		Accepted bool `json:"accepted"`
 		Block    bool `json:"block"`
 	}
-	if err := postJSONInto(base+"/submitshare", b, &res); err != nil {
+	if err := postJSONInto(base+"/submitshare", b, &res, true); err != nil {
 		return err
 	}
 	if !res.Block {

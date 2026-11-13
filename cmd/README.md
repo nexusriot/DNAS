@@ -1,7 +1,10 @@
 # cmd
 
 Module `github.com/nexusriot/DNAS/cmd` — the `dnas` command-line tool. The main
-package lives in `cmd/dnas`.
+package lives in `cmd/dnas`. `cmd/wasmverify` compiles `core`'s verification
+primitives to WebAssembly (`make wasm`, `GOOS=js GOARCH=wasm`) so the browser
+explorer verifies proofs with the same Go the node runs, rather than a
+JavaScript copy that can drift.
 
 ```sh
 dnas node   [flags]              run a full node (default; -config for a JSON file)
@@ -13,36 +16,46 @@ dnas node   [flags]              run a full node (default; -config for a JSON fi
 dnas wallet new|address [-o F]   create / show a key file
 dnas wallet pubkey [-o F]        print a wallet's public key (for multisig/HTLC)
 dnas wallet mnemonic|restore|addresses   BIP39 backup + HD addresses
+dnas wallet new|mnemonic|restore -force  overwrite a key file holding a DIFFERENT key
+dnas wallet bech32 <addr>        convert an address between its two spellings
 dnas wallet multisig -threshold M -pubkeys a,b,c   M-of-N multisig address
 dnas htlc new|address|claim|refund [-asset ID]     hash-time-locked contracts (coin or a native asset)
 dnas htlc swap -hash H -asset-owner A -coin-owner B ...   derive both legs of an asset-for-coin swap
 dnas vault address|spend                           time-delayed vault: cold key now, hot key from a height
 dnas spv [-api URL] sync|verify <txhash>|scan|balance|history <address>   light client (headers/proof/filters/state)
+dnas spv [-peers LIST] [-netkey KEY] sync|scan|history ...                 cross-check filter headers against P2P peers
 dnas spv [-api URL] wallet [-f FILE] add|update|status|list|forget          persistent light wallet (incremental, -watch)
 dnas spv [-api URL] wallet -key FILE new|send <to> <amount>                 self-custodial light wallet (signs locally)
 dnas spv [-api URL] wallet -key FILE issue <ticker> <supply>                mint a native asset (token)
 dnas spv [-api URL] wallet -key FILE -asset ID send <to> <amount>           transfer a native asset
-dnas fastsync [-api URL] [-checkpoint H:HASH] [addr...]                     bootstrap state from a verified snapshot
+dnas fastsync [-api URL] [-checkpoint H:HASH] [-height H] [-peers LIST] [-netkey KEY] [addr...]
+                                                                            bootstrap state from a verified snapshot
 dnas spv [-api URL] wallet label|note|export|import                          private labels, notes, and a key-free watch list
 dnas miner -api URL -address ADDR [-once] [-shares] [-longpoll=false]       external miner (template -> mine -> submit)
 dnas faucet [-api URL] [-address ADDR]                                      ask a testnet/regtest node for coin
 dnas sponsor request -key F -to ADDR -amount A -payer ADDR -o tx.json        have someone else pay the fee (sender's half)
 dnas sponsor pay -wallet F -in tx.json [-submit]                             counter-sign it as the fee payer
 dnas db info|verify|export|import [-db FILE] [-network NAME]                inspect, check and move a chain store
+dnas db compact [-keep N]                                                   rewrite the store, dropping old bodies
 dnas peers [list|bans|unban KEY|add ADDR|drop PEER] [-api URL]              inspect and manage peers and bans
 dnas stats [-api URL] [-window N]                                          hashrate, block timing, fee flow, miners
 dnas reorgs [-api URL]                                                     chain switches this node has lived through
 dnas health [-api URL]                                                     readiness; exits non-zero when not ready
+dnas doctor                                                                run every operational check, and say what to fix
 dnas spv [-api URL] wallet -key F bump|cancel <txhash> [fee]               fee-bump or void a stuck payment
 dnas supply [-api URL]           minted / burned / circulating + the conservation check
 dnas multisig address|propose|sign|submit|inspect                          SPEND from an M-of-N account
 dnas escrow new|show|release|refund                                        2-of-3 buyer/seller/arbiter escrow
 dnas anchor hash|add|verify -file F                                        timestamp a file's hash on the chain
 dnas invoice new|show|watch|pay                                            ask to be paid, and verify that you were
+dnas invoice new -seed FILE                                                a FRESH address per invoice (SLIP-0010)
+dnas invoice serve -dir D [-webhook URL]                                   watch every outstanding invoice, settle each once
 dnas assets [show ID] [-ticker T]                                          what assets exist, and who holds them
 dnas script new|inspect|spend                                              spending conditions as scripts (core/script.go)
 dnas name resolve|list|register|renew|transfer|release                     names that resolve to addresses, with a proof
 dnas tx inspect|verify -in FILE | -hash HASH                               decode and check a transaction
+dnas tx export -address A [-o F] [-format csv|json]                        an address's history, for a spreadsheet or an accountant
+dnas channel open|countersign|arm|fund|pay|accept|close|refund|status       unidirectional payment channels (off-chain payments)
 dnas wallet sign|verify                                                    prove control of an address, off-chain
 dnas wallet passphrase [-remove]                                           re-encrypt a key file under a new passphrase
 dnas backup save|list|restore                                              encrypt the files a re-sync cannot replace
@@ -131,6 +144,13 @@ holds) and reports what the JSON does not: whether the signatures hold, the fee
 expired window, a spent nonce, a fee below the floor), and for a multisig file
 which members have signed. `verify` exits non-zero when a transaction would be
 refused, so a script can gate on it.
+
+`dnas wallet new|mnemonic|restore` refuse to overwrite a key file that holds a
+*different* key unless `-force` is given — re-running `restore` with the same
+mnemonic is harmless, but writing a fresh key over the only copy of a funded one
+is a loss of funds with no undo. Key files are written atomically (temp file,
+fsync, rename) and always `0600`, and `-index`/`-account` must be below 2^31
+(SLIP-0010 hardened derivation reserves the top bit).
 
 `dnas wallet sign|verify` and `dnas wallet passphrase` (`walletcmds.go`) prove
 control of an address without spending from it — domain-separated, so such a

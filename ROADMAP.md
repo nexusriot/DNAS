@@ -418,9 +418,14 @@ sections matter most for "toy → real".
   bandwidth argument does not apply to one peer and the extra round trip would
   widen the timing signal the stem exists to hide. This also subsumes the
   cold-start hole `MsgGetMempool` covered.
-- **`[S/M]` Weight-based congestion signal.** The EIP-1559 base fee currently
-  responds to transaction *count* (§9); switching the signal to block weight/bytes
-  makes it track real demand.
+- ~~**`[S/M]` Weight-based congestion signal.**~~ **Done.** The EIP-1559 base fee
+  responded to transaction *count* while charging per *byte*, so a block packed
+  to `MaxBlockBytes` with a few large transactions read as under-target and
+  lowered the price of the scarce resource. `UpgradeByteBaseFee`
+  (`-upgrades bytebasefee:HEIGHT`) drives it from the parent's non-coinbase
+  transaction bytes against `BaseFeeTargetBytes = MaxBlockBytes / 2`. It is
+  height-activated because the base fee is committed in every header, so an
+  existing chain replays under the count formula below the activation height.
 - ~~**`[S]` Index the mempool for selection.**~~ **Done.** `Mempool.Select` used to
   rescan the whole pool once per chosen transaction, recomputing each candidate's
   hash and canonical size every pass — O(txs × block txs) sha256 work, which on a
@@ -558,7 +563,7 @@ sections matter most for "toy → real".
   consensus codec: these records are local, never hashed and never sent to a
   peer.
 - ~~**`[S]` A Grafana dashboard for the Prometheus metrics.**~~ **Done, with the
-  half that was missing from the request.** `/metrics` now exports 55 series, and
+  half that was missing from the request.** `/metrics` now exports 63 series, and
   a dashboard with fifty series and no alerting is a dashboard nobody opens. So
   [scripts/monitoring/](scripts/monitoring/) ships both: a 27-panel dashboard and
   15 Prometheus alert rules, grouped by what has gone wrong. The rules are the
@@ -585,7 +590,8 @@ sections matter most for "toy → real".
   that has diverged once is not healthy because a later audit happened to pass,
   since the audit only inspects the tip and the damage may sit below it. The
   endpoint is token-guarded despite being a read: it is strictly more expensive
-  than `/snapshot`, and the flat per-client bucket does not price that.
+  than `/snapshot`, and even the cost-weighted limiter's 30-token charge lets a
+  client run one every second and a half at the default rate.
 
 - **`[M]` JSON-RPC 2.0 interface.** The HTTP API is REST; a bitcoind-style JSON-RPC
   surface eases integration with existing tooling and block explorers.
@@ -661,9 +667,8 @@ sections matter most for "toy → real".
   `MaxBlockBytes` for a block (JSON with hex signatures runs several times larger
   than the canonical encoding those constants bound). The cap is on the *reader*,
   not on `Content-Length`, so a request that understates its length is still
-  stopped mid-stream. What remains on this axis is the P2P half: an inbound frame
-  has only the coarse 64 MiB `maxFrame` cap, which is the per-message-type item
-  in §2.
+  stopped mid-stream. The P2P half has since been done too: inbound frames are
+  capped per message type ([node/framecap.go](node/framecap.go)), the §2 item.
 - ~~**`[S]` Expose the empty-block interval to operators.**~~ **Done.**
   `-emptyinterval N` (and the matching `node.json` key). This was not only a
   convenience: `scripts/demo.sh` had been failing silently since the target

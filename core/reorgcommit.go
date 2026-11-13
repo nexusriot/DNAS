@@ -58,13 +58,25 @@ func (s *blockStore) commitReorg(fork uint64, suffix []Block) error {
 		return err
 	}
 	if err := writeReorgCommit(s.path, fork, uint32(len(suffix)), sum); err != nil {
+		// The rename may have landed before the failure (a failed directory
+		// fsync, say). A commit record left behind for a reorg memory never
+		// adopted would make the next open switch the log to it — and truncate
+		// every block appended in the meantime. Withdraw it; if even that fails,
+		// refuse further writes rather than let the log run ahead of a record
+		// that contradicts it.
+		if rerr := removeReorgFiles(s.path); rerr != nil {
+			s.poison(fmt.Errorf("withdraw failed reorg commit: %w", rerr))
+		}
 		return err
 	}
 	if err := s.applyReorgSuffix(fork, suffix); err != nil {
 		s.poison(err)
 		return fmt.Errorf("persist reorg: %w", err)
 	}
-	removeReorgFiles(s.path)
+	// The log is switched, so this is success whatever the cleanup does: a
+	// record that outlives it is re-checked on the next open and found applied
+	// (see reorgApplied), even if more blocks have been appended by then.
+	_ = removeReorgFiles(s.path)
 	return nil
 }
 
@@ -192,6 +204,21 @@ func recoverReorg(storePath string) error {
 		return nil
 	}
 	fork, suffix, err := readReorgSide(storePath, commit)
+	if errors.Is(err, os.ErrNotExist) {
+		// A commit record with no side file. The side file is made durable
+		// BEFORE the record is written, so the only way to get here is a cleanup
+		// that removed the side file and crashed before removing the record (the
+		// order an older build used). The reorg was applied before cleanup began;
+		// if the log is long enough to hold it, drop the stale record.
+		s, blocks, oerr := openStoreFile(storePath)
+		if oerr != nil {
+			return oerr
+		}
+		s.close()
+		if uint64(len(blocks)) >= commit.fork+1+uint64(commit.count) {
+			return removeReorgFiles(storePath)
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("reorg commit record does not match its side file (%w); "+
 			"the main log was not switched on the strength of a record that does not "+
@@ -203,19 +230,21 @@ func recoverReorg(storePath string) error {
 	}
 	defer s.close()
 	if reorgApplied(blocks, fork, suffix) {
-		removeReorgFiles(storePath)
-		return nil
+		return removeReorgFiles(storePath)
 	}
 	if err := s.applyReorgSuffix(fork, suffix); err != nil {
 		return fmt.Errorf("finish persisted reorg: %w", err)
 	}
-	removeReorgFiles(storePath)
-	return nil
+	return removeReorgFiles(storePath)
 }
 
+// reorgApplied reports whether the log already holds suffix directly above
+// fork. Blocks appended AFTER the suffix do not make it "not applied": a node
+// that switched branches and kept mining extends the log past the suffix, and
+// treating that as unapplied would truncate those blocks on the next open.
 func reorgApplied(blocks []Block, fork uint64, suffix []Block) bool {
 	want := int(fork) + 1 + len(suffix)
-	if len(blocks) != want {
+	if len(blocks) < want {
 		return false
 	}
 	for i, b := range suffix {
@@ -300,9 +329,19 @@ func readReorgSide(storePath string, commit reorgCommit) (uint64, []Block, error
 	return fork, suffix, nil
 }
 
-func removeReorgFiles(storePath string) {
-	_ = os.Remove(reorgSidePath(storePath))
-	_ = os.Remove(reorgCommitPath(storePath))
-	_ = os.Remove(storePath + ".reorg.tmp")
+// removeReorgFiles retires a reorg's files. The COMMIT RECORD goes first and
+// is made durable before the side file is touched: a record without its side
+// file is the one leftover recovery cannot check, while a side file without a
+// record is simply discarded on the next open.
+func removeReorgFiles(storePath string) error {
+	if err := os.Remove(reorgCommitPath(storePath)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
 	_ = os.Remove(storePath + ".reorg.commit.tmp")
+	if err := syncDir(filepath.Dir(storePath)); err != nil {
+		return err
+	}
+	_ = os.Remove(reorgSidePath(storePath))
+	_ = os.Remove(storePath + ".reorg.tmp")
+	return nil
 }

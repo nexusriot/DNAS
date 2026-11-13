@@ -247,6 +247,38 @@ Module `github.com/nexusriot/DNAS/core` — the ledger and consensus rules.
   LRU-bounded `NodeStore` and a committer that updates only the accounts a
   block touched. The store is a cache, never a source of truth: a miss falls
   back to the whole-set rebuild, which is also what repopulates it.
+- `disknodes.go` — the same trie-node cache on disk (`-triecache N`,
+  `OpenDiskNodeStore`, `<db>.trie`): a fixed-size open-addressed table with no
+  resident index, possible because a node named by its own hash can never be
+  stale. A collision evicts, which is fine for a cache, and the cache survives a
+  restart so the first block after one does not pay a full rebuild.
+- `statedb.go` — `StateDB`, the interface every read and write on the
+  application path goes through, so where the ledger lives is a choice rather
+  than an assumption. `memState` (the map, the default) and `diskState` implement
+  it; a missing account reads as the zero `Account`, and `Range` is
+  deterministic in order.
+- `diskstate.go` — the disk-backed ledger (`-diskstate`): committed accounts in a
+  sorted, immutable file plus an overlay of unflushed writes. `Snapshot` copies
+  only the overlay and shares the file, which is what keeps a reorg or candidate
+  block from costing as much as the ledger. The block log stays authoritative —
+  the file is rebuilt by replay on open.
+- `addrlog.go` — the durable address index: `+`/`-` records appended as blocks
+  connect and disconnect, with only per-address offsets in RAM. A log built for
+  a different tip is rebuilt from the blocks rather than trusted.
+- `reorgcommit.go` — the **atomic reorg**: write the winning suffix to an
+  fsynced side file, publish a commit record (temp, fsync, rename), then apply it
+  to the log. A crash at any point either leaves the old chain or is finished
+  from the side file on the next open; a record that does not match its side
+  file refuses to open and names `dnas db verify`.
+- `audit.go` — `StateAudit`: a running node's self-audit (`-audit N`,
+  `GET /audit`). A trie rebuilt from the account map, sharing no cache with the
+  incremental committer, plus the supply identity — a second opinion rather than
+  a second copy of the first.
+- `versionbits.go` — BIP9 version-bit signaling: a deployment claims a bit of
+  the header's `Version`, locks in when a window has enough signals and becomes
+  active one window later, and installs that height via `SetUpgradeHeight` so
+  every rule keeps asking `IsUpgradeActive`. A reorg that unwinds a lock-in
+  withdraws the height.
 - `wirecodec.go` — exported binary encodings for the block, header and
   transaction, so the peer wire reuses the store's format rather than inventing
   a second one.
@@ -257,9 +289,10 @@ Module `github.com/nexusriot/DNAS/core` — the ledger and consensus rules.
   leaf produces a tree a client cannot distinguish from the truth. Updates are
   O(depth) and every historical root stays readable. The header **does** commit
   this trie's root (see `state.go`), so its proofs are bound to proof of work.
-  What is not yet done is reading state THROUGH it: `applyBlock` still works on a
-  resident map, so the memory bound and incremental root updates remain open
-  (ROADMAP §1).
+  The root is updated incrementally (`statetrie.go`), and application reads and
+  writes the ledger through the `StateDB` interface (`statedb.go`), so the ledger
+  can live on disk with `-diskstate` (`diskstate.go`) rather than in a resident
+  map.
 - `prune.go` — `-prune` drops old bodies from memory AND, via compaction, from
   disk. Because a header-only store cannot rebuild balances, a verified state
   snapshot is written beside it (`chain.db.state`) and `Open` bootstraps from it

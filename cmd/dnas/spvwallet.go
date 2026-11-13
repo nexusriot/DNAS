@@ -251,7 +251,7 @@ func provenAccount(base, addr string) (core.Account, error) {
 	if p.BlockIndex >= uint64(len(headers)) || p.StateRoot != headers[p.BlockIndex].StateRoot {
 		return core.Account{}, fmt.Errorf("state proof does not reference a verified header")
 	}
-	valid, present := core.VerifyAccountProof(p, headers[p.BlockIndex].StateRoot)
+	valid, present := core.VerifyAccountProofFor(addr, p, headers[p.BlockIndex].StateRoot)
 	if !valid {
 		return core.Account{}, fmt.Errorf("state proof does not fold to a verified header")
 	}
@@ -266,6 +266,12 @@ func provenAccount(base, addr string) (core.Account, error) {
 
 // feePerByte returns the node's recommended per-byte fee rate from /estimatefee,
 // so a send can pay enough to be mined without the user computing it.
+//
+// The rate is the node's word, and every caller multiplies it into a fee it
+// signs without asking. A hostile or broken node answering {"fee": balance/1000}
+// would have the wallet pay nearly its whole balance to a miner, so the answer
+// is capped at maxAutoFeePerByte. A user who really needs to pay more passes an
+// explicit fee.
 func feePerByte(base string) uint64 {
 	var r struct {
 		Fee uint64 `json:"fee"`
@@ -273,7 +279,21 @@ func feePerByte(base string) uint64 {
 	if err := getJSON(base+"/estimatefee", &r); err != nil || r.Fee == 0 {
 		return core.DefaultMinRelayFee
 	}
-	return r.Fee
+	return clampFeePerByte(r.Fee)
+}
+
+// maxAutoFeePerByte is the highest per-byte rate a node's estimate is trusted
+// with: a thousand times the default relay floor, which on a typical 1 KB
+// budget is 0.1 DNAS.
+const maxAutoFeePerByte = 1000 * core.DefaultMinRelayFee
+
+func clampFeePerByte(rate uint64) uint64 {
+	if rate > maxAutoFeePerByte {
+		fmt.Fprintf(os.Stderr, "warning: the node suggested %d base units/byte; capping at %d. "+
+			"Pass an explicit fee to pay more.\n", rate, maxAutoFeePerByte)
+		return maxAutoFeePerByte
+	}
+	return rate
 }
 
 // tipHeight asks the node for its current height, which is what the relative

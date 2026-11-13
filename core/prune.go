@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 )
 
 // Pruning: running a node without keeping every block body in memory.
@@ -337,7 +338,16 @@ func (bc *Blockchain) stateSnapshotLocked() (*Snapshot, error) {
 	if body == 0 || body > uint64(len(bc.blocks)) {
 		return nil, nil // nothing pruned: a plain reopen can replay everything
 	}
-	at := body - 1 // the highest height whose body is gone
+	// The snapshot sits CoinbaseMaturity heights above the last pruned one, so
+	// the bodies a reopen needs in order to validate the next block faithfully
+	// (SnapshotBodiesFrom: the maturity window and the parent) are still in the
+	// store beside it. Snapshotting at body-1 left them all as placeholders, and
+	// a reopened node then read an immature coinbase as mature and a full parent
+	// as empty. Falls back to body-1 when the chain is too short above it.
+	at := body - 1
+	if cand := body + CoinbaseMaturity - 1; cand < uint64(len(bc.blocks)) && SnapshotBodiesFrom(cand) >= body {
+		at = cand
+	}
 	state := cloneState(bc.state)
 	for i := len(bc.blocks) - 1; i > int(at); i-- {
 		applyUndo(state, bc.undos[i])
@@ -352,11 +362,30 @@ func writeStateSnapshotFile(storePath string, snap Snapshot) error {
 	if err != nil {
 		return fmt.Errorf("encode state snapshot: %w", err)
 	}
+	// Durable before it is published, and published durably: the compacted log
+	// that replaces the old one next is header-only below this height, so a
+	// power loss that kept the new log and lost (or tore) this file would leave
+	// a store nothing can replay.
 	tmp := statePath(storePath) + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
 		return fmt.Errorf("write state snapshot: %w", err)
 	}
-	return os.Rename(tmp, statePath(storePath))
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return fmt.Errorf("write state snapshot: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return fmt.Errorf("sync state snapshot: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("write state snapshot: %w", err)
+	}
+	if err := os.Rename(tmp, statePath(storePath)); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(storePath))
 }
 
 // readStateSnapshot loads the sidecar written beside a pruned store.
@@ -373,6 +402,23 @@ func readStateSnapshot(storePath string) (Snapshot, bool, error) {
 		return Snapshot{}, false, fmt.Errorf("parse state snapshot: %w", err)
 	}
 	return s, true, nil
+}
+
+// recentBodies returns the stored bodies SnapshotBodiesFrom(height)..height,
+// or nil when any of them is gone (a sidecar written before the snapshot was
+// moved above the pruned range), in which case the chain is seeded from
+// placeholders as it always was.
+func recentBodies(blocks []Block, height uint64) []Block {
+	from := SnapshotBodiesFrom(height)
+	if height >= uint64(len(blocks)) || from > height {
+		return nil
+	}
+	for i := from; i <= height; i++ {
+		if blocks[i].IsPlaceholder() {
+			return nil
+		}
+	}
+	return blocks[from : height+1]
 }
 
 // firstPlaceholder reports the index of the first header-only block above

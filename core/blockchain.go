@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
+	"math/bits"
 	"os"
 	"sort"
 	"sync"
@@ -31,6 +33,7 @@ type Account struct {
 // safe to share one *Blockchain across the miner, P2P handlers and API.
 type Blockchain struct {
 	mu        sync.RWMutex
+	closed    bool // set by Close; the chain refuses further writes
 	blocks    []Block
 	state     StateDB
 	work      *big.Int      // cumulative proof-of-work of blocks
@@ -315,6 +318,9 @@ func (bc *Blockchain) FindTxProof(txHash string) (TxProof, bool) {
 func (bc *Blockchain) AddBlock(block Block) error {
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
+	if bc.closed {
+		return ErrChainClosed
+	}
 	cc := bc.commitCtxAt(len(bc.blocks) - 1)
 	undo, err := applyBlock(bc.state, bc.blocks, block, bc.sigCache, cc)
 	if err != nil {
@@ -360,6 +366,9 @@ func (bc *Blockchain) ReplaceChain(incoming []Block) (bool, []Block, error) {
 	}
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
+	if bc.closed {
+		return false, nil, ErrChainClosed
+	}
 	if incoming[0].Hash != GenesisBlock().Hash {
 		return false, nil, errors.New("genesis mismatch")
 	}
@@ -382,6 +391,9 @@ func (bc *Blockchain) ReorgFrom(forkHeight uint64, suffix []Block) (bool, []Bloc
 	}
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
+	if bc.closed {
+		return false, nil, ErrChainClosed
+	}
 	if forkHeight >= uint64(len(bc.blocks)) {
 		return false, nil, errors.New("fork height beyond tip")
 	}
@@ -482,13 +494,31 @@ func (bc *Blockchain) reorgLocked(fork int, suffix []Block) (bool, []Block, erro
 	// the tip's, which is what makes rolling back cost nothing there, and the
 	// accumulator is rebuilt to that point once rather than per suffix block.
 	cc := bc.commitCtxAt(fork)
+	// Versionbits: each suffix block is judged by the activations ITS branch
+	// implies, not the ones the chain being replaced does (installDeploymentsFor).
+	// The real chain's table is put back on every exit; on success the refresh
+	// below installs the new chain's, which is the same thing.
+	var candHeaders []Header
+	if len(Deployments()) > 0 {
+		candHeaders = make([]Header, 0, fork+1+len(suffix))
+		for _, b := range blocks {
+			candHeaders = append(candHeaders, b.Header())
+		}
+		defer bc.refreshDeploymentsLocked()
+	}
 	for i, b := range suffix {
+		if candHeaders != nil {
+			installDeploymentsFor(candHeaders)
+		}
 		undo, err := applyBlock(state, blocks, b, bc.sigCache, cc)
 		if err != nil {
 			return false, nil, fmt.Errorf("block %d: %w", fork+1+i, err)
 		}
 		blocks = append(blocks, b)
 		undos = append(undos, undo)
+		if candHeaders != nil {
+			candHeaders = append(candHeaders, b.Header())
+		}
 	}
 
 	// Persist before committing in memory, so disk and memory stay consistent.
@@ -549,18 +579,32 @@ func (bc *Blockchain) Locator() []string {
 	return loc
 }
 
+// MaxLocatorLen bounds how many locator hashes LocatorFork considers. Locator
+// builds one with ten dense entries and then doubles its step, so a real one is
+// about 11 + log2(height) long — under 64 for any chain that could exist.
+// Entries past the bound are ignored.
+const MaxLocatorLen = 128
+
 // LocatorFork returns the height of the most recent block whose hash appears in
 // the locator (the fork point). Genesis is always shared, so this is well-defined.
+//
+// It walks the chain down from the tip against a set of the locator's hashes,
+// so the work is proportional to how far below the tip the fork is — a few
+// blocks for a peer that is in sync. It used to build a hash-to-height map of
+// the WHOLE chain on every getheaders, which any peer could request in a loop.
 func (bc *Blockchain) LocatorFork(locator []string) uint64 {
+	if len(locator) > MaxLocatorLen {
+		locator = locator[:MaxLocatorLen]
+	}
+	want := make(map[string]struct{}, len(locator))
+	for _, h := range locator {
+		want[h] = struct{}{}
+	}
 	bc.mu.RLock()
 	defer bc.mu.RUnlock()
-	have := make(map[string]uint64, len(bc.blocks))
-	for i, b := range bc.blocks {
-		have[b.Hash] = uint64(i)
-	}
-	for _, h := range locator { // ordered tip -> genesis: first match is highest
-		if height, ok := have[h]; ok {
-			return height
+	for i := len(bc.blocks) - 1; i > 0; i-- {
+		if _, ok := want[bc.blocks[i].Hash]; ok {
+			return uint64(i)
 		}
 	}
 	return 0
@@ -580,10 +624,78 @@ func commonPrefix(a, b []Block) int {
 	return i
 }
 
+// ValidateHeaderDifficulty checks that every header from index `from` on
+// commits to the difficulty the chain REQUIRES at its height (the LWMA retarget
+// over the headers before it), not merely one its own hash happens to meet.
+//
+// ValidateHeaderChain checks each header's work against the target that header
+// states, and the only floor on that is PowLimit — about one hash in four
+// thousand. A light client that stopped there would accept a chain forged at
+// the easiest possible target: fifty headers in a fraction of a second, each
+// carrying whatever state root the forger liked. Binding Bits to the retarget
+// makes a forged header chain cost what the real one cost.
+//
+// headers must be the contiguous chain from genesis (headers[i].Index == i).
+// The check reads only headers, so it works for a light client that never sees
+// a body.
+func ValidateHeaderDifficulty(headers []Header, from int) error {
+	if from < 1 {
+		from = 1 // genesis is a constant, checked by hash
+	}
+	for i, h := range headers {
+		if h.Index != uint64(i) {
+			return fmt.Errorf("header %d: index %d, want a contiguous chain from genesis", i, h.Index)
+		}
+	}
+	at := func(h uint64) Header { return headers[h] }
+	for i := from; i < len(headers); i++ {
+		if want := expectedBitsFrom(at, uint64(i)); headers[i].Bits != want {
+			return fmt.Errorf("header %d: bits %#x, but the chain requires %#x at that height", i, headers[i].Bits, want)
+		}
+	}
+	return nil
+}
+
+// ValidateHeaderRunDifficulty is ValidateHeaderDifficulty for a contiguous run
+// of headers that need not start at genesis — what a verifier anchored at some
+// trusted header holds. The retarget at a height reads the lwmaWindow+1
+// headers below it, so only the headers that have that much of the run beneath
+// them (and any at or below lwmaWindow, whose target is fixed) can be checked.
+// It returns how many were; the first few of a mid-chain run are not, and a
+// caller that needs them covered must start the run lwmaWindow+1 headers
+// earlier.
+func ValidateHeaderRunDifficulty(headers []Header) (checked int, err error) {
+	if len(headers) == 0 {
+		return 0, nil
+	}
+	base := headers[0].Index
+	for i, h := range headers {
+		if h.Index != base+uint64(i) {
+			return 0, fmt.Errorf("header %d: index %d, want %d (a contiguous run)", i, h.Index, base+uint64(i))
+		}
+	}
+	at := func(h uint64) Header { return headers[h-base] }
+	for i, h := range headers {
+		height := h.Index
+		if height == 0 {
+			continue // genesis is a constant, checked by hash
+		}
+		if !NoRetarget && height > lwmaWindow && height < base+lwmaWindow+1 {
+			continue // its window reaches below the run
+		}
+		if want := expectedBitsFrom(at, height); h.Bits != want {
+			return checked, fmt.Errorf("header %d: bits %#x, but the chain requires %#x at that height", i, h.Bits, want)
+		}
+		checked++
+	}
+	return checked, nil
+}
+
 // ValidateHeaderChain checks that headers form a contiguous, proof-of-work-valid
 // sequence whose first header builds on (prevHash, prevIndex). It is a cheap
 // pre-filter for headers-first sync — run before downloading bodies — and does
-// not verify the difficulty retarget (bodies are fully validated by AddBlock).
+// not verify the difficulty retarget (bodies are fully validated by AddBlock;
+// a client that never sees bodies adds ValidateHeaderDifficulty).
 func ValidateHeaderChain(headers []Header, prevHash string, prevIndex uint64) error {
 	ph, pi := prevHash, prevIndex
 	for i, h := range headers {
@@ -769,7 +881,8 @@ func openPrunedStore(path string, blocks []Block, firstPruned int) (*Blockchain,
 	// NewFromSnapshot re-derives the state root from the accounts and checks it
 	// against the header, so a tampered or stale snapshot is caught here rather
 	// than becoming this node's idea of everyone's balances.
-	bc, err := NewFromSnapshot(snap, headers)
+	recent := recentBodies(blocks, snap.Height)
+	bc, err := NewFromSnapshotWithBodies(snap, headers, recent)
 	if err != nil {
 		return nil, fmt.Errorf("state snapshot for %s: %w", path, err)
 	}
@@ -781,14 +894,27 @@ func openPrunedStore(path string, blocks []Block, firstPruned int) (*Blockchain,
 	// The reopened chain is pruned by construction; remember how far, so the next
 	// compaction does not redo work it has already done.
 	bc.storeCompactedTo = snap.Height + 1
+	if recent != nil {
+		bc.storeCompactedTo = SnapshotBodiesFrom(snap.Height)
+	}
 	return bc, nil
 }
 
 // Close flushes the account file, compacts the address index, and releases
 // the block log.
+// ErrChainClosed is returned by a write to a chain after Close. Close releases
+// the block store and the account file, so a block applied afterwards would be
+// persisted nowhere — and, on a disk ledger, validated against an account file
+// that can no longer be read.
+var ErrChainClosed = errors.New("chain is closed")
+
 func (bc *Blockchain) Close() error {
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
+	if bc.closed {
+		return nil
+	}
+	bc.closed = true
 	var err error
 	if ds, ok := bc.state.(*diskState); ok {
 		if ferr := ds.Flush(); ferr != nil {
@@ -868,6 +994,16 @@ func Load(path string) (*Blockchain, error) {
 // suite, like Bitcoin's fPowNoRetargeting) it instead holds the genesis target so
 // blocks stay instant; a real network leaves it off.
 func expectedBits(blocks []Block, height uint64) uint32 {
+	return expectedBitsFrom(func(h uint64) Header {
+		return Header{Timestamp: blocks[h].Timestamp, Bits: blocks[h].Bits}
+	}, height)
+}
+
+// expectedBitsFrom is expectedBits over any source of headers. It reads only
+// heights height-lwmaWindow-1 .. height-1 (Timestamp and Bits), which is what
+// lets a verifier holding a run of headers — not the chain from genesis —
+// check the difficulty of every header past the run's first lwmaWindow+1.
+func expectedBitsFrom(at func(uint64) Header, height uint64) uint32 {
 	if NoRetarget || height <= lwmaWindow {
 		return GenesisBits
 	}
@@ -877,14 +1013,15 @@ func expectedBits(blocks []Block, height uint64) uint32 {
 	sumTarget := new(big.Int)
 	for i := 1; i <= N; i++ {
 		cur := height - uint64(N) - 1 + uint64(i) // window blocks: height-N .. height-1
-		st := blocks[cur].Timestamp - blocks[cur-1].Timestamp
+		hc, hp := at(cur), at(cur-1)
+		st := hc.Timestamp - hp.Timestamp
 		if st < 1 {
 			st = 1
 		} else if st > maxSolve {
 			st = maxSolve
 		}
 		weightedSolve += int64(i) * st
-		sumTarget.Add(sumTarget, CompactToBig(blocks[cur].Bits))
+		sumTarget.Add(sumTarget, CompactToBig(hc.Bits))
 	}
 	// nextTarget = avgTarget · weightedSolve / (T · N(N+1)/2). If blocks arrive at
 	// exactly TargetBlockTime the two factors cancel and the target is unchanged;
@@ -904,10 +1041,15 @@ func expectedBits(blocks []Block, height uint64) uint32 {
 }
 
 // expectedBaseFee deterministically derives the base fee for the block at
-// `height` from its parent's fullness (EIP-1559 style): if the parent held more
-// than BaseFeeTargetTxs transactions the fee rises, if fewer it falls, each by at
-// most 1/BaseFeeMaxChangeDenominator. It is clamped to MinBaseFee so it can never
-// reach zero and can always recover. Every node derives the same value.
+// `height` from its parent's fullness (EIP-1559 style): if the parent was fuller
+// than the target the fee rises, if emptier it falls, each by at most
+// 1/BaseFeeMaxChangeDenominator of the distance. It is clamped to MinBaseFee so
+// it can never reach zero and can always recover. Every node derives the same
+// value.
+//
+// Fullness is the parent's non-coinbase transaction COUNT against
+// BaseFeeTargetTxs, or — from UpgradeByteBaseFee on — its transaction BYTES
+// against BaseFeeTargetBytes (see the upgrade for why).
 func expectedBaseFee(blocks []Block, height uint64) uint64 {
 	if height == 0 {
 		return InitialBaseFee
@@ -917,27 +1059,49 @@ func expectedBaseFee(blocks []Block, height uint64) uint64 {
 	if base < MinBaseFee {
 		base = MinBaseFee
 	}
-	parentTxs := 0
-	if len(parent.Transactions) > 0 {
-		parentTxs = len(parent.Transactions) - 1 // exclude the coinbase
+	var used, target uint64
+	if IsUpgradeActive(UpgradeByteBaseFee, height) {
+		used, target = uint64(blockWeight(parent)), uint64(BaseFeeTargetBytes)
+	} else {
+		if len(parent.Transactions) > 0 {
+			used = uint64(len(parent.Transactions) - 1) // exclude the coinbase
+		}
+		target = uint64(BaseFeeTargetTxs)
 	}
-	target := BaseFeeTargetTxs
 	switch {
-	case parentTxs == target:
+	case used == target:
 		return base
-	case parentTxs > target:
-		delta := base * uint64(parentTxs-target) / uint64(target) / BaseFeeMaxChangeDenominator
+	case used > target:
+		delta := scaledDelta(base, used-target, target)
 		if delta == 0 {
 			delta = 1 // always move at least one unit when off-target
 		}
+		if base+delta < base {
+			return math.MaxUint64
+		}
 		return base + delta
-	default: // parentTxs < target
-		delta := base * uint64(target-parentTxs) / uint64(target) / BaseFeeMaxChangeDenominator
+	default: // used < target
+		delta := scaledDelta(base, target-used, target)
 		if delta >= base || base-delta < MinBaseFee {
 			return MinBaseFee
 		}
 		return base - delta
 	}
+}
+
+// scaledDelta is base·distance/target/BaseFeeMaxChangeDenominator, computed
+// with a 128-bit intermediate. With a byte target the distance is up to half a
+// megabyte, so base·distance overflows 64 bits once the base fee passes ~3.7e13
+// — far off, but a consensus formula that silently wraps is not one to leave
+// lying around. The result is identical to the plain uint64 expression whenever
+// that one does not overflow, so the count-based history replays unchanged.
+func scaledDelta(base, distance, target uint64) uint64 {
+	hi, lo := bits.Mul64(base, distance)
+	if hi >= target {
+		return math.MaxUint64 / BaseFeeMaxChangeDenominator // saturate; cannot happen at real values
+	}
+	q, _ := bits.Div64(hi, lo, target)
+	return q / BaseFeeMaxChangeDenominator
 }
 
 // NextBaseFee is the base fee the next mined block must commit to.
@@ -959,7 +1123,12 @@ func immatureCoinbase(blocks []Block, height uint64, addr string) uint64 {
 	var sum uint64
 	for i := start; i < height && i < uint64(len(blocks)); i++ {
 		if len(blocks[i].Transactions) == 0 {
-			continue // pruned/placeholder block (below a snapshot): already final, so mature
+			// A pruned/placeholder body. Below the reach of the next block's
+			// maturity window this is harmless; INSIDE it, it would read an
+			// immature coinbase as mature — which is why a snapshot bootstrap
+			// keeps the last CoinbaseMaturity bodies (see SnapshotBodiesFrom) and
+			// pruning never drops a body that close to the tip.
+			continue
 		}
 		cb := blocks[i].Transactions[0]
 		if cb.IsCoinbase() && cb.To == addr {
@@ -1471,9 +1640,12 @@ func applyAssetOp(state StateDB, tx Transaction, reserve, payerReserve uint64, s
 	var delta int64
 	switch op.Op {
 	case AssetOpMint:
-		// The cap is on the issuer's holding, which is the whole supply for a mint:
-		// nothing else can create units, so this is where the total is bounded and
-		// where the signed arithmetic elsewhere is kept from overflowing.
+		// The cap is on the issuer's HOLDING, not the asset's total supply: units
+		// the issuer transferred away are no longer counted, so this alone does
+		// not bound the total. What it and the matching check on every transfer
+		// credit (applyAssetTransfer) do guarantee is that no single holding can
+		// pass MaxAssetSupply — which is what keeps the signed per-asset
+		// arithmetic (withAssetDelta, conservation) from wrapping.
 		if held+op.Amount < held || held+op.Amount > MaxAssetSupply {
 			return fmt.Errorf("minting %d would take asset %s past the %d cap", op.Amount, tx.AssetID, MaxAssetSupply)
 		}
@@ -1518,6 +1690,16 @@ func applyAssetTransfer(state StateDB, tx Transaction, reserve, payerReserve uin
 	}
 	if sender.Assets[tx.AssetID] < tx.Amount {
 		return fmt.Errorf("insufficient asset for %s: have %d, need %d", tx.From, sender.Assets[tx.AssetID], tx.Amount)
+	}
+	// The credit must not take the recipient's holding past MaxAssetSupply.
+	// Without this an issuer could mint to the cap, transfer it all away, mint
+	// again, and pile the units onto one holder until the balance wrapped mod
+	// 2^64 — to any value the issuer liked, including zero. A self-transfer
+	// nets to nothing and is exempt.
+	if tx.To != tx.From {
+		if have := state.Get(tx.To).Assets[tx.AssetID]; have+tx.Amount < have || have+tx.Amount > MaxAssetSupply {
+			return fmt.Errorf("transfer of %d would take %s's holding of asset %s past the %d cap", tx.Amount, tx.To, tx.AssetID, MaxAssetSupply)
+		}
 	}
 	sender.Balance -= fee
 	sender.Nonce++

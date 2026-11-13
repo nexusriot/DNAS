@@ -2,6 +2,7 @@ package core
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -144,6 +145,10 @@ const (
 	// BaseFeeTargetTxs is the per-block non-coinbase transaction count the base fee
 	// targets: above it the next base fee (per byte) rises, below it falls.
 	BaseFeeTargetTxs = MaxBlockTxs / 2
+	// BaseFeeTargetBytes is the per-block transaction-byte target once
+	// UpgradeByteBaseFee is active: the congestion signal becomes the parent's
+	// BYTES rather than its transaction count, matching what the fee prices.
+	BaseFeeTargetBytes = MaxBlockBytes / 2
 	// BaseFeeMaxChangeDenominator caps the per-block change to 1/8 (12.5%), as in
 	// Ethereum, so the base fee moves smoothly rather than in jumps.
 	BaseFeeMaxChangeDenominator = 8
@@ -208,6 +213,16 @@ func ParseAmount(s string) (uint64, error) {
 	var frac uint64
 	if len(parts) == 2 && parts[1] != "" {
 		f := parts[1]
+		// Validate the WHOLE fraction before trimming it: cutting to eight
+		// characters first let "1.00000000junk" parse as 1 DNAS. Digits past the
+		// eighth are truncated (not rounded) — that is pinned behaviour in the
+		// consensus vectors ("0.000000019" is 1 base unit) — but they must still
+		// be digits.
+		for i := 0; i < len(f); i++ {
+			if f[i] < '0' || f[i] > '9' {
+				return 0, fmt.Errorf("invalid fraction in %q", s)
+			}
+		}
 		if len(f) > 8 {
 			f = f[:8]
 		}
@@ -218,6 +233,11 @@ func ParseAmount(s string) (uint64, error) {
 		if err != nil {
 			return 0, fmt.Errorf("invalid fraction in %q: %w", s, err)
 		}
+	}
+	// whole*Coin wraps silently past MaxUint64/Coin (~184 billion DNAS): a typo
+	// of a few extra digits produced a tiny amount rather than an error.
+	if whole > (math.MaxUint64-frac)/Coin {
+		return 0, fmt.Errorf("amount %q is too large", s)
 	}
 	return whole*Coin + frac, nil
 }

@@ -206,7 +206,10 @@ func (w *Wallet) Save(path string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o600)
+	// Atomically, and always 0600: os.WriteFile truncates the only copy of a key
+	// before writing it (a crash mid-write loses the wallet) and keeps an
+	// existing file's looser mode.
+	return writeFileAtomic(path, data, 0o600)
 }
 
 // Load reads a wallet previously written by Save.
@@ -318,7 +321,9 @@ func (w *Wallet) SaveEncrypted(path, passphrase string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o600)
+	// Atomic for the same reason as Save — and it matters more here: `wallet
+	// passphrase` re-encrypts the only copy in place.
+	return writeFileAtomic(path, data, 0o600)
 }
 
 // LoadEncrypted reads a wallet written by SaveEncrypted, decrypting with the

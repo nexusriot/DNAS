@@ -108,3 +108,77 @@ func TestReorgCommitMismatchRefusesOpen(t *testing.T) {
 		t.Fatalf("mismatched commit should refuse to open and name `dnas db verify`, got %v", err)
 	}
 }
+
+// A commit record that outlived its reorg (cleanup lost to a crash) must not
+// truncate blocks the node appended AFTER the reorg on the next open.
+func TestStaleReorgCommitDoesNotTruncateLaterBlocks(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "chain.db")
+	bc, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	miner, _ := wallet.New()
+	for i := 0; i < 6; i++ {
+		mustAdd(t, bc, mineOn(t, bc, miner.Address(), nil))
+	}
+	blocks := bc.Blocks()
+	if err := bc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Leave a fully-applied reorg's record behind: the suffix (heights 2..3) is
+	// what the log already holds, and heights 4..6 were appended after it.
+	sum, err := writeReorgSide(path, 1, blocks[2:4])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeReorgCommit(path, 1, 2, sum); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer got.Close()
+	if got.Height() != 6 {
+		t.Fatalf("height after reopen = %d, want 6: a stale commit record truncated the log", got.Height())
+	}
+	if _, err := os.Stat(reorgCommitPath(path)); !os.IsNotExist(err) {
+		t.Fatal("stale commit record was not removed")
+	}
+}
+
+// A cleanup that removed the side file and crashed before removing the record
+// (the order an older build used) must not leave the store unopenable.
+func TestCommitRecordWithoutSideFileOpensWhenApplied(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "chain.db")
+	bc, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	miner, _ := wallet.New()
+	for i := 0; i < 3; i++ {
+		mustAdd(t, bc, mineOn(t, bc, miner.Address(), nil))
+	}
+	blocks := bc.Blocks()
+	if err := bc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	sum, err := writeReorgSide(path, 1, blocks[2:4])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeReorgCommit(path, 1, 2, sum); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(reorgSidePath(path)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Open(path)
+	if err != nil {
+		t.Fatalf("store with an applied reorg's orphaned record would not open: %v", err)
+	}
+	defer got.Close()
+	if got.Height() != 3 {
+		t.Fatalf("height = %d, want 3", got.Height())
+	}
+}

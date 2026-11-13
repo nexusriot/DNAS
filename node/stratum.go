@@ -60,6 +60,24 @@ const stratumJobTTL = 2 * time.Minute
 // maxStratumJobs bounds the jobs remembered per connection.
 const maxStratumJobs = 16
 
+// Connection bounds. Each session costs a goroutine, a scanner buffer of up to
+// stratumMaxLine and a job set, and the listener used to accept without limit
+// and read without a deadline — so idle sockets alone could exhaust the node.
+const (
+	maxStratumConns      = 1024
+	maxStratumConnsPerIP = 64
+)
+
+// Variables rather than constants only so the tests need not wait them out.
+var (
+	// stratumAuthTimeout is how long a session may take to authorize; a socket
+	// that never does is not a miner.
+	stratumAuthTimeout = 30 * time.Second
+	// stratumIdleTimeout is how long an authorized miner may go without sending
+	// anything. Vardiff aims for a share every few seconds, so this is generous.
+	stratumIdleTimeout = 10 * time.Minute
+)
+
 // stratumRequest is one line from a miner.
 type stratumRequest struct {
 	ID     *json.RawMessage  `json:"id"`
@@ -181,6 +199,10 @@ func (s *StratumServer) accept() {
 			}
 			continue
 		}
+		if !s.admit(conn) {
+			_ = conn.Close()
+			continue
+		}
 		c := &stratumConn{
 			srv: s, conn: conn, enc: json.NewEncoder(conn),
 			extranonce: randomExtranonce(),
@@ -244,6 +266,29 @@ func (s *StratumServer) pushJobs(clean bool) {
 	}
 }
 
+// admit reports whether a new connection fits under the node-wide and per-IP
+// session caps.
+func (s *StratumServer) admit(conn net.Conn) bool {
+	ip := remoteIP(conn)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.conns) >= maxStratumConns {
+		Warnf("stratum connection refused", "ip", ip, "reason", "session limit")
+		return false
+	}
+	same := 0
+	for c := range s.conns {
+		if remoteIP(c.conn) == ip {
+			same++
+		}
+	}
+	if same >= maxStratumConnsPerIP {
+		Warnf("stratum connection refused", "ip", ip, "reason", "per-address session limit")
+		return false
+	}
+	return true
+}
+
 func (s *StratumServer) drop(c *stratumConn) {
 	s.mu.Lock()
 	delete(s.conns, c)
@@ -286,7 +331,15 @@ func (c *stratumConn) serve() {
 	defer c.srv.drop(c)
 	sc := bufio.NewScanner(c.conn)
 	sc.Buffer(make([]byte, 0, 4096), stratumMaxLine)
-	for sc.Scan() {
+	for {
+		idle := stratumIdleTimeout
+		if !c.authorized() {
+			idle = stratumAuthTimeout
+		}
+		_ = c.conn.SetReadDeadline(time.Now().Add(idle))
+		if !sc.Scan() {
+			return
+		}
 		line := sc.Bytes()
 		if len(line) == 0 {
 			continue

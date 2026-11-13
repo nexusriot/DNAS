@@ -326,7 +326,9 @@ each defence assumes, and what is explicitly out of scope, see
 ## Networking & security
 
 - **Permissionless, encrypted, identified links.** Every connection begins with a
-  symmetric X25519 key exchange and AES-256-GCM encryption. By **default there is
+  symmetric X25519 key exchange and AES-256-GCM encryption — a key per direction
+  and a counter nonce, so frames cannot be replayed, reordered or reflected, and
+  frames of at most 1 MiB. By **default there is
   no shared key — the network is open**: anyone may connect (the defining property
   of a cryptocurrency). Supplying a `-netkey` instead authenticates a *private*
   network (a peer without the key fails an HMAC check). Either way each peer proves
@@ -557,6 +559,8 @@ free.
 | `-network`   | `mainnet`      | which network to run on: `mainnet`, `testnet` or `regtest` — separate genesis, signatures and peers |
 | `-addrindex` | off            | index address → transactions, serving `/address/{addr}/history` (kept in `<db>.addridx`) |
 | `-diskstate` | off            | keep the account ledger in `<db>.accounts` instead of RAM (rebuilt from the block log on start) |
+| `-triecache` | `0`            | keep the state-trie cache in a file of this many slots (0 = in memory; 512 bytes per slot) |
+| `-audit`     | `0`            | re-derive and verify the ledger every N blocks (0 = never; see `GET /audit`) |
 | `-faucet`    | off            | hand out coin via `POST /faucet` (testnet/regtest only)        |
 | `-faucetamount` | `10`        | faucet payout in DNAS                                          |
 | `-faucetcooldown` | `60`      | seconds between faucet payouts to one address or requester     |
@@ -568,7 +572,10 @@ free.
 | `-dandelion` | on             | relay new transactions via Dandelion++ stem/fluff (origin privacy) |
 | `-checkpoints` | —            | finality checkpoints, comma-separated `height:hash` pairs |
 | `-emptyinterval` | `0`          | seconds the miner idles before minting an EMPTY block (0 = one target block time, currently 60s) |
-| `-upgrades`  | —              | consensus upgrade activations, comma-separated `name:height` pairs (known: `dustlimit`, `multioutput`, `vault`, `feesponsor`, `checkedaddresses`, `uniquecoinbase`, `assetops`, `filtercommit`, `historyroot`, `nonfungible`, `nameservice`, `script`) |
+| `-upgrades`  | —              | consensus upgrade activations, comma-separated `name:height` pairs (known: `dustlimit`, `multioutput`, `vault`, `feesponsor`, `checkedaddresses`, `uniquecoinbase`, `assetops`, `filtercommit`, `historyroot`, `nonfungible`, `nameservice`, `script`, `bytebasefee`) |
+| `-deployments` | —            | BIP9 miner votes, comma-separated `name:bit:start:timeout:window:threshold` |
+| `-signalbits` | —             | version bits this node's miner signals, comma-separated (e.g. `0,2`) |
+| `-stratum`   | —              | listen for pool miners on this address (e.g. `:3333`); empty disables it |
 | `-config`    | —              | JSON config file (flags override its values)   |
 
 A node shuts down cleanly on `SIGINT`/`SIGTERM` (stops mining, closes peers,
@@ -593,7 +600,7 @@ A second node on the same machine just needs distinct ports and a peer:
 
 ```sh
 go run ./cmd/dnas node -listen :3001 -api :8081 -peers localhost:3000 -mine \
-  -wallet w2.json -db chain2.json
+  -wallet w2.json -db chain2.db
 ```
 
 ## HTTP API
@@ -622,6 +629,7 @@ go run ./cmd/dnas node -listen :3001 -api :8081 -peers localhost:3000 -mine \
 | POST   | `/droppeer` 🔒    | `{"peer":"addr-or-identity"}` — close a connection            |
 | GET    | `/chainstats`     | `?window=N` → hashrate, block intervals, fee flow, miners     |
 | GET    | `/reorgs`         | chain switches this node has lived through                    |
+| GET    | `/audit` 🔒       | re-derive the ledger and check it against what the chain commits; **500** on a mismatch (token-guarded despite being a read: it is O(ledger)) |
 | GET    | `/health`         | readiness: 200 when usable, 503 + reasons when not            |
 | GET    | `/address`        | this node's wallet address                                    |
 | GET    | `/address/{addr}/history` | transactions touching an address, oldest first (`?from=&limit=`; needs `-addrindex`) |
@@ -645,7 +653,7 @@ go run ./cmd/dnas node -listen :3001 -api :8081 -peers localhost:3000 -mine \
 | GET    | `/cfilter/{index}`| one block's compact filter; **410** when the body is pruned (an empty filter would falsely prove absence) |
 | GET    | `/cfheaders`      | the filter-header chain, paged (BIP157-style); **410** below a fast-synced node's snapshot |
 | GET    | `/events`         | Server-Sent Events stream of new blocks / reorgs / mempool txs |
-| GET    | `/metrics`        | Prometheus-format node metrics: height, difficulty, mempool depth/bytes, peers, fees, plus reorgs, orphans, ban scores, hashrate, block intervals, supply, tip age, webhook delivery, and the address manager's eclipse-resistance signals (55 series) |
+| GET    | `/metrics`        | Prometheus-format node metrics: height, difficulty, mempool depth/bytes, peers, fees, plus reorgs, orphans, ban scores, hashrate, block intervals, supply, tip age, webhook delivery, and the address manager's eclipse-resistance signals (63 series) |
 | GET    | `/webhooks`       | webhook delivery counters (sent / failed / dropped / queued)  |
 | POST   | `/send` 🔒        | `{"to","amount","fee","expiry"?,"lock_until"?,"memo"?,"nonce"?}` — signed by the node wallet |
 | POST   | `/tx` 🔒          | submit a fully-signed transaction (plain / multisig / HTLC / vault / fee-sponsored) |
@@ -958,7 +966,10 @@ asset.
   Ban scores persist across a *graceful* restart but a hard kill can lose the
   latest state (re-synced from peers).
 - Consensus uses a canonical binary encoding (portable across implementations),
-  but there is still only one implementation and no cross-client test vectors.
+  but there is still only one implementation. A language-neutral corpus of
+  golden consensus vectors ([core/testdata/consensus_vectors.json](core/testdata/consensus_vectors.json),
+  checked by [core/vectors_test.go](core/vectors_test.go)) is what a second
+  client would be tested against; nothing has been tested against it yet but this one.
 - Locator sync transfers only the divergent suffix for normal forks; genuinely
   deep or losing forks still fall back to a whole-chain exchange.
 - Recipient checksums are consensus-enforced once the `checkedaddresses` upgrade
@@ -968,7 +979,8 @@ asset.
   and the account state see exactly one spelling per account.
 - The fee market is a burned EIP-1559 base fee (consensus) plus eviction,
   replace-by-fee, and a dynamic relay-policy floor; its congestion signal is
-  transaction count rather than block weight.
+  transaction count until the `bytebasefee` upgrade activates, and transaction
+  bytes from then on.
 - State-root proofs prove membership AND absence: the root is a trie root, so a
   key's position is fixed by the key and arriving at an empty slot is itself the
   proof that nothing is there. The root is computed incrementally against a

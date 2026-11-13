@@ -135,11 +135,8 @@ func (s *diskState) Lookup(addr string) (Account, bool) {
 	if s.base == nil || s.base.count == 0 {
 		return Account{}, false
 	}
-	acc, ok, err := s.base.find(addr)
-	if err != nil || !ok {
-		return Account{}, false
-	}
-	return acc, true
+	acc, ok := s.base.mustFind(addr)
+	return acc, ok
 }
 
 func (s *diskState) Put(addr string, acc Account) {
@@ -197,11 +194,7 @@ func (s *diskState) lookupExists(addr string) (Account, bool) {
 	if s.base == nil {
 		return Account{}, false
 	}
-	acc, ok, err := s.base.find(addr)
-	if err != nil || !ok {
-		return Account{}, false
-	}
-	return acc, true
+	return s.base.mustFind(addr)
 }
 
 // merge walks the file and the overlay in address order. Tombstones suppress
@@ -391,8 +384,29 @@ func writeAccountRecord(w io.Writer, addr string, acc Account) (int, error) {
 }
 
 func (b *diskBase) has(addr string) bool {
-	_, ok, err := b.find(addr)
-	return err == nil && ok
+	_, ok := b.mustFind(addr)
+	return ok
+}
+
+// mustFind is find for the StateDB methods, which have no error to return.
+//
+// A read error used to come back as "no such account". That is the one answer
+// that is never safe: a funded account reads as empty, so a valid block fails
+// validation and the node splits from the network — or, worse, an existing
+// account is re-created at nonce 0, and every transaction it ever signed
+// becomes valid again. Like Range, a ledger that cannot be read stops loudly.
+func (b *diskBase) mustFind(addr string) (Account, bool) {
+	if b.count == 0 {
+		return Account{}, false
+	}
+	if b.f == nil {
+		panic("account file read after the chain was closed")
+	}
+	acc, ok, err := b.find(addr)
+	if err != nil {
+		panic(fmt.Errorf("account file read failed for %s: %w", addr, err))
+	}
+	return acc, ok
 }
 
 func (b *diskBase) find(addr string) (Account, bool, error) {

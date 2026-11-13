@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 )
@@ -42,6 +43,10 @@ type addrLog struct {
 	// order. It holds file offsets, not postings, so a query reads only its
 	// own records instead of the whole log. Built once by sync.
 	offs map[string][]int64
+	// broken is the first write that failed. From then on the log no longer
+	// matches the chain, so it answers no queries and takes no more writes;
+	// its header has been reset so the next start rebuilds it.
+	broken error
 }
 
 var errAddrLogClosed = errors.New("address index is closed")
@@ -151,10 +156,35 @@ func (l *addrLog) addBlock(b Block) error {
 	if l.f == nil {
 		return errAddrLogClosed
 	}
-	if err := l.addBlockLocked(b); err != nil {
-		return err
+	if l.broken != nil {
+		return l.broken
 	}
-	return l.writeHeaderLocked(b.Index, b.Hash)
+	if err := l.addBlockLocked(b); err != nil {
+		return l.breakLocked(err)
+	}
+	// The records must be durable before a header claims the tip they bring
+	// the log to. Without the sync, a power loss can persist the header and not
+	// the records, and the next start trusts a log with postings missing.
+	if err := l.f.Sync(); err != nil {
+		return l.breakLocked(err)
+	}
+	if err := l.writeHeaderLocked(b.Index, b.Hash); err != nil {
+		return l.breakLocked(err)
+	}
+	return nil
+}
+
+// breakLocked records a failed write and resets the header to "no tip", so the
+// next start rebuilds the log from the blocks instead of serving a history
+// with a hole in it. The reset is best effort: if it fails too, the log's tip
+// still names a block this log does not fully describe, which is no worse.
+func (l *addrLog) breakLocked(err error) error {
+	if l.broken == nil {
+		l.broken = fmt.Errorf("address index write failed (rebuilt on restart): %w", err)
+		_ = l.writeHeaderLocked(0, "")
+		_ = l.f.Sync()
+	}
+	return l.broken
 }
 
 func (l *addrLog) addBlockLocked(b Block) error {
@@ -174,10 +204,13 @@ func (l *addrLog) dropBlock(b Block) error {
 	if l.f == nil {
 		return errAddrLogClosed
 	}
+	if l.broken != nil {
+		return l.broken
+	}
 	for i, tx := range b.Transactions {
 		for _, addr := range txAddresses(tx) {
 			if err := l.appendLocked(addrOpDel, addr, b.Index, i); err != nil {
-				return err
+				return l.breakLocked(err)
 			}
 		}
 	}
@@ -244,6 +277,9 @@ func (l *addrLog) history(addr string) ([]TxLoc, error) {
 	if l.f == nil {
 		return nil, errAddrLogClosed
 	}
+	if l.broken != nil {
+		return nil, l.broken
+	}
 	return l.foldLocked(addr)
 }
 
@@ -279,6 +315,11 @@ func (l *addrLog) compact(tipHeight uint64, tipHash string) error {
 	defer l.mu.Unlock()
 	if l.f == nil {
 		return errAddrLogClosed
+	}
+	if l.broken != nil {
+		// The header is already reset; compacting would stamp a tip on a log
+		// that is missing records.
+		return nil
 	}
 	// Deterministic, so two compactions of the same index match byte for byte.
 	addrs := make([]string, 0, len(l.offs))
@@ -332,6 +373,7 @@ func (l *addrLog) compact(tipHeight uint64, tipHash string) error {
 	if err := os.Rename(tmp, l.path); err != nil {
 		return fail(err, false)
 	}
+	_ = syncDir(filepath.Dir(l.path)) // the rename is derivative data; a lost one rebuilds
 	_ = oldF.Close()
 	// l.offs and l.size already describe the renamed file.
 	nf, err := os.OpenFile(l.path, os.O_RDWR, 0o644)

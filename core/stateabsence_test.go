@@ -191,3 +191,27 @@ func TestStateRootIsCanonical(t *testing.T) {
 		t.Errorf("empty state root = %s, want the empty trie root %s", got, EmptyTrieRoot())
 	}
 }
+
+// A proof is for the address IT names, which the server chooses. A client must
+// check it against the address it asked about, or a rich account's valid proof
+// passes as anybody's balance.
+func TestAccountProofIsBoundToTheQueriedAddress(t *testing.T) {
+	bc := NewBlockchain()
+	rich, _ := wallet.New()
+	poor, _ := wallet.New()
+	mustAdd(t, bc, mineOn(t, bc, rich.Address(), nil))
+	p, ok := bc.ProveAccount(rich.Address())
+	if !ok {
+		t.Fatal("no proof")
+	}
+	root := bc.Tip().StateRoot
+	if valid, present := VerifyAccountProofFor(rich.Address(), p, root); !valid || !present {
+		t.Fatal("the proof does not verify for the address it is about")
+	}
+	if valid, _ := VerifyAccountProof(p, root); !valid {
+		t.Fatal("precondition: the unbound check accepts it")
+	}
+	if valid, _ := VerifyAccountProofFor(poor.Address(), p, root); valid {
+		t.Fatal("another address's proof was accepted for the queried one")
+	}
+}

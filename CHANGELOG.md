@@ -11,6 +11,150 @@ It is still a learning project, not money. Do not point it at the internet.
 
 ## 0.4.0 — unreleased
 
+### Review hardening
+
+A pass over consensus, storage, the peer layer and the clients, looking for
+the places where the code did something other than what its comment — or its
+caller — assumed. Several are consensus-relevant; one (the store codec) meant a
+chain using this release's own features could not be relayed or reloaded.
+
+**Fixed — consensus and storage**
+
+- **The binary codec dropped three fields.** The store record format
+  ([core/storecodec.go](core/storecodec.go)), which is also the P2P wire
+  format, silently omitted `Transaction.Script`, `Transaction.Name` and
+  `AssetIssue.Metadata`. Any block with a script spend, a name operation or an
+  NFT issuance therefore failed its merkle check on every binary peer and could
+  not be reloaded from disk. Record **v6** carries them; it is written only
+  when a block needs it, so every other block keeps its v5 bytes.
+- **Snapshot and pruned bootstrap kept no bodies near the snapshot.** Coinbase
+  maturity then read immature coinbases as mature, and the base fee read a
+  non-empty parent as empty — so a fast-synced node could fork off on its first
+  block, and a pruned, compacted store could fail to reopen ("wrong base fee").
+  `core.NewFromSnapshotWithBodies` / `SnapshotBodiesFrom` bootstrap with the
+  bodies those rules need, and the pruned store's sidecar snapshot now sits
+  `CoinbaseMaturity` heights above the pruned range so they stay in the store.
+- **Reorg commit crash recovery** ([core/reorgcommit.go](core/reorgcommit.go)).
+  The commit record is removed before the side file (with a directory fsync); a
+  leftover record no longer truncates blocks appended after an applied reorg; a
+  record without its side file opens if the log already holds the reorg; and a
+  failed commit-record write withdraws the record.
+- **Block store append.** A failed write or fsync now truncates the partial
+  record instead of leaving a block that memory had already rolled back. The
+  state sidecar and the compaction rename are fsynced, file and directory.
+- **Asset credits are capped.** A transfer may not take a holder's balance past
+  `MaxAssetSupply`; an issuer could otherwise mint and transfer repeatedly and
+  wrap a holder's balance mod 2^64.
+- **Mempool pinning by time lock.** The pool refuses a transaction waiting on a
+  signer-chosen lock — `LockUntil`, an HTLC refund timeout, a vault unlock, a
+  script height — more than `MaxMempoolLockAhead` (24) blocks past the next one.
+  Holding a slot for something unminable was free. Upgrade activation gates are
+  not bounded: those are the network's schedule, not the signer's.
+- **`core.VerifyTrieProof` panicked** on a proof with more siblings than key
+  bits — reachable from any SPV client fed a hostile proof. It is now refused.
+
+**Fixed — node and API**
+
+- **Block seen-set ordering.** A block's hash was marked seen before it was
+  validated, so a peer could censor the real next block by sending an empty body
+  under its hash. It is now validated first.
+- **Peer write deadline.** Every send has a 20s deadline; a peer that stops
+  reading is disconnected instead of freezing relay node-wide.
+- **Peer address book capped** at 4096 entries and 262-byte addresses, and
+  `getpeers` answers a bounded sample.
+- **Duplicate shares** on the same tip are rejected by stratum and
+  `/submitshare`, which closes a PPLNS inflation.
+- **Compact blocks** must extend our tip with the expected `Bits` — a
+  self-declared easiest target is no longer accepted — and anything else takes
+  the full-block path. Only the peer asked can complete a reconstruction.
+- **HTTP server timeouts** (`ReadHeaderTimeout` 10s, `ReadTimeout` 30s,
+  `IdleTimeout` 2m; no `WriteTimeout`, deliberately, for `/events` and long
+  poll); **`/events` caps** of 256 streams node-wide and 8 per client; the rate
+  limiter keys IPv6 clients by **/64** and caps its client map at 65536 (LRU).
+
+**Fixed — CLI and wallet**
+
+- **Light clients checked proof of work, not difficulty.** SPV, `fastsync` and
+  the header cache accepted any header whose hash met its own `Bits`, so a
+  server could forge a whole header chain at `PowLimit` in a fraction of a
+  second. Each header's `Bits` must now equal the LWMA retarget
+  (`core.ValidateHeaderDifficulty`).
+- **SPV proofs are bound to the address asked about.** Balance, history and
+  wallet proofs go through `core.VerifyAccountProofFor`, so a valid proof about a
+  *different* account is refused, and the unverified "not found" shortcut is
+  gone. The wasm `verifyAccountProof` takes an optional third argument, the
+  address.
+- **Wallet key files** are written atomically (temp file, fsync, rename) and
+  always `0600`; backup restore is atomic too and refuses bundle entries that
+  are not plain file names.
+- **`dnas wallet new|mnemonic|restore` refuse to overwrite** a key file holding
+  a different key unless `-force`; `-index`/`-account` must be below 2^31.
+- **`ParseAmount`** rejects overflow (above ~184e9 DNAS — a few extra digits
+  used to wrap into a tiny amount) and junk after the fraction ("1.00000000junk"
+  parsed as 1 DNAS). Digits past the eighth decimal are still truncated, as the
+  consensus vectors pin, but must be digits.
+- **A node-suggested fee rate** from `/estimatefee` is capped at 1000×
+  `DefaultMinRelayFee` per byte, with a warning, so a hostile node cannot talk a
+  wallet into paying an absurd fee.
+
+**Fixed — second pass (lower severity)**
+
+- **Peer transport v2 — wire-incompatible with earlier builds.** Each direction
+  now has its own AES-256-GCM key and each frame's nonce is that direction's
+  frame counter, which the reader requires in order. With one key and random
+  nonces an on-path attacker could replay, drop, reorder or reflect frames.
+  Writes are split into frames of at most 1 MiB and the reader refuses a longer
+  length prefix, so an unauthenticated connection can no longer make the node
+  allocate 64 MiB per frame. The session id's domain tag is now
+  `dnas-session-v2`; nodes from before this change cannot complete a handshake
+  with nodes after it, so upgrade every node of a network together.
+- **JSON wire frames are capped by type before allocation**, like binary
+  ones: the type is peeked off the head of the frame, and a large JSON frame
+  whose head carries no readable type is refused outright.
+- **`getheaders` locators** are resolved by walking down from the tip against
+  at most `core.MaxLocatorLen` (128) hashes, instead of building a hash map of
+  the whole chain per request.
+- **Stratum sessions are bounded**: 1024 overall, 64 per address, 30s to
+  authorize and a 10-minute idle read deadline.
+- **Reorgs are validated against the suffix's own versionbits votes.** A
+  suffix was judged by the activation table of the chain being replaced, so a
+  node could refuse (or accept) a branch every node that synced it straight
+  would accept (or refuse). Each suffix block now sees the activations its own
+  branch implies; the real table is restored on every exit.
+- **Disk ledger read errors fail loudly.** A failed read of the account file
+  used to look like "no such account" — a funded account read as empty, or an
+  existing one re-created at nonce 0. It now panics, as `Range` already did. A
+  chain refuses writes after `Close` (`core.ErrChainClosed`).
+- **The on-disk address index** fsyncs its records before its header claims a
+  tip, fsyncs its compaction rename, and no longer swallows a failed write: the
+  index stops answering, resets its header, and is rebuilt on the next start.
+- **Vault keys are compared as bytes**, so the same key in two hex cases is
+  refused as a one-key vault.
+- **Script witness malleability (relay policy).** The mempool refuses a script
+  spend whose script or witness hex is not lowercase; flipping the case left the
+  spend valid with a different txid. Consensus is unchanged.
+- **The wasm verifier checks difficulty.** `validateHeaderChain` binds each
+  header's `Bits` to the retarget wherever the run holds the window beneath it
+  (`core.ValidateHeaderRunDifficulty`) and reports `difficulty_checked`.
+- **`dnas invoice pay`** shows the fee and total before asking, and signs that
+  fee (`-fee` overrides the estimate). **`dnas faucet`** sends
+  `DNAS_API_TOKEN` only to a node on this machine. The invoice seed (the
+  mnemonic), the invoice daemon's state and channel files are written with
+  fsync + rename.
+
+**Added / Changed**
+
+- **`bytebasefee` consensus upgrade** (`core.UpgradeByteBaseFee`). The base fee
+  was charged per byte but moved by transaction *count*, so a block packed to
+  `MaxBlockBytes` with a few large transactions read as under-target and lowered
+  the price of the scarce resource. From the activation height
+  (`-upgrades bytebasefee:HEIGHT`) it follows the parent's non-coinbase
+  transaction bytes against `BaseFeeTargetBytes = MaxBlockBytes / 2`.
+- **The cost-weighted API limiter** (see Changed below) now prices whole-ledger
+  work (`/snapshot`, `/audit`) at 30 tokens, account/window passes at 5, paged
+  reads at 2 + 1 per 100 items, proofs, `/metrics` and `/address*` at 3, and
+  everything else at 1; a cost above the burst is charged as the burst.
+
 ### Added
 
 - **An authorization script VM** ([core/script.go](core/script.go)). Multisig,

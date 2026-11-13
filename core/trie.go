@@ -500,6 +500,12 @@ func VerifyTrieProof(p TrieProof, root string) (valid, present bool) {
 	}
 	var key trieKey
 	copy(key[:], keyBytes)
+	// A walk can be at most one level per key bit. The proof comes from an
+	// untrusted server, and a longer sibling list used to index past the end of
+	// the 32-byte key — a panic in every light client that asked that server.
+	if len(p.Siblings) > trieKeyBits {
+		return false, false
+	}
 
 	// Rebuild the node that sits at the end of the walk.
 	var cur string

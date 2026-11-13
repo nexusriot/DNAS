@@ -193,7 +193,13 @@ func (c *headerCache) appendVerified(batch []core.Header) error {
 			return fmt.Errorf("header chain invalid: %w", err)
 		}
 	}
-	c.Headers = append(c.Headers, batch...)
+	// Linkage and self-declared work are not enough: the difficulty each header
+	// claims must be the one the chain requires (see core.ValidateHeaderDifficulty).
+	combined := append(append([]core.Header(nil), c.Headers...), batch...)
+	if err := core.ValidateHeaderDifficulty(combined, len(c.Headers)); err != nil {
+		return fmt.Errorf("header chain invalid: %w", err)
+	}
+	c.Headers = combined
 	// The filter-header chain no longer covers the new headers; it is re-extended
 	// lazily by syncFilterHeaders.
 	if len(c.FilterHeaders) > len(c.Headers) {

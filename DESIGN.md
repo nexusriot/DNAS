@@ -349,13 +349,14 @@ multi-output transfers — the script is encoded only when present, so schedulin
 the upgrade changes no existing txid and no stored chain.
 
 One interaction is worth knowing before trusting a vault with anything. A hot-key
-spend below `Unlock` is *admitted to the mempool* and merely never selected (the
-same treatment an HTLC refund before its timeout gets). A thief holding the hot
-key can therefore park an unmineable spend at the vault's nonce, and the cold
-key's rescue — which uses that same nonce — has to displace it by
-**replace-by-fee**, i.e. by paying strictly more. The cold key can always do that,
-since it is sweeping the whole balance, but it is a step the rescuer has to take
-rather than a race they automatically win.
+spend below `Unlock` can never be mined early, and the mempool treats it two ways.
+More than `MaxMempoolLockAhead` (24) blocks before the unlock it is refused
+outright — a transaction no block will accept for that long would sit in the pool
+for free, and would let a thief holding the hot key park a spend at the vault's
+nonce. Closer than that it is queued but never selected (the same treatment an
+HTLC refund before its timeout gets), and the cold key's rescue — which uses that
+same nonce — displaces it regardless of fee, because a transaction that cannot go
+in the next block has no claim on its slot (§9).
 
 This is the cheap version of what a script VM would express generically (the
 `[L]` item in the ROADMAP): it buys a real new spending condition today at the
@@ -737,10 +738,16 @@ uncoordinated. Heights are configuration, set identically on every node at start
 (like checkpoints) via `-upgrades name:height` (or the `upgrades` key in the JSON
 config), which refuses an unknown name outright — a misspelled upgrade that
 silently never activates means being forked off a network where the others did.
-Two exist: `UpgradeMultiOutput` gates multi-recipient transfers (§5), and
-`UpgradeDustLimit` is a worked example that rejects coin transfers below
-`DustThreshold`. This is *height* activation; miner version-bit *signaling* (BIP9)
-would additionally need a header version field and is left as future work.
+The first two were `UpgradeMultiOutput`, which gates multi-recipient transfers
+(§5), and `UpgradeDustLimit`, a worked example that rejects coin transfers below
+`DustThreshold`; thirteen exist now (`knownUpgrades`: `dustlimit`, `multioutput`,
+`vault`, `feesponsor`, `checkedaddresses`, `uniquecoinbase`, `assetops`,
+`filtercommit`, `historyroot`, `nonfungible`, `nameservice`, `script`,
+`bytebasefee`). Besides *height* activation, an upgrade can be put to a miner
+version-bit vote (BIP9, [`core/versionbits.go`](core/versionbits.go)): the
+header carries a `Version` field, `-deployments name:bit:start:timeout:window:threshold`
+defines a vote, `-signalbits` sets which bits this node's miner signals, and
+`GET /deployments` reports the counts and the state the chain has taken each to.
 
 **Coinbase maturity.** A coinbase mined at height `C` is spendable only once the
 chain reaches `C + CoinbaseMaturity`. In an account model there are no coins to
@@ -785,7 +792,9 @@ on the same chain.
 **EIP-1559 base fee (consensus, burned, priced per byte).** Each block commits a
 `BaseFee` in its header, derived deterministically from the parent's fullness
 (`expectedBaseFee`): it rises up to 1/`BaseFeeMaxChangeDenominator` (12.5%) when
-the parent held more than `BaseFeeTargetTxs` transactions and falls when fewer,
+the parent held more than `BaseFeeTargetTxs` transactions and falls when fewer —
+or, from the `bytebasefee` upgrade on, when the parent's non-coinbase transaction
+**bytes** exceed or fall short of `BaseFeeTargetBytes` (`MaxBlockBytes / 2`) —
 clamped to `MinBaseFee`. The base fee is a **price per byte**: every non-coinbase
 transaction must pay a fee ≥ `BaseFee × its serialized size` (`Transaction.Size`),
 so a larger transaction owes proportionally more. That base-fee portion is
@@ -797,9 +806,13 @@ consensus fee market — a block whose transactions underpay per byte, whose
 coinbase over-pays, or which exceeds the byte budget is invalid — distinct from
 the mempool's *relay* floor (§10), which only governs what a node queues. Because
 the base fee is in the header, light clients see it and it is covered by proof of
-work. (The *congestion signal* that moves the base fee is transaction count, not
-bytes — a deliberate simplification that keeps the retarget cheap to reason about
-and test; the *payment* is per byte.)
+work. (The *congestion signal* that moves the base fee was transaction count, not
+bytes — a simplification that kept the retarget cheap to reason about, while the
+*payment* was per byte. So a block packed to `MaxBlockBytes` with a few hundred
+large transactions read as under-target and LOWERED the price of the scarce
+resource. `UpgradeByteBaseFee` (`-upgrades bytebasefee:HEIGHT`) measures bytes
+instead; it is height-activated because the base fee is in every header, and an
+existing chain replays under the count formula below the activation height.)
 
 **Supply accounting.** Because those are the only two ways coin moves in or out of
 existence, the total is auditable, and `core/supply.go` tracks the two sides
@@ -850,6 +863,12 @@ trustworthy as the balances themselves.
   pool full by bytes stops quoting the floor fee.
 - **Replace-by-fee.** A conflicting `(From, Nonce)` may be replaced only by a
   strictly higher fee.
+- **No pinning by time lock.** A transaction waiting on a signer-chosen lock —
+  `LockUntil`, an HTLC refund timeout, a vault unlock, a script height — is
+  refused if that lock is more than `MaxMempoolLockAhead` (24) blocks past the
+  next one. Otherwise holding a slot for something unminable for months would
+  cost nothing. Upgrade activation gates are not bounded: the signer did not
+  choose them.
 - **Package relay and child-pays-for-parent** ([core/package.go](core/package.go)).
   Admission used to measure a sender against its CONFIRMED balance, so a
   recipient could not queue a spend of coin a queued transaction was paying
@@ -892,6 +911,15 @@ trustworthy as the balances themselves.
   key's rescue — same account, same nonce — to out-bid them to recover their own
   coin (§5.2). The exception is narrow on purpose: between two mineable
   transactions, the higher fee still wins.
+- **A time lock may only be so far away.** A transaction waiting on a
+  signer-chosen height (`LockUntil`, an HTLC refund timeout, a vault unlock, a
+  script's height constraint) is admitted only if it becomes mineable within
+  `MaxMempoolLockAhead` (24) blocks of the next one. Such a transaction is never
+  mined while it waits, so its fee is never paid: without the bound, a few funded
+  addresses could fill the pool with high-fee transactions locked a billion
+  blocks out and outbid every honest payment for eviction indefinitely. Upgrade
+  activation gates are not bounded — those heights are an operator's schedule,
+  not an attacker's.
 - **Sponsors are held to their whole queue.** A fee payer's outstanding
   sponsorships are totalled per payer and checked against its spendable balance on
   every admission, and re-checked on every new block (§5.3), so a sponsor cannot
@@ -1230,7 +1258,17 @@ a foreign-file guard). `Blockchain.Open(path)` backs a chain with it so:
   (`core/reorgcommit.go`, below).
 
 `Save`/`Load` remain as a JSON import/export snapshot. On restart a node loads its
-store and re-syncs anything missing from peers.
+store and re-syncs anything missing from peers. A failed append (write or
+fsync) truncates the partial record rather than leaving a torn block behind a
+chain that memory has already rolled back; the state sidecar and the compaction
+rename are fsynced, file and directory.
+
+**The record codec is also the wire format** (`core/storecodec.go`), so a field
+it forgets is lost twice: on disk and on every binary peer. Record v5 omitted
+`Transaction.Script`, `Transaction.Name` and `AssetIssue.Metadata`, so a block
+with a script spend, a name operation or an NFT issuance failed its merkle check
+everywhere and could not be reloaded. Record **v6** carries them, and is written
+only when a block needs it, so every other block keeps its v5 bytes.
 
 **Compaction, and why it needs a snapshot.** `-prune` drops block bodies from
 memory; for a long time the file kept every original record, so a pruning node
@@ -1249,6 +1287,16 @@ that snapshot exactly as a fast-synced node does, and verifies it the same way:
 the accounts must hash to the state root committed in a proof-of-work-covered
 header, so a stale or tampered snapshot is rejected rather than silently becoming
 this node's idea of everyone's balances.
+
+A snapshot alone is not quite enough to validate the next block, though. Two
+rules read *bodies* below the tip: coinbase maturity (which coinbases are still
+immature) and the base fee (how full the parent was). Bootstrapping with no
+bodies made the first read every recent coinbase as mature and the second read a
+non-empty parent as empty — so a fast-synced node could fork off on its first
+block, and a pruned store could refuse to reopen ("wrong base fee").
+`NewFromSnapshotWithBodies` takes the recent bodies those rules need
+(`SnapshotBodiesFrom`), and the pruned store's sidecar snapshot is placed
+`CoinbaseMaturity` heights above the pruned range so those bodies stay in the store.
 
 Pruned heights keep a header-only record rather than vanishing, because linkage,
 median-time-past and the difficulty retarget all read those headers. The saving
@@ -1398,7 +1446,11 @@ than silently wrong; a nonce of the wrong length is rejected instead of panickin
 Because a `Header` hashes identically to its block and commits to a Merkle root,
 a client with headers alone can:
 
-1. verify each header's proof-of-work and that it links to its parent, then
+1. verify each header's proof-of-work and that it links to its parent — and that
+   its `Bits` equals the LWMA retarget the chain below it implies
+   (`core.ValidateHeaderDifficulty`). Meeting its *own* target is not enough:
+   a header that names an easy target meets it trivially, and a server could
+   forge a whole header chain at `PowLimit` in a fraction of a second; then
 2. confirm a transaction's inclusion by folding a compact `MerkleProof` to the
    header's Merkle root.
 
@@ -1564,7 +1616,7 @@ with `httptest`). Highlights:
   confirmation instead of guessing which to ask), `/supply` (minted, burned,
   circulating and the conservation check, §9), `/peers`, `/address`,
   `/estimatefee?blocks=N` (recommended fee = base fee + estimated tip),
-  `/metrics` (Prometheus text — 55 series: chain, mempool count *and bytes*, peers
+  `/metrics` (Prometheus text — 63 series: chain, mempool count *and bytes*, peers
   and their ban scores, reorg totals and depth, orphan count, hashrate and block
   intervals, supply, tip age, blocks-behind, shares, and webhook delivery. Most of
   those numbers existed already but only as JSON on five different endpoints,
@@ -1894,6 +1946,7 @@ govern — the proof-of-work targets and `lwmaWindow` in
 | `InitialBaseFee`      | 10 /byte         | EIP-1559 base fee at genesis (consensus, per byte) |
 | `MinBaseFee`          | 1 /byte          | base-fee floor (per byte)                 |
 | `BaseFeeTargetTxs`    | MaxBlockTxs / 2  | per-block tx count the base fee targets    |
+| `BaseFeeTargetBytes`  | MaxBlockBytes / 2 | per-block tx bytes the base fee targets once `bytebasefee` is active |
 | `BaseFeeMaxChangeDenominator` | 8        | max base-fee change per block (1/8 = 12.5%) |
 | `GenesisTimestamp`    | 1735689600       | fixed genesis time (2025-01-01Z)          |
 | `DefaultShareFactor`  | 256              | how many times easier a mining share is than a block (pool accounting, not consensus) |
@@ -1944,7 +1997,7 @@ govern — the proof-of-work targets and `lwmaWindow` in
 | Two-layer fees: consensus base fee + relay-policy floor | Base fee (burned, in-header) is a real fee market; the relay floor tunes what a node queues | Two knobs to understand; the relay floor doesn't affect block validity |
 | Base fee committed in the header | Light clients see it; it's covered by PoW; supply drop is verifiable | Changing the header format invalidates old chains (fine for a dev chain) |
 | Fees priced per byte; blocks bounded by bytes | Block space is a metered, priced resource; a big tx pays its share; the mempool ranks by fee rate | A cheap `Size()` (JSON length) approximates real serialized weight |
-| Base fee *congestion signal* stays tx-count, not weight | Keeps the retarget cheap to reason about and test | Slightly inconsistent with per-byte pricing; documented in §9 |
+| Base fee *congestion signal* is tx-count until `bytebasefee`, then bytes | Byte signal matches what the fee prices; height activation keeps old chains replaying | Two formulas in the code, selected by height; documented in §9 |
 | Finality: max-reorg-depth + checkpoints | Settled history can't be rewritten; a fresh/lagging node can't be fed a bogus deep chain | A genuinely longer fork past the depth is also refused (a node stuck offline too long must resync from a trusted store) |
 | 256-bit compact target (nBits) + LWMA retarget | Continuous difficulty, smooth per-block retargeting, and fixes the genesis-timestamp collapse | Header change (genesis hash changed); compact encoding is lossy in the low bits |
 | Snapshot fast-sync, verified against the state root | Trustless bootstrap without replaying settled history — composes checkpoints + state roots | The fast-synced (pruned) chain runs in memory; persisting it needs a base-offset store format (future work) |
@@ -2023,12 +2076,12 @@ govern — the proof-of-work targets and `lwmaWindow` in
   writes its log line AFTER the result, which is precisely what a merged
   stdout+stderr stream cannot survive.
 - **GUI tests** (`gui/test_dnas_gui.py`) run headless (`QT_QPA_PLATFORM=offscreen`)
-  against a stub HTTP server. They now also cover the client's *own* crypto:
-  `header_string`, `compact_to_big` and `meets_target` must match
-  `core.Header.headerString`, `core.CompactToBig` and `meetsTarget` exactly, or
-  the client's proof-of-work check is meaningless — and it HAD fallen out of step,
-  silently, when the chain moved to an nBits target and a state root. Nothing
-  exercised the SPV path, so nothing noticed.
+  against a stub HTTP server. The client once carried its *own* crypto
+  (`header_string`, `meets_target`), which fell out of step silently when the
+  chain moved to an nBits target and a state root, and again when BIP9 added
+  `Version`; verification is now delegated to the `dnas` binary, and the tests
+  check the arguments it is called with and that the result is read from stdout
+  (see the guard below).
 - **Black-box end-to-end suite** (`e2e/`, behind the `e2e` build tag) starts the
   shipped `dnas` binary and drives it over HTTP and the CLI, importing no DNAS
   package. Everything above tests the code; this tests the *product* — wire
@@ -2192,8 +2245,13 @@ See [scripts/README.md](scripts/README.md) for the script details.
   from peers).
 - Consensus is defined by a canonical binary encoding (portable across
   implementations), but there is still only ONE implementation — no second client
-  has verified the spec, and there are no cross-client consensus test vectors.
-- Recipient checksums are client-side, not consensus.
+  has verified the spec. A language-neutral corpus of golden consensus vectors
+  ([core/testdata/consensus_vectors.json](core/testdata/consensus_vectors.json),
+  checked by [core/vectors_test.go](core/vectors_test.go)) is what one would be
+  tested against; so far only this client has been.
+- Recipient checksums are consensus-enforced once the `checkedaddresses` upgrade
+  activates; below that height they are a client-side convention, so a buggy
+  client could burn coin to a typo.
 - API auth is a single shared bearer token on write endpoints, not per-user
   authentication; reads are unauthenticated.
 - Locator sync transfers only the divergent suffix for normal forks; deep/losing
@@ -2202,7 +2260,8 @@ See [scripts/README.md](scripts/README.md) for the script details.
   must resync from a trusted store rather than over the wire.
 - The fee market is a burned, **per-byte** EIP-1559 base fee (consensus) plus
   rate-based eviction, replace-by-fee, and a per-byte relay-policy floor; its
-  congestion signal is transaction count, not weight (§9).
+  congestion signal is transaction count until the `bytebasefee` upgrade
+  activates, and transaction bytes from then on (§9).
 - Mempool admission counts a sender's **confirmed** balance plus what the pool
   is already paying it, so a recipient can spend coin that is still unconfirmed
   (§10, [core/package.go](core/package.go)). The dependency is bounded by
@@ -2270,7 +2329,7 @@ See [scripts/README.md](scripts/README.md) for the script details.
   that §9 reports, so a block that would inflate or destroy coin is rejected
   rather than noticed afterwards.
 - HTLC refund timing and coinbase maturity are enforced at block application, not
-  in signature verification. HD is not SLIP-0010. Proof of work is a continuous
+  in signature verification. Proof of work is a continuous
   256-bit target (nBits) retargeted by an LWMA with **no hard difficulty cap**, so
   on a real network difficulty tracks hashpower without bound; only a devnet /
   regtest (`NoRetarget`) holds it at the easy genesis floor for instant blocks.
@@ -2299,13 +2358,18 @@ See [scripts/README.md](scripts/README.md) for the script details.
   purpose (a client-set header would hand out a fresh bucket per request), so a
   node behind a real proxy needs the limit at the proxy. It is also per-process:
   nothing is shared between two nodes behind one address. Request *bodies* are
-  bounded (413 past 64 KiB / 400 KB / 4 MB by endpoint class, §15), but the P2P
-  side still has only the coarse 64 MiB `maxFrame` cap with no per-message-type
-  limits.
+  bounded (413 past 64 KiB / 400 KB / 4 MB by endpoint class, §15). On the P2P
+  side each message type has its own cap ([node/framecap.go](node/framecap.go)):
+  the binary format puts the type first, so a short peek identifies it and the
+  frame is refused before its body is allocated; the JSON format keeps the
+  64 MiB `maxFrame` ceiling for the allocation and is checked against the
+  per-type cap once decoded.
 - An invoice is matched by (address, amount, height ≥ its own), so two invoices
-  for the same amount at the same address cannot be told apart. The file says so;
-  a fresh address per invoice is the fix, and needs standard HD derivation to be
-  worth exporting.
+  for the same amount at the same address cannot be told apart. The fix is a
+  fresh address per invoice: `dnas invoice new -seed FILE` derives the next
+  SLIP-0010 address from a seed file ([cmd/dnas/invoiceaddr.go](cmd/dnas/invoiceaddr.go)),
+  so each invoice gets its own. An invoice made without `-seed` still pays the
+  shared address and has the old ambiguity.
 - A message signature is domain-separated from a transaction signature, so
   neither can be replayed as the other — but it proves only control of a key at
   the moment it was made. There is no revocation and no expiry on one.

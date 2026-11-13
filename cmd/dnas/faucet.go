@@ -44,7 +44,11 @@ func runFaucet(args []string) {
 		AmountFmt string `json:"amount_fmt"`
 		Cooldown  string `json:"cooldown"`
 	}
-	if err := postJSONInto(base+"/faucet", map[string]string{"address": target}, &res); err != nil {
+	// The faucet is the one command routinely pointed at SOMEONE ELSE'S node — a
+	// public testnet's — while DNAS_API_TOKEN holds the key to one's own. So the
+	// token goes only to a node on this machine; a remote faucet that wants a
+	// token is the operator's own, and `dnas send` funds from it just as well.
+	if err := postJSONInto(base+"/faucet", map[string]string{"address": target}, &res, isLoopback(*apiAddr)); err != nil {
 		log.Fatalf("faucet: %v", err)
 	}
 	fmt.Printf("faucet sent %s to %s (%s)\n", res.AmountFmt, res.To, short(res.Hash))
@@ -54,8 +58,8 @@ func runFaucet(args []string) {
 
 // postJSONInto is postJSON that also decodes the node's reply. postJSON discards
 // the body, which is fine for a submission but not for a request whose answer is
-// the point.
-func postJSONInto(url string, body, out any) error {
+// the point. withToken says whether DNAS_API_TOKEN may be sent to this node.
+func postJSONInto(url string, body, out any, withToken bool) error {
 	data, err := json.Marshal(body)
 	if err != nil {
 		return err
@@ -65,7 +69,7 @@ func postJSONInto(url string, body, out any) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if tok := os.Getenv("DNAS_API_TOKEN"); tok != "" {
+	if tok := os.Getenv("DNAS_API_TOKEN"); tok != "" && withToken {
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 	resp, err := spvHTTP.Do(req)

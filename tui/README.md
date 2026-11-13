@@ -11,7 +11,8 @@ independent of the repo's internal-module workspace:
 ```sh
 cd tui
 go build -o dnas-tui .
-./dnas-tui -api localhost:8080     # connect to a running node
+./dnas-tui -api localhost:8080 -dnas ./dnas   # connect to a running node
+                                   #   (-dnas: the binary `v` verifies with)
 ./dnas-tui -spawn                  # launch a local node and connect to it
                                    #   (-dnas <path> to point at the binary)
 
@@ -31,8 +32,11 @@ asks for a different one is refused rather than silently overridden.
 
 The dashboard shows live chain status (including the current dynamic `minfee`),
 recent blocks, the mempool, and the node wallet's balance. `v` performs a full
-light-client check (header proof-of-work + merkle proof fold) in the client, and
-`x`/`h` call the node's stateless wallet helpers and show the result in a panel.
+light-client check (header proof-of-work + merkle proof fold) by running
+`dnas spv -cache "" verify` through the binary — which is why `-dnas` must point
+at it (default: `dnas` on `$PATH`). It used to do the check in the TUI with a
+hand-written header preimage, which went wrong when BIP9 put `Version` at the
+front of the header and then answered FAILED for every valid proof. `x`/`h` call the node's stateless wallet helpers and show the result in a panel.
 
 Two things go beyond a status readout. A **fee-rate histogram** (from
 `/mempool/stats`) shows what the pending queue is actually paying per byte — a

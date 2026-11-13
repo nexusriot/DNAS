@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 )
 
@@ -188,13 +189,15 @@ func openStoreFile(path string) (*blockStore, []Block, error) {
 // both, because a store written by an older build must still load: a JSON
 // record begins with '{', so the two are told apart by the leading byte rather
 // than by trial and error.
-func encodeStoredBlock(b Block) ([]byte, error) { return encodeBlockV5(b), nil }
+func encodeStoredBlock(b Block) ([]byte, error) { return encodeBlockCurrent(b), nil }
 
 func decodeStoredBlock(data []byte) (Block, error) {
 	if len(data) == 0 {
 		return Block{}, errEmptyRecord
 	}
 	switch data[0] {
+	case storeRecordV6:
+		return decodeBlockV6(data)
 	case storeRecordV5:
 		return decodeBlockV5(data)
 	case storeRecordV4:
@@ -227,15 +230,30 @@ func (s *blockStore) append(b Block) error {
 	}
 	var lenBuf [4]byte
 	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(data)))
-	if _, err := s.f.WriteAt(lenBuf[:], s.size); err != nil {
+	// The record only becomes part of the log once it is durable. If any step
+	// fails, the caller rolls the block back in memory — so the bytes must go
+	// too, or the next block at this height is appended after a block the chain
+	// never kept, and the store refuses to open with two blocks at one height.
+	fail := func(err error) error {
+		if terr := s.f.Truncate(s.size); terr != nil {
+			if s.poisoned == nil {
+				s.poisoned = fmt.Errorf("append failed (%v) and could not be undone: %w", err, terr)
+			}
+		}
 		return err
 	}
+	if _, err := s.f.WriteAt(lenBuf[:], s.size); err != nil {
+		return fail(err)
+	}
 	if _, err := s.f.WriteAt(data, s.size+4); err != nil {
-		return err
+		return fail(err)
+	}
+	if err := s.f.Sync(); err != nil {
+		return fail(err)
 	}
 	s.offsets = append(s.offsets, s.size)
 	s.size += 4 + int64(len(data))
-	return s.f.Sync()
+	return nil
 }
 
 // truncateAfter drops all blocks above the given height (keeping 0..height).
@@ -380,6 +398,9 @@ func (s *blockStore) adoptCompacted(path string, offsets []int64, size int64, ta
 		s.poisoned = fmt.Errorf("compact: rename: %w", err)
 		return s.errPoisonedLocked()
 	}
+	// Make the swap itself durable; the state sidecar it depends on was synced
+	// (file and directory) before this rename (see writeStateSnapshotFile).
+	_ = syncDir(filepath.Dir(path))
 	reopened, err := os.OpenFile(path, os.O_RDWR, 0o644)
 	if err != nil {
 		s.poisoned = fmt.Errorf("compact: reopening the compacted store: %w", err)

@@ -24,6 +24,8 @@ dist/
 *.db.addridx
 *.db.reorg
 *.db.reorg.commit
+*.db.trie
+*.db.compact
 wallet.json
 wallet*.json
 w*.json
@@ -49,6 +51,11 @@ multisig-spend*.json
 escrow*.json
 sponsored-tx*.json
 invoice*.json
+channel*.json
+refund-request*.json
+signed-refund*.json
+settlement*.json
+.invoice-state.json
 *.dnasanchor
 
 # Everything else the docs have a reader create at the root by name (m1.json,

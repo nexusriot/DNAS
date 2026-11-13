@@ -163,6 +163,23 @@ const UpgradeFilterCommit = "filtercommit"
 // anchored on a header at or above it can verify ancestry without the prefix.
 const UpgradeHistoryRoot = "historyroot"
 
+// UpgradeByteBaseFee, once active, drives the base fee from the parent block's
+// transaction BYTES (against BaseFeeTargetBytes) instead of its transaction
+// COUNT (against BaseFeeTargetTxs).
+//
+// The fee has been priced per byte, and block space metered in bytes, for a
+// long time; only the congestion signal still counted transactions. So a block
+// packed to MaxBlockBytes with a few hundred large transactions read as
+// under-target and LOWERED the price of the scarce resource, while a block of
+// many tiny transfers raised it. Measuring what is actually scarce makes the
+// base fee track real demand.
+//
+// It is height-activated because the base fee is committed in every header and
+// checked by every node: switching the formula is a consensus change in both
+// directions, so the whole network has to change it at the same block, and an
+// existing chain replays under the old formula below the activation height.
+const UpgradeByteBaseFee = "bytebasefee"
+
 var (
 	upgradesMu sync.RWMutex
 	upgrades   = map[string]uint64{}
@@ -174,7 +191,8 @@ var (
 // activate means being forked off it.
 var knownUpgrades = []string{UpgradeDustLimit, UpgradeMultiOutput, UpgradeVault,
 	UpgradeFeeSponsor, UpgradeCheckedAddresses, UpgradeUniqueCoinbase, UpgradeAssetOps,
-	UpgradeFilterCommit, UpgradeHistoryRoot, UpgradeNonFungible, UpgradeNameService, UpgradeScript}
+	UpgradeFilterCommit, UpgradeHistoryRoot, UpgradeNonFungible, UpgradeNameService, UpgradeScript,
+	UpgradeByteBaseFee}
 
 // Upgrades lists the upgrade names this build understands.
 func Upgrades() []string { return append([]string(nil), knownUpgrades...) }
