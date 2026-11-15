@@ -144,8 +144,13 @@ func (c *headerCache) tryExtend(base string) ([]core.Header, error) {
 		if len(c.Headers) == 0 {
 			return nil, fmt.Errorf("node served no headers")
 		}
-		// Nothing new, and nothing to re-check: the node is at or below our tip.
-		return c.verified()
+		// The node has nothing at our tip's height. That is fine only if it is
+		// BEHIND us on the same chain. It used to be taken as that without
+		// asking — so a node that had reorged onto a SHORTER branch (with more
+		// work: difficulty varies), or a client pointed at another chain, kept
+		// being "verified" against the stale cache: spv sync reported the old
+		// tip and spv verify proved payments in blocks the node had orphaned.
+		return c.checkNodeBehind(base)
 	}
 	if len(c.Headers) > 0 {
 		if fresh[0].Index != from || fresh[0].Hash != c.Headers[from].Hash {
@@ -172,6 +177,26 @@ func (c *headerCache) tryExtend(base string) ([]core.Header, error) {
 		fresh = next
 	}
 	return c.verified()
+}
+
+// checkNodeBehind is the empty-page case of tryExtend: the node served nothing
+// at or above our cached tip's height. The cache stands only if the node's own
+// tip is a header we already hold; otherwise the cached chain is not the
+// node's, and the caller rebuilds.
+func (c *headerCache) checkNodeBehind(base string) ([]core.Header, error) {
+	var info struct {
+		Height uint64 `json:"height"`
+		Tip    string `json:"tip"`
+	}
+	if err := getJSON(base+"/info", &info); err != nil {
+		return nil, err
+	}
+	if info.Height < uint64(len(c.Headers)) && c.Headers[info.Height].Hash == info.Tip {
+		return c.verified()
+	}
+	return nil, &forkedError{msg: fmt.Sprintf(
+		"node's tip (height %d) is not on the cached chain of %d headers (a reorg onto a shorter branch, or a different chain)",
+		info.Height, len(c.Headers))}
 }
 
 // appendVerified checks a batch links onto the cache and has valid proof of

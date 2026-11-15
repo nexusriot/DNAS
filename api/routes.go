@@ -289,12 +289,12 @@ func (s *Server) routes() []route {
 				queryParam("limit", "integer", "how many (bounded server-side)")).
 			out([]core.Header{}).
 			does(s.headers),
-		get("/header/", "One block header by height").
-			at("/header/{height}", pathParam("height", "integer", "block height")).
+		get("/header/", "One block header by height or hash").
+			at("/header/{ref}", pathParam("ref", "string", "block height, or a 64-hex block hash on the active chain")).
 			out(core.Header{}).
 			does(s.header),
-		get("/block/", "One full block body by height").
-			at("/block/{height}", pathParam("height", "integer", "block height")).
+		get("/block/", "One full block body by height or hash").
+			at("/block/{ref}", pathParam("ref", "string", "block height, or a 64-hex block hash on the active chain")).
 			out(core.Block{}).
 			does(s.block),
 		get("/snapshot/", "The whole account state at a height, for fast sync").

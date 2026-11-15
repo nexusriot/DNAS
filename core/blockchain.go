@@ -32,9 +32,15 @@ type Account struct {
 // replaying every transaction. All exported methods take the lock, so it is
 // safe to share one *Blockchain across the miner, P2P handlers and API.
 type Blockchain struct {
-	mu        sync.RWMutex
-	closed    bool // set by Close; the chain refuses further writes
-	blocks    []Block
+	mu     sync.RWMutex
+	closed bool // set by Close; the chain refuses further writes
+	blocks []Block
+	// byHash maps every block hash on the active chain to its height. It is
+	// kept in step with blocks on every connect and reorg (and rebuilt by the
+	// constructors), so "where is this block?" is one map lookup instead of a
+	// walk of the chain — which a getheaders full of junk hashes used to force.
+	// Placeholders keep their hash, so pruning does not touch it.
+	byHash    map[string]uint64
 	state     StateDB
 	work      *big.Int      // cumulative proof-of-work of blocks
 	undos     [][]undoEntry // undos[i] reverts blocks[i]'s state changes (undos[0] is nil)
@@ -133,9 +139,27 @@ func NewBlockchain() *Blockchain {
 		sigCache:      NewValidationCache(DefaultValidationCacheSize),
 		nodes:         NewBoundedNodeStore(DefaultTrieCacheNodes),
 		history:       &MMR{},
+		byHash:        map[string]uint64{genesis.Hash: 0},
 	}
 	bc.refreshDeploymentsLocked()
 	return bc
+}
+
+// buildHashIndex maps each block's hash to its height.
+func buildHashIndex(blocks []Block) map[string]uint64 {
+	m := make(map[string]uint64, len(blocks))
+	for i, b := range blocks {
+		m[b.Hash] = uint64(i)
+	}
+	return m
+}
+
+// HeightOf returns the height of the block with this hash on the active chain.
+func (bc *Blockchain) HeightOf(hash string) (uint64, bool) {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+	h, ok := bc.byHash[hash]
+	return h, ok
 }
 
 func (bc *Blockchain) Tip() Block {
@@ -333,6 +357,7 @@ func (bc *Blockchain) AddBlock(block Block) error {
 		}
 	}
 	bc.blocks = append(bc.blocks, block)
+	bc.byHash[block.Hash] = block.Index
 	bc.undos = append(bc.undos, undo)
 	bc.history = cc.history // cc worked on a clone; adopt it now the block is ours
 	// A miner vote may have closed a window with this block, which fixes (or
@@ -542,6 +567,12 @@ func (bc *Blockchain) reorgLocked(fork int, suffix []Block) (bool, []Block, erro
 		bc.unindexBlock(bc.blocks[i])
 		bc.burned -= blockBurned(bc.blocks[i])
 	}
+	for i := fork + 1; i < len(bc.blocks); i++ {
+		delete(bc.byHash, bc.blocks[i].Hash)
+	}
+	for i := fork + 1; i < len(blocks); i++ {
+		bc.byHash[blocks[i].Hash] = uint64(i)
+	}
 	bc.blocks = blocks
 	bc.refreshDeploymentsLocked() // a reorg can undo a lock-in (see versionbits.go)
 	bc.state = state
@@ -567,16 +598,30 @@ func (bc *Blockchain) reorgLocked(fork int, suffix []Block) (bool, []Block, erro
 func (bc *Blockchain) Locator() []string {
 	bc.mu.RLock()
 	defer bc.mu.RUnlock()
+	return locatorOf(len(bc.blocks), func(i int) string { return bc.blocks[i].Hash })
+}
+
+// HeaderLocator is Locator for a client holding only a header chain from
+// genesis — a light client asking a peer where its chain leaves this one.
+func HeaderLocator(headers []Header) []string {
+	if len(headers) == 0 {
+		return nil
+	}
+	return locatorOf(len(headers), func(i int) string { return headers[i].Hash })
+}
+
+// locatorOf builds a block locator over n blocks: the ten most recent hashes,
+// then exponentially sparser ones, then genesis.
+func locatorOf(n int, hashAt func(int) string) []string {
 	var loc []string
 	step := 1
-	for i := len(bc.blocks) - 1; i > 0; i -= step {
-		loc = append(loc, bc.blocks[i].Hash)
+	for i := n - 1; i > 0; i -= step {
+		loc = append(loc, hashAt(i))
 		if len(loc) > 10 {
 			step *= 2
 		}
 	}
-	loc = append(loc, bc.blocks[0].Hash) // genesis is always common
-	return loc
+	return append(loc, hashAt(0)) // genesis is always common
 }
 
 // MaxLocatorLen bounds how many locator hashes LocatorFork considers. Locator
@@ -588,26 +633,24 @@ const MaxLocatorLen = 128
 // LocatorFork returns the height of the most recent block whose hash appears in
 // the locator (the fork point). Genesis is always shared, so this is well-defined.
 //
-// It walks the chain down from the tip against a set of the locator's hashes,
-// so the work is proportional to how far below the tip the fork is — a few
-// blocks for a peer that is in sync. It used to build a hash-to-height map of
-// the WHOLE chain on every getheaders, which any peer could request in a loop.
+// Each locator hash is one lookup in the hash index, so the work is bounded by
+// the locator — at most MaxLocatorLen entries — whatever the chain's length or
+// the hashes' content. It used to build a hash map of the WHOLE chain per
+// request, and after that walk the chain down from the tip, which a locator of
+// junk hashes still drove all the way to genesis.
 func (bc *Blockchain) LocatorFork(locator []string) uint64 {
 	if len(locator) > MaxLocatorLen {
 		locator = locator[:MaxLocatorLen]
 	}
-	want := make(map[string]struct{}, len(locator))
-	for _, h := range locator {
-		want[h] = struct{}{}
-	}
 	bc.mu.RLock()
 	defer bc.mu.RUnlock()
-	for i := len(bc.blocks) - 1; i > 0; i-- {
-		if _, ok := want[bc.blocks[i].Hash]; ok {
-			return uint64(i)
+	var best uint64
+	for _, h := range locator {
+		if height, ok := bc.byHash[h]; ok && height > best {
+			best = height
 		}
 	}
-	return 0
+	return best
 }
 
 // commonPrefix returns the number of leading blocks a and b share (by hash).
@@ -1207,7 +1250,7 @@ func validateBlockStructure(blocks []Block, block Block, cc *commitCtx) error {
 	}
 	// NetworkTime, not time.Now: a node whose own clock is skewed would
 	// otherwise reject every block its peers produce (see nettime.go).
-	if block.Timestamp > NetworkTime()+MaxFutureDrift {
+	if block.Timestamp > NetworkTime()+FutureDrift() {
 		return errors.New("timestamp too far in the future")
 	}
 	if cp, ok := checkpointAt(block.Index); ok && block.Hash != cp {
@@ -1349,6 +1392,12 @@ func checkTxAtHeight(tx Transaction, height uint64) error {
 	// Height-activated rule (consensus upgrade): script-authorized spends.
 	if tx.IsScript() && !IsUpgradeActive(UpgradeScript, height) {
 		return errors.New("script-authorized spends are not active at this height")
+	}
+	// Height-activated rule (consensus upgrade): one id per script spend.
+	if tx.IsScript() && IsUpgradeActive(UpgradeCanonicalWitness, height) {
+		if err := canonicalScriptHex(tx); err != nil {
+			return err
+		}
 	}
 	// Height-activated rule (consensus upgrade): name-service operations.
 	if tx.IsNameOp() && !IsUpgradeActive(UpgradeNameService, height) {

@@ -109,11 +109,16 @@ func newLimiter(rate, burst float64) *limiter {
 }
 
 // allow consumes one token for key, reporting whether the request may proceed.
-func (l *limiter) allow(key string) bool { return l.allowN(key, 1) }
+func (l *limiter) allow(key string) bool { ok, _ := l.allowN(key, 1); return ok }
 
 // allowN consumes cost tokens for key. A cost above the burst is charged as the
 // burst, so a client with a full bucket can always make any single request.
-func (l *limiter) allowN(key string, cost float64) bool {
+//
+// A refused request also learns how long until its bucket holds enough for it,
+// which becomes the 429's Retry-After. That used to be a constant "1": a paged
+// read costs up to 22 tokens, which at the default 20/s is more than a second
+// of refill, so a client that obeyed the header to the letter was refused again.
+func (l *limiter) allowN(key string, cost float64) (bool, time.Duration) {
 	if cost < 1 {
 		cost = 1
 	}
@@ -129,7 +134,7 @@ func (l *limiter) allowN(key string, cost float64) bool {
 		// first request from anyone is never delayed.
 		l.sweepLocked(now)
 		l.clients[key] = &apiBucket{tokens: l.burst - cost, last: now}
-		return true
+		return true, 0
 	}
 	b.tokens += now.Sub(b.last).Seconds() * l.rate
 	if b.tokens > l.burst {
@@ -137,10 +142,23 @@ func (l *limiter) allowN(key string, cost float64) bool {
 	}
 	b.last = now
 	if b.tokens < cost {
-		return false
+		if l.rate <= 0 {
+			return false, time.Minute
+		}
+		return false, time.Duration((cost - b.tokens) / l.rate * float64(time.Second))
 	}
 	b.tokens -= cost
-	return true
+	return true, 0
+}
+
+// retryAfterSeconds renders a wait as a Retry-After value: whole seconds,
+// rounded up, and never 0 (which a client would read as "retry at once").
+func retryAfterSeconds(d time.Duration) string {
+	s := int64((d + time.Second - 1) / time.Second)
+	if s < 1 {
+		s = 1
+	}
+	return strconv.FormatInt(s, 10)
 }
 
 // sweepLocked drops buckets nobody has used for a while, and makes room when the
@@ -206,8 +224,8 @@ func (s *Server) RateLimit(h http.Handler) http.Handler {
 			h.ServeHTTP(w, r)
 			return
 		}
-		if !s.limiter.allowN(clientKey(r), routeCost(r)) {
-			w.Header().Set("Retry-After", "1")
+		if ok, wait := s.limiter.allowN(clientKey(r), routeCost(r)); !ok {
+			w.Header().Set("Retry-After", retryAfterSeconds(wait))
 			writeErr(w, http.StatusTooManyRequests, "rate limit exceeded; slow down")
 			return
 		}

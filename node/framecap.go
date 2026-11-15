@@ -16,10 +16,10 @@ import "github.com/nexusriot/DNAS/core"
 // whole history. The bound has to be per type, which means knowing the type
 // BEFORE allocating. The binary wire format puts the type first, so a short
 // peek at the head of the frame identifies it while the body is still on the
-// socket (msgReader.Decode). The JSON format has no fixed layout, so it keeps
-// the global ceiling for the allocation and is checked against its per-type cap
-// once decoded — refused either way, just later. Binary is what peers
-// negotiate, so the path that matters is the one that is covered.
+// socket (msgReader.Decode). A JSON frame is peeked too (peekJSONType reads the
+// type name off its head); one whose head does not match the layout this node
+// writes is decoded only if it is under smallMsgCap, and is then checked
+// against its per-type cap — anything larger is refused unread.
 
 const (
 	// smallMsgCap covers the control and request messages: pings, inventory

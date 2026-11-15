@@ -1,7 +1,9 @@
 package core
 
 import (
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/nexusriot/DNAS/wallet"
 )
@@ -111,5 +113,36 @@ func TestRegtestHoldsDifficultyFixed(t *testing.T) {
 	withNetwork(t, MainNet)
 	if NoRetarget {
 		t.Fatal("mainnet must retarget difficulty")
+	}
+}
+
+// Regtest mines faster than the clock, a second of timestamp per block, so it
+// allows far more future drift than the networks whose difficulty a timestamp
+// could game. Mainnet and testnet keep the tight bound.
+func TestFutureDriftIsPerNetwork(t *testing.T) {
+	if FutureDrift() != MaxFutureDrift {
+		t.Fatalf("mainnet drift %d, want %d", FutureDrift(), MaxFutureDrift)
+	}
+	hour := time.Now().Unix() + 3600
+
+	main := NewBlockchain()
+	miner, _ := wallet.New()
+	if err := main.AddBlock(mineAt(t, main, miner.Address(), nil, hour)); err == nil ||
+		!strings.Contains(err.Error(), "future") {
+		t.Fatalf("mainnet accepted a block an hour ahead: %v", err)
+	}
+
+	withNetwork(t, TestNet)
+	if FutureDrift() != MaxFutureDrift {
+		t.Fatalf("testnet drift %d, want %d", FutureDrift(), MaxFutureDrift)
+	}
+
+	withNetwork(t, RegTest)
+	if FutureDrift() < 3600 {
+		t.Fatalf("regtest drift %d: a burst of /generate stalls ~that many blocks in", FutureDrift())
+	}
+	rt := NewBlockchain()
+	if err := rt.AddBlock(mineAt(t, rt, miner.Address(), nil, hour)); err != nil {
+		t.Fatalf("regtest refused a block an hour ahead: %v", err)
 	}
 }

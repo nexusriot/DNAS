@@ -23,7 +23,7 @@ import (
 //	dnas peers                        list connections in detail
 //	dnas peers bans                   show scored and banned keys
 //	dnas peers unban <key>            clear a ban score
-//	dnas peers add <host:port>        dial a peer now
+//	dnas peers add [<pubkey>@]<host:port>  dial a peer now (a pubkey pins its identity)
 //	dnas peers drop <addr|identity>   close a connection
 func runPeers(args []string) {
 	// These subcommands take a positional argument (`unban <key>`, `add <addr>`),
@@ -52,7 +52,7 @@ func runPeers(args []string) {
 			fmt.Sprintf("cleared the ban score for %s", rest[1]))
 	case "add":
 		if len(rest) < 2 {
-			fmt.Println("usage: dnas peers add <host:port>")
+			fmt.Println("usage: dnas peers add [<pubkey>@]<host:port>")
 			return
 		}
 		postAndReport(base+"/addpeer", map[string]string{"addr": rest[1]},

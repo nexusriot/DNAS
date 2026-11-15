@@ -106,7 +106,8 @@ Module `github.com/nexusriot/DNAS/core` — the ledger and consensus rules.
   client can verify PoW and the hash chain from headers alone.
 - **EIP-1559 base fee, priced per byte** (consensus) — each block commits a
   `BaseFee` in its header, derived from the parent's fullness by `expectedBaseFee`
-  (rising above `BaseFeeTargetTxs` txs, falling below, ±1/`BaseFeeMaxChangeDenominator`
+  (rising above `BaseFeeTargetTxs` txs — or, from `UpgradeByteBaseFee`,
+  `BaseFeeTargetBytes` of transaction bytes — falling below, ±1/`BaseFeeMaxChangeDenominator`
   = 12.5%, clamped to `MinBaseFee`); `Blockchain.NextBaseFee` exposes the next
   block's value. Every non-coinbase tx must pay a fee ≥ `BaseFee × Size()`
   (`BaseFeeFor`), that portion is **burned** — the coinbase may pay only
@@ -115,17 +116,18 @@ Module `github.com/nexusriot/DNAS/core` — the ledger and consensus rules.
   discard, and `checkpoint.go` pins known-good hashes at heights (genesis is
   implicit; `AddCheckpoint`); a block at a checkpointed height must match, and no
   reorg may fork below one.
-- `merkle.go` — a shared `merkleRootOf` / `merkleProofOf` fold used by both the
-  transaction tree and the state tree; `MerkleProof` / `VerifyMerkleProof` give
-  compact inclusion proofs (unchanged, and used for both).
-- `state.go` — `stateRoot` folds the sorted account set into the header
-  `StateRoot` that every block commits. `Blockchain.ProveAccount(addr)` serves an
-  `AccountProof` (balance + nonce + merkle path) and `VerifyAccountProof(p, root)`
-  folds it, so a light client can prove an address's balance/nonce against the
-  header state root — membership only, not the absence of an account.
+- `merkle.go` — the `merkleRootOf` / `merkleProofOf` fold behind the
+  transaction tree (the state tree is now the trie in `trie.go`);
+  `MerkleProof` / `VerifyMerkleProof` give compact inclusion proofs.
+- `state.go` — `stateRoot` commits the account set (one `stateLeaf` per
+  account) into the header `StateRoot` that every block commits.
+  `Blockchain.ProveAccount(addr)` serves an `AccountProof` (account + trie path)
+  and `VerifyAccountProof(p, root)` checks it, so a light client can prove an
+  address's balance/nonce against the header state root (see below).
 - `cfilter.go` — BIP158-style **compact block filters**: a Golomb-Coded Set per
   block over the addresses it touches (every recipient + non-coinbase sender).
-  SipHash-2-4 keyed by the block hash places items, Golomb-Rice coded (P=19,
+  SipHash-2-4 keyed by the block hash (from `UpgradeFilterCommit`, by a digest of
+  `PrevHash` and `MerkleRoot`, recorded as `BlockFilter.Key`) places items, Golomb-Rice coded (P=19,
   M=784931). `BuildBlockFilter` builds one; `BlockFilter.Match`/`MatchAny` test it
   with no false negatives (a non-match proves non-inclusion) and ≈1/M false
   positives; `FilterHeaderChain` folds them into a BIP157-style filter-header
@@ -144,7 +146,7 @@ Module `github.com/nexusriot/DNAS/core` — the ledger and consensus rules.
   `NextStateRoot(candidate)` can compute a candidate block's resulting state root
   before it is mined.
 - `store.go` — an append-only, length-framed block log, with `compact` to rewrite
-  it so it matches a pruned chain (atomic: temp file + rename). `Open` backs a chain with
+  it so it matches a pruned chain (`writeCompacted`/`adoptCompacted`; atomic: temp file + rename). `Open` backs a chain with
   it so `AddBlock` persists in O(1) and reorgs truncate+append (no whole-file
   rewrite); `Save`/`Load` remain as a JSON import/export snapshot. A reorg whose
   writes fail partway **poisons** the store: the truncate has already discarded
@@ -161,13 +163,15 @@ Module `github.com/nexusriot/DNAS/core` — the ledger and consensus rules.
   so those are reproducible by any implementation (not tied to `encoding/json`).
 - `upgrade.go` — height-activated consensus upgrades: `SetUpgradeHeight` /
   `IsUpgradeActive(name, height)` gate a rule change to a coordinated flag-day.
-  Five are defined: `UpgradeMultiOutput` (multi-recipient transfers),
+  Fourteen are defined (`knownUpgrades`), among them `UpgradeMultiOutput` (multi-recipient transfers),
   `UpgradeVault` (time-delayed vault spends), `UpgradeFeeSponsor` (a third party
   paying the fee), `UpgradeCheckedAddresses` (every address a transaction names
   must be well-formed and checksummed — the only thing that stops a client bug
-  burning coin to a typo) and `UpgradeDustLimit` (the worked example). All are
-  guarded in `checkTxAtHeight`, so the mempool, `Select` and block application
-  enforce them identically.
+  burning coin to a typo) and `UpgradeDustLimit` (the worked example). Every
+  transaction-level one is guarded in `checkTxAtHeight`, so the mempool, `Select`
+  and block application enforce them identically; the block-level ones
+  (`UpgradeFilterCommit`, `UpgradeHistoryRoot`, `UpgradeByteBaseFee`,
+  `UpgradeUniqueCoinbase`) are checked with the block.
   `KnownUpgrade`/`Upgrades` let the CLI reject a misspelled name at startup.
 - `work.go` — cumulative proof-of-work (`BlockWork = 2^256/(target+1)`,
   `ChainWork`). Fork choice is greatest cumulative work, with equal-work ties
@@ -205,9 +209,9 @@ Module `github.com/nexusriot/DNAS/core` — the ledger and consensus rules.
   than a Merkle fold over the sorted accounts. That is what makes **absence**
   provable: `ProveAccount` answers for an address with no account, and
   `VerifyAccountProof` returns `(valid, present)` so a light client can tell
-  "holds nothing" from "I am not showing you this". Still a resident
-  `map[string]Account`, so memory bounds the ledger and the root is rebuilt per
-  call — see ROADMAP §1.
+  "holds nothing" from "I am not showing you this". The accounts are a
+  `StateDB` (a map unless opened with `-diskstate`) and the root is committed
+  incrementally (`statetrie.go`).
 - `nettime.go` — network-adjusted time: the bounded median of peers' clock
   offsets, applied to timestamp validation only. Stops one machine's wrong clock
   isolating it from the chain.
@@ -218,8 +222,10 @@ Module `github.com/nexusriot/DNAS/core` — the ledger and consensus rules.
   read the extra bytes as the next field: **V2** (pre-`Version`), **V3** (+ the
   header's `Version`, from BIP9 signaling), **V4** (+ a transaction's asset
   mint/burn), **V5** (+ the scheduled header commitments `FilterRoot` and
-  `HistoryRoot`). Writing emits the newest; reading accepts them all, so a
-  store written by an older build still loads and replays to the same hashes.
+  `HistoryRoot`), **V6** (+ a transaction's script, name operation and NFT
+  metadata). Writing emits V6 only for a block that needs it and V5 otherwise
+  (`recordVersionFor`); reading accepts them all, so a store written by an
+  older build still loads and replays to the same hashes.
 - `script.go` / `scriptbuild.go` — the **authorization script VM**: a bounded
   stack language that decides whether a transaction may spend from an account.
   No loops, no backward jumps, hard caps on script length, stack depth,
@@ -270,7 +276,7 @@ Module `github.com/nexusriot/DNAS/core` — the ledger and consensus rules.
   to the log. A crash at any point either leaves the old chain or is finished
   from the side file on the next open; a record that does not match its side
   file refuses to open and names `dnas db verify`.
-- `audit.go` — `StateAudit`: a running node's self-audit (`-audit N`,
+- `audit.go` — `AuditState` → `StateAudit`: a running node's self-audit (`-audit N`,
   `GET /audit`). A trie rebuilt from the account map, sharing no cache with the
   incremental committer, plus the supply identity — a second opinion rather than
   a second copy of the first.
@@ -285,8 +291,8 @@ Module `github.com/nexusriot/DNAS/core` — the ledger and consensus rules.
 - `trie.go` — a content-addressed, path-compressed **sparse Merkle trie** keyed
   by the hash of an address: `Trie`, a pluggable `NodeStore`, and `Prove` /
   `VerifyTrieProof` giving both **membership and absence** proofs. Absence is the
-  capability `state.go`'s sorted-leaf fold cannot offer — a prover who omits a
-  leaf produces a tree a client cannot distinguish from the truth. Updates are
+  capability the old sorted-leaf fold could not offer — a prover who omitted a
+  leaf produced a tree a client could not distinguish from the truth. Updates are
   O(depth) and every historical root stays readable. The header **does** commit
   this trie's root (see `state.go`), so its proofs are bound to proof of work.
   The root is updated incrementally (`statetrie.go`), and application reads and
@@ -307,7 +313,7 @@ Module `github.com/nexusriot/DNAS/core` — the ledger and consensus rules.
   difficulty bounds and retarget, `CoinbaseMaturity`, `MaxReorgDepth`,
   `MaxBlockBytes`, `MaxBlockVerifyOps`, `MaxTxOutputs`, `DefaultMinRelayFee`,
   `DefaultMempoolBytes`, `MinPruneKeep`, the per-byte base-fee params
-  `InitialBaseFee`/`MinBaseFee`/`BaseFeeTargetTxs`/`BaseFeeMaxChangeDenominator`,
+  `InitialBaseFee`/`MinBaseFee`/`BaseFeeTargetTxs`/`BaseFeeTargetBytes`/`BaseFeeMaxChangeDenominator`,
   genesis) plus the `BaseFeeFor`, `Tips`, and `CoinbaseAmount` fee helpers.
 
 Depends on `wallet` for signature verification and address derivation.

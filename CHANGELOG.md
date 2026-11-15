@@ -9,7 +9,99 @@ rather than written at the time.
 
 It is still a learning project, not money. Do not point it at the internet.
 
-## 0.4.0 — unreleased
+## 0.5.0 — unreleased
+
+Identity pinning and the light-client tip cross-check, and what a multi-node
+end-to-end run on a real host found in them.
+
+### Added
+
+- **Identity pinning.** A `-peers` entry may be `<pubkey>@host:port` — for
+  `dnas node`, `dnas spv` and `dnas fastsync` alike. The peer must prove that
+  node key after the handshake, or the dial is dropped (logged, not banned).
+  Pins come only from configuration and are never gossiped. This closes the
+  "active MITM on the handshake" gap for the peers an operator names
+  (`node.ParsePeerAddr`, [node/pin.go](node/pin.go)).
+- **Light-client tip cross-check.** With `-peers`, `dnas spv` asks each peer,
+  over the peer protocol, where its chain leaves the API node's
+  (`node.FetchHeadersAfter`, `core.HeaderLocator`), validates the answer, and
+  refuses outright if any peer holds a branch with more work. The tip must be
+  confirmed by `min(2, len(-peers))` peers; a warning is printed when every
+  confirming peer is in one /16 (IPv6: /32). Nodes now answer `getheaders` even when they
+  have nothing newer — an empty batch naming its start height — so "you are at
+  my tip" is distinguishable from a dead peer.
+- **A transport version in the handshake.** The encrypted handshake now opens
+  with a version byte (`node.TransportVersion` = 2, `MinTransportVersion` = 2);
+  the session runs at the lower of the two sides' versions, and a peer below the
+  minimum is refused with an error naming both. The next transport change can
+  therefore be negotiated rather than splitting the network. Each side's
+  advertised byte is mixed into its send key, so rewriting it in transit breaks
+  the session instead of downgrading it. (Part of the same wire break as
+  peer transport v2 in 0.4.0, which never shipped either.)
+- **`canonicalwitness` consensus upgrade** (`core.UpgradeCanonicalWitness`).
+  From its activation height a block may not carry a script spend whose script
+  or witness hex is not lowercase, so a script spend has exactly one txid. The
+  mempool already refused such spends as relay policy; this binds miners too.
+- **A block hash index.** The chain keeps a hash → height map in step with every
+  connect and reorg (rebuilt from the headers on open; placeholders keep their
+  hash, so pruning and snapshots are covered). `getheaders` locators are now one
+  lookup per hash. `core.Blockchain.HeightOf` exposes it, and `GET /block/{ref}`
+  and `GET /header/{ref}` accept a 64-hex block hash as well as a height.
+
+### Fixed — found by an end-to-end run on a separate host
+
+The unit and e2e suites were run from cross-compiled binaries on a 1-CPU
+Ubuntu host, then multi-node scenarios (pinning, cross-checks, forks, restarts,
+private nets, garbage on the p2p port), a 3000-block sync over an SSH-tunnelled
+WAN link with a dropped connection, and a real-PoW testnet run with
+retargeting. Every suite passed as it was; these came from the scenarios.
+
+- **The light client trusted a stale header cache when its node moved to a
+  shorter chain.** With nothing served at the cached tip's height, the cache
+  assumed the node was merely behind and returned itself unchecked — so after
+  a reorg onto a shorter (heavier) branch, or against a different chain,
+  `dnas spv` reported the old tip and proved payments in orphaned blocks. It
+  now checks the node's tip is a header it holds and rebuilds otherwise.
+- **The CLI tripped a node's default rate limit.** One `dnas fastsync` with
+  `-peers` spends more than the default burst on paged reads and a snapshot, and
+  finished with its filter headers unverified on a 429. CLI reads (GET only)
+  now wait out a 429 for as long as `Retry-After` says, within the request's
+  deadline; and the node's `Retry-After` is now the actual refill time (it was
+  always 1 s, short of what a 22-token paged read needs at 20/s).
+- **`POST /addpeer` and `dnas peers add` took a pinned address as the
+  address.** They answered "dialing" and the dial of `<key>@host:port` could
+  never connect. The pinned form is now parsed, recorded and enforced as in
+  `-peers`; a malformed pin is a 400.
+- **A refused session reset the dial backoff.** A socket that connected but
+  failed the session — a wrong pin, a wrong netkey, another network — was
+  retried at the 3 s floor forever, a full handshake (and a signature from the
+  peer) each time. It now backs off like a failed dial; only an established
+  session resets the delay.
+- **Regtest could not mine more than ~120 blocks at a time.** `/generate`
+  stamps each block a second after its parent, so a burst runs ahead of the
+  clock, and the 120 s future-drift bound stopped it and kept it stopped until
+  real time caught up. Regtest now allows a day of drift
+  (`core.NetworkParams.FutureDrift`, `core.FutureDrift()`); mainnet and testnet
+  keep 120 s. One `/generate` is also capped at 10000 blocks — it mines
+  synchronously, and an unbounded `n` kept a node busy as long as asked.
+- **A node's own identity was not readable from the node.** The docs pointed
+  at the `-nodekey` file, which holds a seed (encrypted under a passphrase),
+  not the public key. `/info` now reports `identity`, and the startup log
+  prints it with the ready-to-use `pin=<identity>@<advertise>`.
+
+### Changed
+
+- **`scripts/version.sh`** prints `X.Y.Z+dirty` for the tagged commit with
+  uncommitted changes; it printed `X.Y.Z.dirty`, which reads as a fourth
+  version number rather than semver build metadata.
+- **`.gitignore`** covers the rest of a node's soft state beside `-db`
+  (`addrs.json`, `shares.json`, `pool.json`, `reorgs.json`), which was only
+  ignored at the repository root.
+
+## 0.4.0 — never tagged
+
+The release number reached 0.4.0 in [VERSION](VERSION) but, like 0.3.0, no
+commit was tagged for it, so nothing below shipped under that number.
 
 ### Review hardening
 
@@ -111,9 +203,9 @@ chain using this release's own features could not be relayed or reloaded.
 - **JSON wire frames are capped by type before allocation**, like binary
   ones: the type is peeked off the head of the frame, and a large JSON frame
   whose head carries no readable type is refused outright.
-- **`getheaders` locators** are resolved by walking down from the tip against
-  at most `core.MaxLocatorLen` (128) hashes, instead of building a hash map of
-  the whole chain per request.
+- **`getheaders` locators** consider at most `core.MaxLocatorLen` (128)
+  hashes, each resolved in the chain's hash index (below), instead of building a
+  hash map of the whole chain per request.
 - **Stratum sessions are bounded**: 1024 overall, 64 per address, 30s to
   authorize and a 10-minute idle read deadline.
 - **Reorgs are validated against the suffix's own versionbits votes.** A
@@ -708,7 +800,8 @@ are there to make loud rather than silent.
   content-addressed, path-compressed sparse Merkle trie keyed by the hash of the
   address, with membership **and absence** proofs, a pluggable `NodeStore`, and
   O(depth) updates (~16µs at 10 000 accounts, flat as the ledger grows).
-  **Not yet wired into consensus** — see *Known gaps* below.
+  **Not yet wired into consensus** when it landed; it became the state root
+  later in this cycle (see *Fixed* above).
 - **A threat model** ([THREAT-MODEL.md](THREAT-MODEL.md)): assets, adversaries,
   what each defence assumes, what is explicitly out of scope (majority hashpower,
   side channels, supply chain), and where an outside reviewer should attack

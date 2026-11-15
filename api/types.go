@@ -30,6 +30,11 @@ type InfoResponse struct {
 	MinRelayFee    uint64   `json:"min_relay_fee"`
 	BaseFee        uint64   `json:"base_fee"`
 	Peers          []string `json:"peers"`
+	// Identity is this node's network identity public key: what it proves to
+	// every peer in the handshake, so nothing is disclosed by publishing it here.
+	// It is what another operator pins (`<identity>@host:port` in -peers), and
+	// it used to be readable only from some OTHER node's /peers.
+	Identity string `json:"identity"`
 
 	// Addrs is the address manager's tables, so an operator can see how
 	// eclipse-resistant this node currently is rather than only how many peers

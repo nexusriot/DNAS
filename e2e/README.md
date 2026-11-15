@@ -12,7 +12,7 @@ make e2e-docker   # the same suite, hermetically, in a container (needs only Doc
 ```
 
 They are behind the `e2e` build tag, so `make test` and `go test ./core/...`
-never pick them up: they spawn processes, bind sockets, and take ~20 s.
+never pick them up: they spawn processes, bind sockets, and take ~40 s.
 
 Most commands print their errors and still exit 0, so assertions are on the
 output text (`mustContain`). A few deliberately exit **non-zero** — `dnas health`
@@ -119,12 +119,14 @@ arm64 hosts resolve the same pin.
 | `TestDBVerifyExportImport` | `dnas db` mis-reading, mis-verifying, or losing a chain on a round trip |
 | `TestNodeIdentityIsNotTheWallet` | a node publishing its wallet address to every peer via its identity key |
 | `TestSPVHeaderCache` | the light client re-downloading the whole header chain on every command |
+| `TestSPVCacheFollowsTheNodeToAShorterChain` | a header cache outliving its node's move to a shorter chain |
 | `TestPagedReadEndpoints` | a bulk read serializing the whole chain into one response |
 | `TestPeersAndBansCLI` | peers/bans becoming unobservable or unmanageable — and a node connecting to itself |
 | `TestStatsAndHealthAndReorgsCLI` | hashrate/timing/reorg reporting, and `health` failing to exit non-zero when unready |
 | `TestBumpAndCancelCLI` | replace-by-fee being unreachable from a client, or a bump paying twice |
 | `TestStructuredLogging` | `-logjson`/`-loglevel` silently not applying |
 | `TestPrintConfigShowsTheResolvedSettings` | `-printconfig` starting the node, or hiding a resolved default |
+| `TestPrintConfigCreatesNothing` | `-printconfig` creating key files, or failing on a `-db` directory that does not exist yet |
 | `TestMultisigSpendEndToEnd` | a funded multisig account being unspendable, or a stranger/duplicate signature being accepted |
 | `TestEscrowReleaseEndToEnd` | one party moving escrowed coin alone, or a shared role passing as a 2-of-3 |
 | `TestAnchorEndToEnd` | an unmined or altered file verifying as anchored |
@@ -137,6 +139,10 @@ arm64 hosts resolve the same pin.
 | `TestSendOptionsEndToEnd` | memo/expiry/lock-until not reaching the wire, or a dead-on-arrival expiry being signed |
 | `TestPruningNodeReportsWhatItHolds` | `-prune` not being applied, or its floor not being enforced |
 | `TestConsoleAnswersTheReadCommands` | the console losing a command, or `-console` not forcing the prompt |
+| `TestRegtestGeneratesALongChain` | `/generate` stalling ~120 blocks in on the future-drift bound, or a peer refusing the result |
+| `TestIdentityPinning` | a pinned peer (`-peers` or `/addpeer`) accepted with the wrong key, or a node's identity missing from `/info` |
+| `TestSPVCrossChecksTheTip` | `spv -peers` confirming a tip through a peer that failed its pin |
+| `TestCLIHonoursTheAPIRateLimit` | `fastsync`/`spv` failing on a 429 instead of waiting out `Retry-After` |
 
 ## Adding a test
 
@@ -153,13 +159,15 @@ exit status is part of the contract (`dnas health`, `anchor verify`,
 passes a secret through the environment (a passphrase must not land in shell
 history or `ps`), and `cliStdin` drives the console.
 
-Two limits of the harness worth knowing before writing a test:
+Two things about the harness worth knowing before writing a test:
 
-- **Regtest cannot mint a deep chain in one call.** Block timestamps advance a
-  second each and `MaxFutureDrift` is 120 seconds, so a single `/generate` stops
-  around 120 blocks in — a node refuses its own block as too far in the future.
-  Anything needing more (pruning's 132-body floor, say) belongs in the unit
-  suites, where the chain is built directly.
+- **Regtest can mint a deep chain in one call, up to a point.** Block timestamps
+  advance a second each, so a burst runs ahead of the clock; regtest allows a
+  24-hour future drift (other networks keep `MaxFutureDrift`'s 120 seconds,
+  where `/generate` used to stop around 120 blocks in), and `/generate` takes at
+  most 10000 blocks a request. Past a day's worth of seconds a node refuses its
+  own block as too far in the future — that belongs in the unit suites, where
+  the chain is built directly.
 - **This module imports no DNAS package**, so a consensus constant used in an
   assertion has to be written out — and will not follow a change to core. Prefer
   asserting on what the binary *reports* over hard-coding a number.

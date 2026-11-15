@@ -70,10 +70,10 @@ documents and some code comments cite them.)
 
 ## 0. Build
 
-The quickest way is `make` (stamps a version from git, writes to `bin/`):
+The quickest way is `make` (stamps the version from the `VERSION` file plus git detail, writes to `bin/`):
 
 ```sh
-cd ~/workspace/my/DNAS
+cd DNAS                # your checkout
 make build            # -> bin/dnas and bin/dnas-tui
 ./bin/dnas version
 make help             # list all targets: test, dist, deb, install, …
@@ -305,7 +305,7 @@ curl -s localhost:8080/headers            # all headers (verify the PoW chain)
 
 A light client verifies the header chain's proof-of-work, then folds the merkle
 proof to the header's merkle root — no full node required. `scripts/demo.sh`
-shows this end to end with a small Python verifier.
+shows this end to end with `dnas spv verify` (§8b).
 
 ## 8. See it all at once
 
@@ -409,8 +409,9 @@ that have it enabled will mine blocks the others reject:
 dnas node -upgrades multioutput:1000     # accepted from block 1000 onwards
 ```
 
-The same applies to every upgrade this build knows: `dustlimit`, `multioutput`,
-`vault` (§8d6), `feesponsor` (§8d5) and `checkedaddresses`. Pass them together,
+The same applies to every upgrade this build knows — `dustlimit`, `multioutput`,
+`vault` (§8d6), `feesponsor` (§8d5), `checkedaddresses`, and the newer ones below
+(`dnas node -h` lists the full set under `-upgrades`). Pass them together,
 and identically, on every node:
 
 ```sh
@@ -453,9 +454,31 @@ every block it validated links into it. With `-peers` (p2p addresses, plus
 A failure there is printed as `✗ filter headers NOT verified` — the balances
 are still reported, since they do not depend on it.
 
-`dnas spv scan` and `dnas spv history` take the same `-peers`: with two or
-more, a filter non-match only counts as "this address is absent" once the
-peers and the API node agree on the filter-header chain.
+`dnas spv` takes `-peers` too, and uses it for two checks. Every spv command
+first asks each peer where its chain leaves the API node's: a peer holding a
+branch with more work makes the command refuse (the API node is serving a stale
+or minority chain), and the tip must be confirmed by two peers (or by the one,
+if you gave one). `scan` and `history` also need two or more to agree on the
+filter-header chain before a non-match counts as "this address is absent".
+
+**Pinning a peer's identity.** Any `-peers` entry — for `dnas node` as well as
+the light clients — may be written `<pubkey>@host:port`. The peer must then
+prove that node key after the handshake, or the connection is dropped; without a
+pin an attacker on the path can answer as anyone. A node's key is the `identity`
+in its own `/info`; it also prints it at startup, already in pin form
+(`node identity … pin=<identity>@<advertise>`). The same form works when adding a
+peer at runtime:
+
+```sh
+curl -s localhost:8080/info | jq -r .identity     # what others pin THIS node by
+dnas node -peers 3f2a…c901@seed.example:3000,other.example:3000
+dnas spv -api localhost:8080 -peers 3f2a…c901@seed.example:3000 sync
+dnas peers add 3f2a…c901@seed.example:3000          # or POST /addpeer
+```
+
+A pin that no longer matches (the operator rotated the key) is logged as
+`peer rejected … identity does not match the pinned key` and retried with a
+growing backoff, not every few seconds.
 
 ## 8c. Ops: config file, metrics, clean shutdown
 
@@ -473,7 +496,7 @@ appeared or vanished some other way.
 
 `node.json` keys mirror the flags, e.g. `{"listen":":3000","api":":8080","mine":true,"maxpeers":8}`.
 
-`/metrics` is a plain Prometheus scrape target — 45 gauges and counters covering
+`/metrics` is a plain Prometheus scrape target — 63 gauges and counters covering
 the chain (height, difficulty, hashrate, block intervals), the mempool (count and
 bytes), peers (count, ban scores, the threshold), the reorgs and orphans this node
 has seen, supply, tip age and blocks-behind, the share ledger, and webhook
@@ -506,13 +529,14 @@ refused by a node on another.
 
 ## 8d. Regtest: mine blocks on demand
 
-Waiting ~5 s per block is tedious for testing. `-regtest` (shorthand for
-`-network regtest`) mines only when asked, holds difficulty at the easy floor, and
-defaults to an isolated network key:
+Waiting ~60 s per block is tedious for testing. `-regtest` (shorthand for
+`-network regtest`) mines only when asked, holds difficulty at the easy floor,
+defaults to an isolated network key, and accepts block timestamps up to 24 h
+ahead (mainnet allows 120 s), so a burst of generated blocks is not refused:
 
 ```sh
 dnas node -regtest -api :8080 &
-curl -s -X POST localhost:8080/generate -d '{"n":10}'   # mine 10 blocks instantly
+curl -s -X POST localhost:8080/generate -d '{"n":10}'   # mine 10 blocks instantly (at most 10000 per call)
 ```
 
 ## 8d2. External mining (with long polling and shares)
@@ -675,7 +699,7 @@ its own API, so they work against a local or a remote node:
 dnas peers                       # every connection: identity, version, caps, direction, uptime, ban score
 dnas peers bans                  # who is scored and how close to the cut-off
 dnas peers unban <identity|ip>   # clear a score (previously impossible without a restart)
-dnas peers add <host:port>       # dial now, no restart
+dnas peers add [<pubkey>@]<host:port>   # dial now, no restart (a pubkey pins it, §8b2)
 dnas peers drop <addr|identity>  # close a wedged connection (an outbound peer is redialed)
 
 dnas stats [-window N]           # estimated hashrate, block timing vs the target, fee flow, miners
@@ -1026,7 +1050,7 @@ Use `-quiet` to print only the findings.
 
 ## 8d20. Dashboards and alerts
 
-`GET /metrics` exports 53 Prometheus series. A dashboard with fifty series and no
+`GET /metrics` exports 63 Prometheus series. A dashboard with sixty series and no
 alerting is a dashboard nobody opens, so [scripts/monitoring/](scripts/monitoring/)
 ships both.
 
@@ -1297,9 +1321,9 @@ Bob must close before that height. `channel status` warns him as it approaches.
 ## 8f. Lock down the API
 
 By default the API is fully open (a localhost toy). Set a token to require it on
-the **write** endpoints (`/send`, `/tx`, `/mine`, `/generate`, `/submitblock`);
-reads stay open, and all bundled clients send it automatically from the same env
-var:
+the **write** endpoints (`/send`, `/tx`, `/mine`, `/generate`, `/submitblock`, `/faucet`, …);
+reads stay open (except `/audit`, which is O(ledger)), and all bundled clients
+send it automatically from the same env var:
 
 ```sh
 export DNAS_API_TOKEN='a-long-random-secret'
@@ -1370,8 +1394,9 @@ produce signatures a node rejects.
   snapshot a pruned store reopens from) and, only while a reorg is being
   written, `chain.db.reorg` + `chain.db.reorg.commit` — leave those two alone:
   the next start uses them to finish the reorg.
-- `peers.json`, `bans.json`, `mempool.json` — soft state written beside `chain.db`
-  on graceful shutdown and reloaded on start, so a restart resumes warm. The chain
+- `peers.json`, `bans.json`, `mempool.json`, `reorgs.json`, `shares.json`,
+  `pool.json` — soft state written beside `chain.db` on graceful shutdown and
+  reloaded on start, so a restart resumes warm. The chain
   stays authoritative; these are conveniences (re-learned from peers if lost).
 - `spvwallet.json` and `spvheaders.json` / `<wallet>.headers` — a light wallet's
   scanned state and its verified header cache. Deleting them costs a rescan, not
@@ -1393,6 +1418,6 @@ your peers know you by. If you ever add a JSON file to the root that *should* be
 tracked, add a `!name.json` exception rather than removing the rule.
 
 To start clean, stop the node and delete `chain.db` (keep `wallet.json` to keep
-your address). Different networks are separated by `-netkey`. Note: the block
+your address). Different networks are separated by `-network` (§8c2). Note: the block
 header format evolves as the project gains features, so a `chain.db` from an older
 build may be rejected as incompatible — delete it to start a fresh chain.

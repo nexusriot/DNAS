@@ -7,13 +7,14 @@ import (
 	"strings"
 )
 
-// The account state is committed in each block header as a merkle root over the
-// account set, so a light client can *prove* an address's balance and nonce
-// against a proof-of-work-verified header — not just that a transaction was
-// included. Leaves are sorted by address for determinism (every node builds an
-// identical tree), and each leaf binds the address to its (balance, nonce).
+// The account state is committed in each block header as the root of a sparse
+// Merkle trie keyed by address (trie.go, kept incrementally by statetrie.go), so
+// a light client can *prove* an address's balance and nonce — or its absence —
+// against a proof-of-work-verified header, not just that a transaction was
+// included. A key's position is fixed by the key, so every node builds an
+// identical trie, and each leaf binds the address to its (balance, nonce).
 
-// stateLeaf is the merkle leaf committing one account: address, coin balance,
+// stateLeaf is the trie leaf value committing one account: address, coin balance,
 // nonce, and any asset balances (appended in sorted order so the encoding is
 // deterministic). A coin-only account has no asset suffix, so its leaf — and
 // therefore the whole state root for a coin-only chain — is byte-identical to

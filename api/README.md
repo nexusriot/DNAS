@@ -16,7 +16,9 @@ genesis on a long chain.
 
 Every request passes a **per-client token bucket** (`ratelimit.go`,
 `-apirate`/`-apiburst`), answering **429** with `Retry-After` when it is
-exceeded. It keys on the client IP and deliberately ignores `X-Forwarded-For`: a
+exceeded. `Retry-After` is the time until the bucket holds enough for that
+request (whole seconds, rounded up), not a constant: a paged read can cost more
+than a second of refill. The `dnas` CLI waits it out on its reads. It keys on the client IP and deliberately ignores `X-Forwarded-For`: a
 client-set header would hand out a fresh bucket per request. An IPv6 client is
 keyed by its **/64**, since one subscriber is routinely handed a whole /64 and
 would otherwise have 2^64 buckets to rotate through. The bucket map itself is
@@ -97,7 +99,9 @@ matters: a client told "not found" concludes the chain is shorter than it is,
 when the right move is to ask another node. A body-less block serves no filter at
 all, because an empty filter is a proof of *absence*.
 
-SPV / light-client endpoints: `/headers`, `/header/{index}`, `/block/{index}`
+SPV / light-client endpoints: `/headers`, `/header/{index}`, `/block/{index}` (both
+also take a 64-hex block hash, resolved through the chain's hash index; a hash
+not on the active chain is 404)
 (one full block body, so a light client downloads only filter-flagged blocks),
 `/proof/{txhash}` (a merkle inclusion proof, verifiable against a header's merkle
 root), `/stateproof/{addr}` (an account balance/nonce proof against the header
@@ -124,10 +128,14 @@ into single numbers, which cannot show a quantity *moving*. `/richlist?limit=N`
 ranks the largest holders straight from resident account state, bounded to a
 top-N so one request cannot sort a whole ledger.
 
+`/info` also carries the node's own `identity` — the key it proves to every
+peer, and the one another operator pins it by (`<identity>@host:port`).
+
 Operator endpoints: `/peers` (every connection in detail — identity, negotiated
 version, capabilities, direction, uptime, ban score, whether a block request is
 outstanding), `/bans` (scored keys *including* those below the threshold, plus
-the threshold itself), `POST /unban`, `POST /addpeer`, `POST /droppeer`,
+the threshold itself), `POST /unban`, `POST /addpeer` (`{"addr"}`, which may be pinned:
+`<identity>@host:port`), `POST /droppeer`,
 `/chainstats?window=N` (estimated hashrate, block timing against the target, fee
 flow, miners), `/reorgs` (the chain switches this node has lived through), and
 `/health` — which answers **503 with reasons** when the node is not usable.
@@ -148,8 +156,8 @@ route table (`routes.go`) that registers the handlers, so it cannot describe an
 endpoint that is not served or miss one that is.
 
 Event stream: `GET /events` is a Server-Sent Events stream that pushes a small
-JSON envelope on every new block, reorg, and mempool transaction (fed by the
-node's pub/sub bus).
+JSON envelope on every new block, reorg, and mempool transaction, and on a failed
+ledger audit (`audit_failed`) (fed by the node's pub/sub bus).
 
 Write endpoints: `POST /send` (`{"to","amount","fee","expiry"?,"lock_until"?,"memo"?,"nonce"?}`,
 signed by the node's wallet — set `nonce`+higher `fee` to fee-bump; or
@@ -159,7 +167,7 @@ recipients in one transaction, every address checksum-validated before signing),
 (submit a fully-signed transaction, including multisig, HTLC, a vault spend, a
 fee-sponsored transfer, a native-asset transfer, or an issuance), `POST /mine`
 (`{"on":bool}`, toggle mining at runtime), `POST /generate` (`{"n":N}`, **regtest
-only**: mine N blocks on demand), and `POST /faucet` (`{"address":…}`, testnet or
+only**: mine N blocks on demand, at most 10000 per request), and `POST /faucet` (`{"address":…}`, testnet or
 regtest only, and only when the node was started with `-faucet` — it pays out of
 the node's own wallet, rate-limited per recipient and per client IP). When
 `DNAS_API_TOKEN` is set these require an `Authorization: Bearer <token>` header
@@ -170,7 +178,7 @@ the node's own wallet, rate-limited per recipient and per client IP). When
 External mining: `GET /blocktemplate?address=ADDR` returns a candidate block
 (every field but the winning nonce) and `POST /submitblock` accepts an
 externally-mined block, so an off-node miner (`dnas miner`) can hash and submit
-without the node mining itself. `/submitblock` is guarded like the other writes.
+without the node mining itself. `/submitblock` (and `/submitshare`) is guarded like the other writes.
 
 Two things make that efficient rather than merely possible. The template request
 **long polls** with `&longpoll=1&prev=HASH[&timeout=S]`: it does not answer until

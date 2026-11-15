@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The features of this round, driven through the real binary against a real
@@ -408,9 +409,11 @@ func TestSendOptionsEndToEnd(t *testing.T) {
 // headers, the API answers 410 rather than 404, the light client scans only what
 // it was served). What only the binary can show is the wiring: the flag, the
 // floor it is raised to, and the fields /info publishes so a client can ask
-// elsewhere. It deliberately does NOT mine past the keep window — that needs 132
-// blocks, and regtest cannot mint them in one go: block timestamps advance a
-// second each and MaxFutureDrift stops a node roughly 120 blocks in.
+// elsewhere — and, past the keep window, the 410 for a body it has dropped.
+// That last part used to be out of reach: regtest could not mint the 132+
+// blocks it takes, because block timestamps advance a second each and the
+// 120 s future-drift bound stopped /generate about 120 blocks in. Regtest now
+// allows a day of drift (core.NetworkParams.FutureDrift).
 func TestPruningNodeReportsWhatItHolds(t *testing.T) {
 	n := startNode(t, nodeOpts{name: "prune", extra: []string{"-prune", "5"}})
 	// -prune 5 is raised to the minimum, which is above the reorg depth: a node
@@ -440,13 +443,41 @@ func TestPruningNodeReportsWhatItHolds(t *testing.T) {
 	if code, _ := n.get("/block/1"); code != 200 {
 		t.Fatalf("a block inside the keep window returned %d", code)
 	}
+	// Mine past the keep window in one go: the oldest bodies are dropped, the
+	// node says so in /info, and asking for one is 410 Gone — never 404, which
+	// a client would read as "the chain is shorter than that".
+	n.generate(int(info.PruneKeep) + 10)
+	n.getJSON("/info", &info)
+	if info.BodyHeight <= 1 {
+		t.Fatalf("body_height = %d after mining past the keep window", info.BodyHeight)
+	}
+	if code, _ := n.get("/block/1"); code != 410 {
+		t.Fatalf("a pruned block returned %d, want 410", code)
+	}
+	if code, _ := n.get("/block/" + itoa(info.BodyHeight)); code != 200 {
+		t.Fatalf("the oldest kept body (%d) returned %d", info.BodyHeight, code)
+	}
 	// -printconfig shows it, so an operator can check before starting.
 	mustContain(t, n.cli("node", "-printconfig", "-prune", "500", "-db", "pc.db"),
 		"keep 500 recent bodies", "printconfig")
-	// What a node does once bodies HAVE been dropped — 410 rather than 404, no
-	// empty filters, a cached filter-header chain — is covered where it can be
-	// driven without minting 132 blocks: api.TestPrunedNodeDistinguishesGoneFromMissing
+	// The rest of a pruned node's behaviour — no empty filters, a cached
+	// filter-header chain — is covered in api.TestPrunedNodeDistinguishesGoneFromMissing
 	// and core's prune_test.go.
+}
+
+// A regtest node mines a long chain on demand. Each generated block is stamped
+// at least a second after its parent, so a burst runs ahead of the clock; with
+// the 120 s drift bound other networks use, /generate failed about 120 blocks
+// in and kept failing until real time caught up.
+func TestRegtestGeneratesALongChain(t *testing.T) {
+	n := startNode(t, nodeOpts{name: "long"})
+	n.generate(300)
+	if h := n.height(); h != 300 {
+		t.Fatalf("height %d after generating 300", h)
+	}
+	// The chain those blocks make is one a second node accepts too.
+	b := startNode(t, nodeOpts{name: "follower", peers: []string{n.p2pAddr}})
+	waitFor(t, 60*time.Second, "the follower to sync 300 blocks", func() bool { return b.height() == 300 })
 }
 
 // The console: the only way to look at a node whose API is unreachable.

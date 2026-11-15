@@ -245,10 +245,9 @@ func (bc *Blockchain) FilterHeaders() []string {
 }
 
 // FilterHeadersFrom returns up to max filter headers starting at the given
-// height. The chain is a running hash, so the values below `from` still have to
-// be folded to produce them — paging bounds the RESPONSE, not the work. A client
-// that keeps its own verified prefix (see the SPV header cache) folds
-// incrementally instead and pays neither.
+// height. The chain is folded once as blocks connect and kept, so a page is a
+// slice of it and costs only its own range. Heights below FilterHeaderBase
+// (a snapshot or pruned bootstrap) are not held and return nil.
 func (bc *Blockchain) FilterHeadersFrom(from uint64, max int) []string {
 	bc.mu.RLock()
 	defer bc.mu.RUnlock()

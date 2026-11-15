@@ -671,6 +671,14 @@ func TestGenerateEndpoint(t *testing.T) {
 	if chain.Height() != 3 {
 		t.Fatalf("height = %d, want 3", chain.Height())
 	}
+	// One request is bounded: it mines synchronously, so an unbounded n would
+	// keep the node busy for as long as the caller asked.
+	if obj, code := postObj(t, rt.URL+"/generate", map[string]any{"n": 1_000_000_000}); code != http.StatusBadRequest {
+		t.Fatalf("an enormous n = %d (%v), want 400", code, obj)
+	}
+	if chain.Height() != 3 {
+		t.Fatalf("a refused /generate still mined: height %d", chain.Height())
+	}
 }
 
 // TestStateProofEndpoint confirms /stateproof returns a proof that folds to the

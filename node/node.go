@@ -254,6 +254,11 @@ type Node struct {
 	dialFn   func(string) (net.Conn, error)
 	dialBase time.Duration // first retry wait; a field so tests need not wait seconds
 	listenFn func(string) (net.Listener, error)
+
+	// pins maps a configured peer address to the node identity it must prove
+	// ("<pubkey>@host:port" in Config.Peers; see pin.go).
+	pinMu sync.RWMutex
+	pins  map[string]string
 }
 
 // New constructs a Node. The wallet enables mining and API-side signing; if it
@@ -375,7 +380,13 @@ func (n *Node) Shutdown() {
 func (n *Node) Start() {
 	n.loadState() // restore persisted peers/bans/mempool before dialing
 	go n.listen()
-	for _, a := range n.cfg.Peers {
+	for _, raw := range n.cfg.Peers {
+		a, pinned, err := ParsePeerAddr(raw)
+		if err != nil {
+			Warnf("configured peer skipped", "peer", raw, "err", err)
+			continue
+		}
+		n.setPin(a, pinned)
 		n.book.note(a)
 		// Configured peers are the operator's own choice, so they go in as
 		// `tried`: they should be preferred over anything gossip offers.
@@ -562,6 +573,9 @@ func (n *Node) listen() {
 		return
 	}
 	Infof("p2p listening", "listen", n.cfg.ListenAddr, "advertise", n.cfg.AdvertiseAddr)
+	// The full key, once: it is what another operator pins this node by
+	// (`<identity>@host:port`), and a node's own log is the first place one looks.
+	Infof("node identity", "identity", n.identity.PublicKeyHex(), "pin", n.identity.PublicKeyHex()+"@"+n.cfg.AdvertiseAddr)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -668,11 +682,21 @@ func (n *Node) dialLoop(addr string) {
 	for !n.stopped() {
 		n.addrs.Attempt(addr)
 		if conn, err := n.dialFn(addr); err == nil {
-			// A connection that was ESTABLISHED resets the backoff: this peer is real
+			// A session that was ESTABLISHED resets the backoff: this peer is real
 			// and reachable, and a drop after an hour of good service should be
 			// retried promptly rather than at whatever interval past failures reached.
-			delay = base
-			n.handleConn(conn, false, addr) // outbound; blocks until the connection drops
+			//
+			// A socket that connected but was refused — the wrong pin, the wrong
+			// netkey, another network, a version we no longer speak — backs off
+			// like a failed dial. It used to reset the delay too, so a pin that
+			// no longer matched made this node redo a full handshake (and make
+			// the peer sign for it) every few seconds, forever. Not counted as a
+			// failure, though: the address is reachable, just not acceptable.
+			if n.handleConn(conn, false, addr) { // outbound; blocks until the connection drops
+				delay = base
+			} else {
+				delay = nextDialDelay(delay, base)
+			}
 		} else {
 			// A dial that never connected is evidence against the address; enough
 			// of them and the addrman retires it rather than retrying forever.
@@ -705,7 +729,12 @@ func nextDialDelay(d, base time.Duration) time.Duration {
 	return d * 2
 }
 
-func (n *Node) handleConn(rawConn net.Conn, inbound bool, dialed string) {
+// handleConn runs one peer connection, inbound or dialed, from the handshake
+// until it drops. It reports whether a session was established — the handshake, identity,
+// pin, version and network checks all passed and the peer was registered —
+// which the dialer uses to tell a real peer that later dropped from a socket
+// that answered only to be refused.
+func (n *Node) handleConn(rawConn net.Conn, inbound bool, dialed string) (established bool) {
 	ip := remoteIP(rawConn)
 	if n.bans.banned(ip) {
 		_ = rawConn.Close()
@@ -767,6 +796,17 @@ func (n *Node) handleConn(rawConn net.Conn, inbound bool, dialed string) {
 		_ = sc.Close()
 		return
 	}
+	// A pinned address must answer with the pinned key. Not a ban: the likely
+	// causes are an operator who rotated the key or an attacker on the path,
+	// and banning by identity would punish neither.
+	if dialed != "" {
+		if pinned := n.pinFor(dialed); !pinnedIdentityOK(pinned, p.id) {
+			Warnf("peer rejected", "addr", dialed, "reason", "identity does not match the pinned key",
+				"pinned", short(pinned), "proven", short(p.id))
+			_ = sc.Close()
+			return
+		}
+	}
 
 	// Protocol version + capability negotiation: drop peers speaking an
 	// incompatible version, and record capabilities (e.g. Dandelion++) for feature
@@ -820,6 +860,7 @@ func (n *Node) handleConn(rawConn net.Conn, inbound bool, dialed string) {
 
 	n.addPeer(p)
 	defer n.removePeer(p)
+	established = true
 	// A completed handshake is the only evidence that an address is a real node,
 	// so this is what promotes it from the `new` table to `tried` — and `tried`
 	// is what outbound selection prefers on the next start.
@@ -974,9 +1015,11 @@ func (n *Node) handleMessage(p *peer, m Message) {
 		if len(m.Locator) > 0 { // locator-based: reply from just after the fork point
 			from = n.chain.LocatorFork(m.Locator) + 1
 		}
-		if hs := n.chain.HeadersFrom(from, maxHeadersBatch); len(hs) > 0 {
-			p.send(Message{Type: MsgHeaders, Headers: hs})
-		}
+		// The answer names where it starts, and is sent even when empty: a
+		// light client cross-checking its tip (FetchHeadersAfter) learns "you
+		// are at my tip" from an empty batch at From, where silence would only
+		// look like a dead peer. A node receiving an empty batch ignores it.
+		p.send(Message{Type: MsgHeaders, From: from, Headers: n.chain.HeadersFrom(from, maxHeadersBatch)})
 
 	case MsgHeaders:
 		n.onHeaders(p, m.Headers)

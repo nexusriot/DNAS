@@ -33,9 +33,10 @@ a number, or a hex-encoded byte string.
 ## Reproducing the keys
 
 Every key in the corpus derives from one fixed BIP39 mnemonic, recorded in the
-`mnemonic` field. Derivation is `HMAC-SHA512(seed, "dnas/ed25519" || uint32be(index))`,
-truncated to 32 bytes and used as an Ed25519 seed (see
-[`wallet/hd.go`](../../wallet/hd.go) — note this is *not* SLIP-0010). Ed25519
+`mnemonic` field. Derivation is SLIP-0010 for Ed25519 (hardened only) along
+`m/44'/9999'/0'/0'/index'`, the 32-byte child key used as an Ed25519 seed (see
+[`wallet/slip10.go`](../../wallet/slip10.go); `9999` is `DNASCoinType`, not a
+registered coin type). Ed25519
 signing is deterministic (RFC 8032), so the same key over the same message
 yields byte-identical signatures in any correct implementation: the signatures in
 this file are reproducible, not merely valid.
@@ -91,6 +92,8 @@ one that admits its edges:
 - **No negative-space proof.** The corpus shows that these inputs produce these
   outputs. It cannot show that no *other* input is mishandled — that is what
   fuzzing and a second implementation are for.
-- **The state root is a sorted-leaf Merkle fold**, so it proves account
-  membership but not absence. If that construction changes, every value in
-  `state_roots` and every `headers` entry changes with it.
+- **No trie proofs.** The state root is the root of a sparse Merkle trie keyed
+  by the hash of the address (see [`core/trie.go`](../trie.go)); `state_roots`
+  pins the roots, not membership or absence proofs against them. If that
+  construction changes, every value in `state_roots` and every `headers` entry
+  changes with it.

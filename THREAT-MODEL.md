@@ -54,7 +54,7 @@ DNAS is a learning project. Do not point it at the internet.
 | Spending an orphaned reward | `CoinbaseMaturity` (3 blocks) | Reorgs stay shallower than 3 blocks. Thin, though less so since the target block time became 60s |
 | Deep history rewrite | `MaxReorgDepth` (100) + operator checkpoints | See §5: this is also a liveness hazard. A refusal is now counted, logged and surfaced by `/health` rather than silent |
 | Oversized/expensive blocks | `MaxBlockBytes`, `MaxBlockTxs`, `MaxBlockVerifyOps`, `MaxCoinbaseBytes` | The verification-cost model matches real cost |
-| Timestamp manipulation | Median-time-past, `MaxFutureDrift` (120s), plus a bounded median-of-peers clock offset ([core/nettime.go](core/nettime.go)) | Peers are majority-honest. The offset is capped at `MaxTimeOffset` (70 min), so a hostile peer set moves the clock at most that far |
+| Timestamp manipulation | Median-time-past, `MaxFutureDrift` (120s; regtest allows a day via its per-network `FutureDrift`), plus a bounded median-of-peers clock offset ([core/nettime.go](core/nettime.go)) | Peers are majority-honest. The offset is capped at `MaxTimeOffset` (70 min), so a hostile peer set moves the clock at most that far |
 | A corrupt store after a failed reorg | The suffix is committed to a checksummed side file before the log is touched; a failed apply poisons the store, and the next open finishes the reorg from the side file ([core/reorgcommit.go](core/reorgcommit.go)) | A commit record whose side file fails its checksum is refused, and recovery from that is manual |
 
 ### Networking
@@ -65,7 +65,7 @@ DNAS is a learning project. Do not point it at the internet.
 | **Outbound eclipse** | Address manager: tried/new tables, per-group cap on live outbound peers ([node/addrman.go](node/addrman.go)) | Same /16 approximation; an attacker with addresses in many ranges still wins |
 | Gossip flooding memory | Bounded tables with eviction, per-group entry caps | — |
 | Peer resource abuse | Per-peer token bucket, ban scoring, per-message-type frame caps ([node/framecap.go](node/framecap.go)) — a frame's type (binary or JSON) is peeked and an oversized one refused before its body is allocated; encrypted frames are at most 1 MiB, so an unauthenticated connection cannot make the node allocate more per frame | — |
-| Expensive header requests | A `getheaders` locator is resolved by walking down from the tip against at most 128 hashes | — |
+| Expensive header requests | A `getheaders` locator is at most 128 hashes, each one lookup in the chain's hash index | — |
 | Stratum socket exhaustion | 1024 sessions overall, 64 per address; 30s to authorize, 10 min idle deadline | — |
 | A peer that stops reading | Every peer send has a 20s write deadline; a peer that misses it is disconnected | Without it one stalled socket froze relay node-wide |
 | Censoring the next block by hash | A block's hash enters the seen-set only after it validates, so an empty or bogus body sent under the real block's hash no longer makes the node ignore the real one | — |
@@ -74,7 +74,8 @@ DNAS is a learning project. Do not point it at the internet.
 | PPLNS share inflation | A duplicate share on the same tip is rejected (stratum and `/submitshare`) | — |
 | Passive eavesdropping | Encrypted, authenticated transport ([node/secure.go](node/secure.go)) | — |
 | Replaying, reordering or reflecting frames | A key per direction and a counter nonce the reader requires in order | — |
-| **Active MITM on the handshake** | **None.** The open handshake is anonymous | Safety rests on connecting to many peers. No key pinning yet |
+| Transport downgrade | The handshake carries a version byte; each side's byte is bound into its send key, so a rewritten one breaks the session | `MinTransportVersion` is raised when an old version must stop being spoken |
+| **Active MITM on the handshake** | Identity pinning: a configured peer written `<pubkey>@host:port` must prove that key or the dial is dropped ([node/pin.go](node/pin.go)); the light client's `-peers` take the same form | Only pinned dials are covered. An unpinned or inbound connection is still anonymous, and safety there rests on connecting to many peers |
 | Transaction origin linkage | Dandelion++ stem/fluff | Anonymity set is tiny on a small network |
 | Hostile bootstrap | DNS seeds enter the `new` table with no special standing, subject to the same diversity cap; consulted only when short of peers | Configure more than one seed. A single seed *is* an eclipse vector |
 
@@ -87,7 +88,7 @@ DNAS is a learning project. Do not point it at the internet.
 | Memory amplification | Paged reads; `http.MaxBytesReader` on every write endpoint (413) | — |
 | Key theft at rest | PBKDF2 + AES-256-GCM when `DNAS_WALLET_PASSPHRASE` is set | **Unencrypted by default** |
 | Secrets in `ps` | Passphrase and API token come from the environment, never flags | Environment is readable by the same user |
-| Node identity leaking the operator's address | Identity is a separate key from the wallet | Only if `-nodekey` is actually used |
+| Node identity leaking the operator's address | Identity is a separate key from the wallet (`-nodekey`, default `nodekey.json` beside the chain) | The daemon always uses one; only an embedded node given no identity falls back to the wallet key, with a warning |
 
 ### Light clients
 
@@ -95,13 +96,13 @@ DNAS is a learning project. Do not point it at the internet.
 |---|---|---|
 | Fake payment | Merkle inclusion proof against a PoW-verified header | Client verifies the header chain itself |
 | A forged header chain at minimum difficulty | SPV, fastsync and the header cache require each header's `Bits` to equal the LWMA retarget (`core.ValidateHeaderDifficulty`), not merely to be met; the browser verifier does the same for every header its run holds the retarget window beneath (`core.ValidateHeaderRunDifficulty`) | The first 21 headers of a run anchored mid-chain cannot be checked; the result says how many were |
-| A txid changed in relay | Script witness hex must be lowercase to be relayed | Policy, not consensus: a miner can still include a mutated copy |
+| A txid changed in relay | Script witness hex must be lowercase to be relayed, and to be mined once `canonicalwitness` is active | Below the activation height it is policy only: a miner can still include a mutated copy |
 | Fake balance | State proof against the header's state root, bound to the queried address (`core.VerifyAccountProofFor`) — a valid proof about a *different* account is refused | — |
 | **"You were never paid"** | An **absence proof** against the header's trie state root ([core/state.go](core/state.go)); compact filters additionally give probabilistic block-level non-inclusion | Both answers are trustless once `filtercommit` is active: the filter's header is in the proof-of-work preimage, so a forged filter does not fold to the committed value. Below that height the filter answer still rests on honest-node/multi-peer |
 | Being lied to about which address a name points at | The name record is in the state trie, so a resolution — and the absence of a registration — is provable against a PoW-verified header ([core/name.go](core/name.go)) | The client actually checks, rather than reading `/name/{name}`. `dnas name resolve` proves by default; `-trust` opts out |
 | Being shown a block that is not in the chain | An ancestry proof against the Merkle Mountain Range the later header commits ([core/mmr.go](core/mmr.go)) | `historyroot` is active at both heights; below it, ancestry still means holding every header in between |
 | A client's own verifier being wrong | Every client runs the SAME code the node runs: WebAssembly in the browser, the `dnas` binary everywhere else | `make wasm` was run for the browser path; otherwise the explorer says its verifier is unavailable rather than guessing |
-| Being served a minority chain | Most-work rule + checkpoints | Client talks to more than one node |
+| Being served a minority chain | Most-work rule + checkpoints. With `-peers`, a light client asks each peer where its chain leaves the API node's and refuses if any peer shows a heavier branch; the tip must be confirmed by `min(2, len(-peers))` of them ([cmd/dnas/crosscheck.go](cmd/dnas/crosscheck.go)) | The client is given `-peers`, and at least one honest peer is among them. A warning is printed when every confirming peer is in one /16 — one operator could be all of them |
 
 ## 4. Trust boundaries
 
@@ -138,7 +139,10 @@ unstated exclusion reads as a claim.
 - **Physical and host security.** A machine with an attacker on it is lost.
 - **Side channels.** No constant-time review beyond the token compare; no
   attempt at timing or memory-access resistance.
-- **Supply-chain integrity.** No reproducible builds, no signed releases.
+- **Supply-chain integrity.** Release builds are reproducible (`make
+  verify-reproducible`) and `SHA256SUMS` is GPG-signed only when `DNAS_SIGN_KEY`
+  is set — unsigned by default — and there is no audit of the dependencies or
+  the toolchain.
 - **Legal and regulatory exposure** of running or distributing a token.
 
 ## 6. Known weaknesses, ranked by what an attacker would actually do
@@ -147,11 +151,13 @@ unstated exclusion reads as a claim.
    not by ASN. An attacker with addresses across enough distinct /16s — cheap at
    cloud providers — still fills a node's outbound set. Raises cost; does not
    settle it.
-2. **No MITM authentication on the handshake.** An attacker on the path can be
-   any peer. Peer-key pinning is possible now that node identity is a stable key,
-   but is not implemented.
-3. **Local clock trusted for timestamp rules.** A node with a skewed clock can be
-   fooled on MTP and future-drift checks.
+2. **No MITM authentication on an unpinned handshake.** An attacker on the path
+   can be any peer the operator did not pin. Pinning (`<pubkey>@host:port`)
+   closes it for the peers named; everything else is still anonymous.
+3. **Local clock trusted for timestamp rules.** The future-drift check uses the
+   local clock adjusted by a median of peer offsets, capped at `MaxTimeOffset`
+   (70 min), so a node with a badly skewed clock — or a hostile peer set within
+   that cap — can still be fooled on it.
 4. **Scheduled protections are inert until an operator schedules them.** The
    filter commitment, the history accumulator, the script VM, the name service
    and non-fungible assets are all height-activated, and every node on a
@@ -228,5 +234,5 @@ Ordered by where the author's confidence most exceeds the evidence:
 
 ---
 
-*Written 2026-09-08 and revised 2026-10-08 against the working tree at the
-time. If the code has moved, this has not.*
+*Written 2026-09-08 and revised 2026-10-08 and 2026-11-15 against the working
+tree at the time. If the code has moved, this has not.*

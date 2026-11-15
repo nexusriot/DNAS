@@ -157,6 +157,7 @@ func NewFromSnapshotWithBodies(s Snapshot, headers []Header, recent []Block) (*B
 		work:    work,
 		undos:   undos, // all nil: no reorg below the snapshot is permitted
 		txIndex: buildTxIndex(blocks),
+		byHash:  buildHashIndex(blocks),
 		assets:  buildAssetIndex(blocks),
 		burned:  burned,
 		// The bodies below the snapshot were never seen, so their filter

@@ -142,9 +142,18 @@ func (n *Node) Unban(key string) error {
 // in hand, rather than quietly doing nothing — an operator adding a peer wants
 // to know whether it took.
 func (n *Node) AddPeer(addr string) error {
+	// The pinned form is accepted here exactly as in -peers. It used to be
+	// taken as the address itself: the API answered "dialing" and the dial of
+	// "<key>@host:port" failed in the background, so the operator saw success
+	// and the node never connected.
+	addr, pinned, err := ParsePeerAddr(addr)
+	if err != nil {
+		return err
+	}
 	if addr == "" {
 		return errors.New("no address given")
 	}
+	n.setPin(addr, pinned)
 	if addr == n.cfg.AdvertiseAddr {
 		return errors.New("that is this node's own address")
 	}

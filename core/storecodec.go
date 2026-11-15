@@ -15,10 +15,12 @@ import (
 // alone are most of the file.
 //
 // This is a compact binary encoding instead. It is explicitly NOT the consensus
-// codec: records here are local to one node, never hashed and never sent to a
-// peer, so the format may change whenever it is worth changing. The only hard
-// requirement is that an older file still loads, which the leading tag byte
-// provides — a JSON record begins with '{', so the two are distinguishable
+// codec: records are never hashed, so the format may change whenever it is
+// worth changing. They are, however, also the P2P block encoding (wirecodec.go
+// exports them), and the record version travels with the bytes, so a new
+// version must stay decodable by the peers that will receive it. The other
+// hard requirement is that an older file still loads, which the leading tag
+// byte provides — a JSON record begins with '{', so the two are distinguishable
 // without guessing.
 //
 // Hex fields are decoded to raw bytes where they are known to be hex of a fixed

@@ -22,7 +22,7 @@ func runFastSync(args []string) {
 	api := fs.String("api", "localhost:8080", "node HTTP API address")
 	cp := fs.String("checkpoint", "", "trusted checkpoint HEIGHT:HASH (the anchor of trust)")
 	heightFlag := fs.Int("height", -1, "snapshot height (default: the server's latest safe height)")
-	peers := fs.String("peers", "", "comma-separated peer addresses; each must report the same filter-header chain as the API node before it is installed")
+	peers := fs.String("peers", "", "comma-separated peer addresses ([<pubkey>@]host:port to pin an identity); each must report the same filter-header chain as the API node before it is installed")
 	netkey := fs.String("netkey", "", "pre-shared key for -peers (empty = the network default, which is open on mainnet)")
 	_ = fs.Parse(args)
 	base := ensureHTTP(*api)

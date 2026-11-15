@@ -123,7 +123,7 @@ func fetchTemplate(base, addr string, longpoll bool, prevTip string) (blockTempl
 
 // longPollHTTP outlives a long poll. The shared client's timeout is tuned for
 // ordinary requests and would cut every long poll short.
-var longPollHTTP = &http.Client{Timeout: longPollTimeout + 15*time.Second}
+var longPollHTTP = &http.Client{Timeout: longPollTimeout + 15*time.Second, Transport: newRetryTransport(nil)}
 
 // longPollTimeout is how long the miner lets a template request hang before
 // asking again. Well under any sensible proxy or firewall idle timeout.

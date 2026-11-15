@@ -23,7 +23,7 @@ dnas htlc new|address|claim|refund [-asset ID]     hash-time-locked contracts (c
 dnas htlc swap -hash H -asset-owner A -coin-owner B ...   derive both legs of an asset-for-coin swap
 dnas vault address|spend                           time-delayed vault: cold key now, hot key from a height
 dnas spv [-api URL] sync|verify <txhash>|scan|balance|history <address>   light client (headers/proof/filters/state)
-dnas spv [-peers LIST] [-netkey KEY] sync|scan|history ...                 cross-check filter headers against P2P peers
+dnas spv [-peers LIST] [-netkey KEY] sync|scan|history ...                 cross-check the tip (and filter headers) against P2P peers; [<pubkey>@]host:port pins one
 dnas spv [-api URL] wallet [-f FILE] add|update|status|list|forget          persistent light wallet (incremental, -watch)
 dnas spv [-api URL] wallet -key FILE new|send <to> <amount>                 self-custodial light wallet (signs locally)
 dnas spv [-api URL] wallet -key FILE issue <ticker> <supply>                mint a native asset (token)
@@ -65,10 +65,11 @@ dnas version                     print the build version (stamped via -ldflags)
 Running a node with an interactive terminal — or with `-console`, which forces it
 on so a script can drive it — also starts a **console** (`repl.go`) covering the
 same ground the HTTP API does, read straight out of the running node: `info`,
-`balance` (with assets), `peers`, `mempool [list]`, `tx`, `assets`, `supply`,
-`stats`, `health`, `reorgs`, `prune`, `webhooks`, `mine`, `generate`, and a
+`balance` (with assets), `address`, `peers`, `mempool [list]`, `tx`, `assets`, `supply`,
+`stats`, `health`, `reorgs`, `prune`, `webhooks`, `mine`, `generate`, a
 `send` that takes `fee=`, `expiry=`, `lock=` and `memo=` words (quoted runs stay
-together, so a memo can contain spaces). It is the only way to look at a node
+together, so a memo can contain spaces), and a `sendmany` that pays several
+`addr:amount` pairs in one transaction. It is the only way to look at a node
 whose API is unreachable, which is when it is most wanted. The commands are a
 table, so `help` cannot drift from what exists. It shuts down cleanly on
 SIGINT/SIGTERM. The `spv` subcommand (`spv.go`) is a standalone light client
@@ -171,8 +172,20 @@ its recipient twice.
 
 `dnas spv` keeps its verified headers between runs (`headercache.go`, `-cache`),
 so a command downloads only what is new. The cache is trustless — a batch must
-link onto it and carry valid proof of work, and a reorg below its tip discards it
-— and each `spv wallet` keeps its own beside its state file.
+link onto it and carry valid proof of work, and a reorg below its tip discards it,
+as does a node whose (shorter) tip is not on it — and each `spv wallet` keeps its
+own beside its state file. With `-peers`, `spv` (`crosscheck.go`) also asks each
+peer over the P2P protocol where its chain leaves the API node's, and refuses
+outright if any peer shows a branch with more work, or if fewer than
+min(2, peers given) confirm the tip; a peer that does not answer, or whose
+headers do not check out, simply fails to count as a confirmation.
+
+Every CLI read goes through one HTTP client (`spvHTTP`, plus the miner's
+long-poll client) whose transport (`httpretry.go`) waits out a **429** for as
+long as the node's `Retry-After` says, up to 5 s a time and 4 retries, within
+the request's own deadline. GET and HEAD only: a POST may already have taken
+effect. Without it, one `fastsync -peers …` against a node on default limits ran
+out of burst part way through.
 
 `dnas node -printconfig` (`printconfig.go`) prints the effective configuration:
 flags merged over `-config` with the defaults resolved, then exits without

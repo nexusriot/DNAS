@@ -106,11 +106,12 @@ func TestGetHeadersReply(t *testing.T) {
 	if len(got) != 1 || got[0].Type != MsgHeaders || len(got[0].Headers) != 1 {
 		t.Fatalf("getheaders should return available headers: %+v", got)
 	}
-	// Past the tip: no reply.
+	// Past the tip: an EMPTY answer that names where it starts, so a light
+	// client can tell "nothing after this" from a dead peer.
 	p2, buf2 := bufPeer()
 	n.handleMessage(p2, Message{Type: MsgGetHeaders, From: 99})
-	if got := sentMsgs(t, buf2); len(got) != 0 {
-		t.Fatalf("getheaders past the tip should not reply: %+v", got)
+	if got := sentMsgs(t, buf2); len(got) != 1 || got[0].Type != MsgHeaders || len(got[0].Headers) != 0 || got[0].From != 99 {
+		t.Fatalf("getheaders past the tip should answer an empty batch from 99: %+v", got)
 	}
 }
 

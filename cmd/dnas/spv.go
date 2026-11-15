@@ -18,23 +18,26 @@ import (
 // it never downloads block bodies or trusts the node's balances.
 //
 //	dnas spv [-api URL] [-peers a,b] [-netkey KEY] sync
-//	dnas spv [-api URL] verify <txhash> prove a transaction is in the chain
+//	dnas spv [-api URL] [-peers a,b] verify <txhash> prove a transaction is in the chain
 //	dnas spv [-api URL] [-peers a,b] scan <address>
-//	dnas spv [-api URL] balance <addr>  prove an address's balance against the state root
+//	dnas spv [-api URL] [-peers a,b] balance <addr>  prove an address's balance against the state root
 //	dnas spv [-api URL] [-peers a,b] history <addr>
 //	dnas spv [-api URL] wallet ...      persistent light wallet (add/update/status/list/forget)
 //
-// -peers is two or more node addresses that speak the peer protocol. scan and
-// history ask them for the filter-header chain and require they agree with
-// each other and with the API node before a filter non-match is treated as
-// absence. One peer cannot confirm that, so fewer than two leaves the HTTP
-// behavior unchanged. -netkey is the shared key those peers expect; empty uses
+// -peers is node addresses that speak the peer protocol, each optionally
+// pinned to its node identity as <pubkey>@host:port. Every command that
+// verifies the header chain first asks each peer where its chain leaves the
+// API node's (crosscheck.go): a peer holding a branch with more work is
+// refused outright, and the tip must be confirmed by min(2, len(-peers)) of
+// them. scan and history also ask them for the filter-header chain and require
+// they agree with each other and with the API node before a filter non-match is
+// treated as absence; one peer cannot confirm that, so it needs two or more. -netkey is the shared key those peers expect; empty uses
 // the network default, which is no key on an open net.
 func runSPV(args []string) {
 	fs := flag.NewFlagSet("spv", flag.ExitOnError)
 	api := fs.String("api", "localhost:8080", "node HTTP API address")
 	cache := fs.String("cache", "spvheaders.json", "verified-header cache file (empty disables it and refetches every time)")
-	peers := fs.String("peers", "", "comma-separated peer addresses; two or more must agree on filter headers before a non-match counts as absence")
+	peers := fs.String("peers", "", "comma-separated peer addresses ([<pubkey>@]host:port); each is asked where its chain leaves the API node's, a heavier branch is refused, and two or more must agree on filter headers before a non-match counts as absence")
 	netkey := fs.String("netkey", "", "pre-shared key for -peers (empty = the network default, which is open on mainnet)")
 	_ = fs.Parse(args)
 	spvCachePath = *cache
@@ -60,7 +63,7 @@ func runSPV(args []string) {
 	if len(spvPeers) == 1 {
 		// Ignoring the flag silently would let the operator believe a
 		// non-match had been cross-checked when it had not.
-		fmt.Println("warning: -peers needs two or more addresses; filter headers will NOT be cross-checked")
+		fmt.Println("warning: with one -peers address the tip is cross-checked but filter headers are NOT; give two or more")
 	}
 
 	switch rest[0] {
@@ -149,6 +152,10 @@ func verifyHeaderChain(headers []core.Header) (uint64, *big.Int, error) {
 	// Each header's own target is self-declared; require the one the chain's
 	// retarget demands, or a server can forge the chain at the easiest target.
 	if err := core.ValidateHeaderDifficulty(headers, 1); err != nil {
+		return 0, nil, err
+	}
+	// A valid chain is not necessarily THE chain: with -peers, ask them.
+	if err := crossCheckSPVTip(headers); err != nil {
 		return 0, nil, err
 	}
 	work := new(big.Int)
@@ -538,7 +545,7 @@ func spvBalance(base, addr string) error {
 	return nil
 }
 
-var spvHTTP = &http.Client{Timeout: 8 * time.Second}
+var spvHTTP = &http.Client{Timeout: 8 * time.Second, Transport: newRetryTransport(nil)}
 
 func ensureHTTP(addr string) string {
 	if !strings.HasPrefix(addr, "http") {

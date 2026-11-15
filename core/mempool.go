@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strings"
 	"sync"
 )
 
@@ -1112,31 +1111,4 @@ func (m *Mempool) Select(bc *Blockchain, max int) []Transaction {
 		ops += best.ops
 	}
 	return selected
-}
-
-// canonicalScriptHex is relay policy against witness malleability: a script
-// spend's predicate and witness items must be lowercase hex.
-//
-// Hex is case-insensitive when decoded, so "ab" and "AB" are the same witness
-// to the script VM — but the txid hashes the text, and the witness is not
-// covered by the signature (it cannot be: it CONTAINS the signature). So
-// anyone relaying a script spend could flip the case of a witness item and
-// produce a second, equally valid transaction with a different id, which
-// breaks anything that tracks a payment by txid. Every wallet here writes
-// lowercase; refusing anything else at the mempool stops honest nodes from
-// relaying the mutated copy. It is policy rather than consensus, so blocks
-// already mined are unaffected.
-func canonicalScriptHex(tx Transaction) error {
-	if tx.Script == nil {
-		return nil
-	}
-	if tx.Script.Script != strings.ToLower(tx.Script.Script) {
-		return errors.New("non-canonical script: hex must be lowercase")
-	}
-	for i, a := range tx.Script.Args {
-		if a != strings.ToLower(a) {
-			return fmt.Errorf("non-canonical witness item %d: hex must be lowercase", i)
-		}
-	}
-	return nil
 }

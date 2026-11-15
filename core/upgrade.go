@@ -180,6 +180,22 @@ const UpgradeHistoryRoot = "historyroot"
 // existing chain replays under the old formula below the activation height.
 const UpgradeByteBaseFee = "bytebasefee"
 
+// UpgradeCanonicalWitness, once active, requires a script spend's predicate
+// and witness items to be lowercase hex.
+//
+// Hex decodes case-insensitively, so "ab" and "AB" are the same witness to the
+// script VM, but the transaction id hashes the text — and the witness is not
+// covered by the signature, because it contains the signature. Anyone relaying
+// a script spend could therefore flip the case of a witness item and get a
+// second, equally valid transaction with a different id. The mempool has
+// refused such copies as relay policy since the review pass; this makes it a
+// rule a miner cannot ignore either, so a script spend has exactly one id.
+//
+// It is a tightening: a block that includes a non-canonical script spend is
+// invalid from the activation height on. Every wallet here already writes
+// lowercase, and below the height an existing chain replays unchanged.
+const UpgradeCanonicalWitness = "canonicalwitness"
+
 var (
 	upgradesMu sync.RWMutex
 	upgrades   = map[string]uint64{}
@@ -192,7 +208,7 @@ var (
 var knownUpgrades = []string{UpgradeDustLimit, UpgradeMultiOutput, UpgradeVault,
 	UpgradeFeeSponsor, UpgradeCheckedAddresses, UpgradeUniqueCoinbase, UpgradeAssetOps,
 	UpgradeFilterCommit, UpgradeHistoryRoot, UpgradeNonFungible, UpgradeNameService, UpgradeScript,
-	UpgradeByteBaseFee}
+	UpgradeByteBaseFee, UpgradeCanonicalWitness}
 
 // Upgrades lists the upgrade names this build understands.
 func Upgrades() []string { return append([]string(nil), knownUpgrades...) }

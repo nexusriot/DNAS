@@ -19,6 +19,7 @@ go build -o dnas-tui .
 # spend YOUR key instead of the node's: signed locally, the node only ever
 # receives a signed transaction
 ./dnas-tui -api localhost:8080 -key mine.json -dnas ./dnas
+#   (-wallet FILE: the light-wallet state file used with -key; default spvwallet.json)
 ```
 
 Keys: `s` send · `v` verify a transaction (SPV) · `w` watch a transaction to
@@ -67,4 +68,7 @@ at startup rather than in the middle of a payment.
   and stderr (the log lines) apart, because a merged stream has no reliable last
   line — and reading the outcome from the output, because a refusal the CLI
   handles itself is printed with a zero exit status.
+- `uri.go` — parses a pasted `dnas:` payment URI for the send prompt; its own
+  copy rather than an import of `core.ParsePaymentURI`, since this module imports
+  no DNAS package.
 - `main.go` — the bubbletea model/update/view and local-node launcher.

@@ -130,14 +130,16 @@ deliberate choice for readability: balances and replay protection are a small
 map rather than a set of coins to track.
 
 ```go
-type Account struct { Balance uint64; Nonce uint64; Assets map[string]uint64 }
+type Account struct { Balance uint64; Nonce uint64; Assets map[string]uint64
+                      Owner string; Expires uint64 } // Owner/Expires: name records only (§5.7)
 ```
 
 - **Balances** are integer base units. `Coin = 100_000_000` (1 DNAS), so amounts
   on the wire and in state never touch floating point.
 - **Nonces** are per-account and strictly sequential. A transaction must use the
   sender's next nonce, which prevents replay and orders a sender's transactions.
-- Chain state is a `map[address]Account` derived by applying blocks in order. It
+- Chain state is an address → `Account` store (`StateDB`: a map by default,
+  disk-backed with `-diskstate`) derived by applying blocks in order. It
   is never trusted from the wire; it is recomputed from validated blocks.
 
 **Native assets (tokens).** Besides the base coin, an account may hold balances of
@@ -167,9 +169,12 @@ type Transaction struct {
     Outputs          []Output        // OR pay many recipients at once (see below)
     AssetID          string          // move this native asset instead of coin (§4)
     Issue            *AssetIssue     // OR mint a new native asset to From (§4)
+    AssetOp          *AssetOp        // issuer mints more of / burns an existing asset
+    Name             *NameOp         // name-service operation (§5.7)
     PubKey, Signature string         // single-key authorization (both hex)
     Multisig         *MultisigScript // OR multisig authorization
     Signatures       []string        // hex
+    Script           *ScriptAuth     // OR script authorization (§5.6)
     HTLC             *HTLCScript     // OR hash-time-locked-contract authorization
     Preimage         string          // hex; revealed on the HTLC claim branch
     Vault            *VaultScript    // OR time-delayed vault authorization (§5.2)
@@ -180,8 +185,9 @@ type Transaction struct {
 ```
 
 **Signing.** The signed message (`signingBytes`) covers every consensus-relevant
-field (From/To/Amount/Fee/Nonce/Expiry/LockUntil/AssetID/Issue/Memo, plus Outputs
-and FeePayer when present, and the NETWORK ID — see §5.1) but **not** the
+field (From/To/Amount/Fee/Nonce/Expiry/LockUntil/AssetID/Issue/Memo, plus Outputs,
+FeePayer, AssetOp, an NFT issuance's Metadata and Name when present, and the
+NETWORK ID — see §5.1) but **not** the
 signature fields. Crucially it is *identical* for single-key and multisig
 transactions, so the two authorization paths sign the same bytes. (A native-asset
 transfer or issuance is an ordinary single-key spend by `From`; the fee is always
@@ -550,6 +556,12 @@ there is no second signing format to drift. The witness itself cannot be
 covered by a signature inside it, so it is covered by the txid instead, which
 the block's merkle root commits once mined.
 
+That leaves the witness's *spelling* open: hex decodes case-insensitively, so
+the same witness written in another case is a valid spend with a different
+txid. The mempool refuses non-lowercase script and witness hex as relay policy,
+and `UpgradeCanonicalWitness` (`-upgrades canonicalwitness:HEIGHT`) makes it a
+block rule, so from its height a script spend has exactly one id.
+
 [core/scriptbuild.go](core/scriptbuild.go) writes the four hard-coded shapes in
 the language. That is the specification by example, and it is also where the
 witness ORDER for each is documented: the stack is filled bottom-first, so an
@@ -641,8 +653,10 @@ than a matter of trusting whoever answered; see §14.
 
 `core/merkle.go` builds the shared merkle fold (`MerkleProof`, `VerifyMerkleProof`);
 an odd level duplicates its last node (Bitcoin's rule), and proof and root use the
-same rule so they agree. `core/state.go` reuses that fold over the sorted account
-set to produce the `StateRoot` and account-membership proofs.
+same rule so they agree. The `StateRoot` is *not* that fold: it is the root of an
+authenticated sparse Merkle trie keyed by the hash of the address
+([core/trie.go](core/trie.go), [core/state.go](core/state.go)), so an account
+proof can show absence as well as membership.
 
 **Transaction index.** Finding *which* block holds a txid used to mean scanning
 every block body on every lookup, which put an O(chain × txs) walk behind
@@ -707,9 +721,14 @@ flapping). It is *not* Bitcoin first-seen, which is per-node and wouldn't
 converge here.
 
 **Median-time-past.** A block's timestamp must exceed the median of the last 11
-timestamps, and may not be more than `MaxFutureDrift` seconds ahead of local
-time. This bounds timestamp manipulation of the retarget while tolerating small
+timestamps, and may not be more than `MaxFutureDrift` seconds ahead of network
+time (the local clock adjusted by a median of peer offsets, capped at
+`MaxTimeOffset` — [core/nettime.go](core/nettime.go)). This bounds timestamp manipulation of the retarget while tolerating small
 out-of-order stamps — stricter "strictly increasing" would reject honest jitter.
+Regtest allows a day instead of 120 s (`NetworkParams.FutureDrift`): it mines on
+demand faster than the clock, a second of timestamp per block, and it does not
+retarget, so the bound protects nothing there and only stopped `/generate`
+about 120 blocks into a burst.
 
 **Reorgs with undo logs.** The chain keeps a per-block **undo log**
 (`[][]undoEntry`). `AddBlock` applies a block incrementally and records how to
@@ -740,10 +759,10 @@ config), which refuses an unknown name outright — a misspelled upgrade that
 silently never activates means being forked off a network where the others did.
 The first two were `UpgradeMultiOutput`, which gates multi-recipient transfers
 (§5), and `UpgradeDustLimit`, a worked example that rejects coin transfers below
-`DustThreshold`; thirteen exist now (`knownUpgrades`: `dustlimit`, `multioutput`,
+`DustThreshold`; fourteen exist now (`knownUpgrades`: `dustlimit`, `multioutput`,
 `vault`, `feesponsor`, `checkedaddresses`, `uniquecoinbase`, `assetops`,
 `filtercommit`, `historyroot`, `nonfungible`, `nameservice`, `script`,
-`bytebasefee`). Besides *height* activation, an upgrade can be put to a miner
+`bytebasefee`, `canonicalwitness`). Besides *height* activation, an upgrade can be put to a miner
 version-bit vote (BIP9, [`core/versionbits.go`](core/versionbits.go)): the
 header carries a `Version` field, `-deployments name:bit:start:timeout:window:threshold`
 defines a vote, `-signalbits` sets which bits this node's miner signals, and
@@ -1073,6 +1092,19 @@ Either way, peers are still cryptographically identified afterwards by their
 Ed25519 node identity (below). The handshake sends and receives concurrently so it
 also works over `net.Pipe` (used in tests).
 
+The handshake message is `[transport version][X25519 key][salt][HMAC]`. Each side
+advertises its `TransportVersion`; the session runs at the lower of the two, and
+a peer below `MinTransportVersion` is refused with an error naming both numbers.
+The message layout is the one thing a version may never change — it is read
+before the version is known — while the key schedule, nonces and framing after
+it are the version's to choose. Each side's advertised version is mixed into the
+key for the traffic it sends, so an on-path attacker who rewrites the byte (on an
+open network the HMAC key is empty, so the HMAC alone cannot stop that) produces
+two sides with different keys and a session whose first frame fails. Transport
+v2 is the current and minimum version: a key per direction, a frame counter as
+the nonce (so frames cannot be replayed, reordered or reflected) and frames of at
+most 1 MiB. v1 — one key, random nonces, no version byte — cannot connect.
+
 **Peer identity — and why it is NOT the wallet key.** The handshake yields a
 deterministic session id; each peer then signs it with its **Ed25519 node
 identity** (`MsgIdentity`), so peers are cryptographically identified, not merely
@@ -1088,6 +1120,17 @@ key file ([node/identity.go](node/identity.go), `-nodekey`, default
 `nodekey.json` beside the chain), holding no coin and needing no backup — losing
 it costs a node its accumulated peer reputation and nothing else. An in-process
 node with no identity given still falls back to the wallet, and says so at WARN.
+
+**Identity pinning** ([node/pin.go](node/pin.go)). Because the identity is a stable
+key, an operator can name it: a configured peer written `<pubkey>@host:port`
+must prove that key after the handshake, or the dial is dropped (logged, not
+banned — a rotated key and an attacker on the path both look like this, and a
+ban would punish neither). It covers the connections a node DIALS, which are the
+ones whose identity the dialer has an opinion about, and turns "an attacker on
+the path can be any peer" into "an attacker on the path can be any peer you did
+not pin". Pins come only from configuration: gossiped addresses carry none, and
+a pinned address is gossiped without its pin. The light client's `-peers` accept
+the same form.
 
 **Self-connections.** Two connections cannot be told apart by address: a node
 advertising `:3000` is reached as `localhost:3000`, and a string comparison sees
@@ -1120,7 +1163,8 @@ the wire format can evolve; a peer on a *different network* is dropped too (§5.
 — its genesis and its signatures are not ours, so the connection could only ever
 fail to converge. A peer predating network names sends none, which reads as
 mainnet. Capabilities (`dand` for Dandelion++, `mpool` for mempool
-reconciliation) let optional features be negotiated per-connection without a
+reconciliation, `txinv` for announcement-based transaction relay, `cf` for
+compact filters over the wire) let optional features be negotiated per-connection without a
 version bump.
 
 **Mempool reconciliation.** Transactions are otherwise only ever *pushed* as they
@@ -1173,8 +1217,11 @@ is headers-first; forks transfer only the divergent suffix:
 | Purpose            | Messages                                   |
 |--------------------|--------------------------------------------|
 | Handshake/identity | `MsgHello`, `MsgIdentity`                  |
-| Tx gossip          | `MsgTx`                                    |
+| Tx gossip          | `MsgTxInv` → `MsgGetTx` → `MsgTxs` (with the `txinv` capability; `MsgTx` push otherwise) |
+| Mempool reconciliation | `MsgGetMempool` → `MsgMempool`         |
 | Block announce/pull| `MsgInv` → `MsgGetData` → `MsgBlock`       |
+| Compact block relay| `MsgCmpctBlock` → `MsgGetBlockTxn` → `MsgBlockTxn` (missing transactions only; full fetch if the merkle root does not reproduce) |
+| Compact filters    | `MsgGetCFilters` → `MsgCFilters`, `MsgGetCFHeaders` → `MsgCFHeaders` |
 | Headers-first sync | `MsgGetHeaders` (+ block locator) → `MsgHeaders` |
 | Ranged body sync   | `MsgGetBlocks` → `MsgBlocks` (several ranges in flight, tracked and timed out) |
 | Deep-fork/bootstrap fallback | `MsgGetChain` → `MsgChain`       |
@@ -1249,7 +1296,8 @@ next one once the OS recycled its port.
 ## 12. Persistence
 
 `core/store.go` is an **append-only, length-framed block log** (`blockStore`:
-4-byte length + JSON frame per block, with offsets, corrupt-tail truncation, and
+4-byte length + a binary record per block (`core/storecodec.go`; older JSON
+records still load), with offsets, corrupt-tail truncation, and
 a foreign-file guard). `Blockchain.Open(path)` backs a chain with it so:
 
 - `AddBlock` persists in O(1) (one append), and
@@ -1344,7 +1392,7 @@ it.
 its whole size in RAM. `-prune N` (`core/prune.go`) keeps the state and every
 header for all time and drops the bodies deeper than N, replacing them with the
 same header-only placeholders a fast-synced node already uses below its snapshot
-(`blockFromHeader`) — which is why nothing in validation, supply accounting or
+(`BlockFromHeader`) — which is why nothing in validation, supply accounting or
 maturity had to change.
 
 Three things make that safe rather than merely smaller:
@@ -1372,11 +1420,13 @@ location holding nothing is worse than a miss); the **asset registry** does not,
 because an asset issued at height 5 still exists and is still held — what is lost
 is the transaction that issued it, not the fact of it.
 
-Pruning is a memory bound, not a disk one: the append-only store still holds
-every block and a restart replays it (see [ROADMAP](ROADMAP.md) §1).
+Pruning bounds disk as well as memory: compaction (above) rewrites the store so
+pruned heights keep only header-only records, and a restart bootstraps from the
+sidecar snapshot rather than replaying bodies it no longer has.
 
-**Soft state.** Beside the authoritative chain, a node also persists three
-*conveniences* to the same directory (`peers.json`, `bans.json`, `mempool.json`),
+**Soft state.** Beside the authoritative chain, a node also persists four
+*conveniences* to the same directory (`peers.json`, `addrs.json` — the address
+manager's `tried` table, §11 — `bans.json`, `mempool.json`),
 loading them on start and rewriting them on graceful shutdown. This lets a
 restart resume warm — known peers, accrued ban scores, and pending transactions
 survive instead of resetting — while the chain stays the single source of truth
@@ -1393,9 +1443,10 @@ torn files.
 **Addresses.** `dnas` + `hex( sha256(pubkey)[:20] ‖ checksum[4] )`, where the
 checksum is `sha256("dnas" ‖ body)[:4]`. `ValidateAddress` verifies prefix,
 length, and checksum so a mistyped recipient fails validation instead of burning
-coins. (Checksums are enforced **client-side** — in `/send` and the console — not in
-consensus, to avoid a validation cascade; a malicious client can still burn its
-own coins.)
+coins. (Checksums are enforced **client-side** — in `/send` and the console — and
+reach consensus only once the `checkedaddresses` upgrade is scheduled
+(`UpgradeCheckedAddresses`); until then a malicious client can still burn its own
+coins.)
 
 **At-rest encryption.** Key files can be encrypted with PBKDF2 + AES-256-GCM,
 opt-in via the `DNAS_WALLET_PASSPHRASE` env var (kept out of flags so it doesn't
@@ -1403,8 +1454,12 @@ leak into `ps`).
 
 **BIP39 + HD.** A wallet can be backed up as a BIP39 mnemonic (vendored canonical
 English wordlist, PBKDF2 seed) that deterministically derives many addresses.
-Derivation is `HMAC-SHA512(seed, "dnas/ed25519" ‖ index)` → an Ed25519 seed — a
-simple, deterministic HD scheme, explicitly **not** SLIP-0010.
+Derivation is **SLIP-0010** for Ed25519 ([wallet/slip10.go](wallet/slip10.go)),
+hardened-only, at `m/44'/9999'/account'/0'/index'` (`DNASCoinType` is an
+unregistered 9999), so a mnemonic restores the same addresses in any SLIP-0010
+wallet told the coin type. The original one-level scheme,
+`HMAC-SHA512(seed, "dnas/ed25519" ‖ index)`, survives as `DeriveLegacy` for
+restoring old backups.
 
 **Multisig.** `MultisigAddress(threshold, pubKeysHex)` sorts the keys (so the
 address is order-independent) and hashes them into the *same* address format and
@@ -1455,7 +1510,7 @@ a client with headers alone can:
    header's Merkle root.
 
 `Blockchain.FindTxProof` serves a `TxProof` (block index, confirmations, Merkle
-root, proof steps). The API exposes `/headers`, `/header/{index}`,
+root, proof steps). The API exposes `/headers`, `/header/{index}` (or `{hash}`),
 `/proof/{txhash}`; `dnas spv` is a real light client that trusts only headers;
 and the web explorer does the same fold in-browser by running `core` compiled
 to WebAssembly (`cmd/wasmverify`, built by `make wasm`).
@@ -1472,6 +1527,24 @@ serves `/cfilter/{index}`, `/cfilters`, and a BIP157-style filter-header chain a
 `/cfheaders`; `dnas spv scan <addr>` PoW-verifies the headers, checks each filter
 is bound to its header and consistent with the filter-header chain, then reports
 matches and how many blocks the address is provably absent from.
+
+**Cross-checking the tip** ([cmd/dnas/crosscheck.go](cmd/dnas/crosscheck.go)).
+Every proof a light client checks is checked against a header chain that the
+API node also served, and proof of work says only that a chain cost something,
+not that it is the chain. So with `-peers`, before anything else, the client
+sends each peer a locator built from the verified headers
+(`core.HeaderLocator`) and the peer answers with its headers after the highest
+block they share (`node.FetchHeadersAfter`; a node now answers `getheaders`
+even when it has nothing newer, naming where its answer starts). The client
+validates that answer — linkage, work, and the retarget's difficulty — and
+classifies the peer as agreeing, ahead, behind, on a lighter branch, or on a
+**heavier** branch. A heavier branch is refused outright: it is direct evidence
+the API node is serving a stale or minority chain, and producing one costs real
+work. An answer that does not check out only fails to count, since lying that
+way is free. The tip must be confirmed (same tip, peer ahead, or peer at most
+two blocks behind) by `min(2, len(-peers))` peers, and a warning is printed when
+every confirming peer sits in one /16 (or IPv6 /32) — the same coarse
+"one operator" proxy the node uses for outbound diversity.
 
 **The filter key, and why it had to move.** Below `UpgradeFilterCommit` the
 SipHash key is the block's own hash, as BIP158 does it, and the filter's
@@ -1509,7 +1582,7 @@ a prover that could choose it could prove anything.
 **State proofs (balances).** Inclusion and non-inclusion are about
 *transactions*; the header's `StateRoot` (§6, §9) lets a client prove *state*.
 `Blockchain.ProveAccount` serves an `AccountProof` — the account's balance and
-nonce plus a merkle path to the tip's `StateRoot` — and `VerifyAccountProof`
+nonce plus a trie path to the tip's `StateRoot`, or proof of its absence — and `VerifyAccountProof`
 folds it. `dnas spv balance <addr>` PoW-verifies the headers, then checks the
 proof folds to the verified header's state root, proving the balance
 trustlessly (`GET /stateproof/{addr}`). `dnas spv history <addr>` combines all
@@ -1570,10 +1643,14 @@ fetched all of it. Headers are self-authenticating — each commits to its
 predecessor's hash and to its own proof of work — so the verified prefix can be
 KEPT ([cmd/dnas/headercache.go](cmd/dnas/headercache.go)) and only the suffix
 downloaded. Trust is unchanged: a fetched batch must link onto the cached tip and
-satisfy `ValidateHeaderChain`, a cache from another network or format version is
+satisfy `ValidateHeaderChain` and `ValidateHeaderDifficulty`, a cache from another network or format version is
 discarded, and a node serving a different hash at a height we already hold is
 treated as a reorg — the cache is dropped and rebuilt, because a client cannot
 tell a reorg from a lie and the honest answer to both is to verify again. The
+same holds when the node serves nothing at the cached tip's height: that is
+"behind on the same chain" only if the node's own tip is a header the cache
+holds, and otherwise a reorg onto a SHORTER branch (or another chain) — which
+the cache used to miss, returning itself unchecked. The
 filter-header chain is cached alongside for a stronger reason: it is a running
 hash, so a client with a verified prefix folds new filters onto it
 (`core.FoldFilterHeaders`) instead of re-folding from genesis, and a wallet that
@@ -1591,12 +1668,13 @@ placeholders below the snapshot, real state at it), then downloading and *fully*
 validating only the block bodies above it. It reaches the full chain's cumulative
 work without replaying settled history — the balances proven, never trusted.
 Reorgs below the snapshot are impossible by the finality guards (§8), so the
-pruned bodies are never needed. (The fast-synced chain currently runs in memory;
-persisting a pruned chain through the append-only, index-based block store would
-need a base-offset store format and is left as future work.)
+pruned bodies are never needed. (`dnas fastsync` currently runs in memory and
+writes no store, although a compacted pruning store (§12) already persists the
+same shape — header-only records plus a verified state snapshot.)
 
 So this SPV layer proves transaction *inclusion* trustlessly, *non-inclusion*
-under the filter honest-node assumption, and account *balances* (membership)
+under the filter honest-node assumption (or the chain's work, from
+`UpgradeFilterCommit`), and account *balances* — membership and absence —
 against the PoW-committed state root.
 
 ---
@@ -1678,7 +1756,7 @@ with `httptest`). Highlights:
   bounded by the chain — an address appearing in a million transactions has a
   million entries — and it is maintained across reorgs by the same
   unindex-from-the-tip-down discipline as the transaction index.
-- **SPV / filters / state:** `/headers`, `/header/{index}`, `/block/{index}`,
+- **SPV / filters / state:** `/headers`, `/header/{index|hash}`, `/block/{index|hash}`,
   `/proof/{txhash}`, `/cfilters`, `/cfilter/{index}`, `/cfheaders`,
   `/stateproof/{addr}` (a balance proof against the header state root), and
   `/snapshot/{height}` (the full account state at a height, for fast-sync).
@@ -1725,13 +1803,20 @@ with `httptest`). Highlights:
   early on and the HTTP API had nothing, while being the cheaper target of the
   two: no handshake, no protocol, just a URL — and the expensive endpoints are
   plain GETs (`/chain?limit=2000` serializes two thousand blocks, `/snapshot`
-  walks the whole account state, `/stateproof` builds a proof per call). It keys
-  on the IP rather than host:port (a client uses a new source port per request)
-  and deliberately ignores `X-Forwarded-For`: trusting a client-set header would
-  let anyone claim a new identity per request, turning the limiter into a memory
-  allocator for the attacker. `/events` is exempt — it is one long-lived request
-  that then sends many messages, and dropping a live feed because of an unrelated
-  burst of reads would be the wrong answer.
+  walks the whole account state, `/stateproof` builds a proof per call). So a
+  request is charged by **cost**, not counted (`routeCost`): 1 token for a cheap
+  read, 3 for a proof, `/metrics` or an address query, 5 for a whole-state or
+  window pass (`/richlist`, `/series`, `/chainstats`, `/supply`), 30 for
+  `/snapshot` and `/audit`, and 2 plus one per hundred items for a paged bulk
+  read — never more than the burst, so every endpoint stays reachable. It keys
+  on the IP rather than host:port (a client uses a new source port per request;
+  an IPv6 client is keyed by its /64) and deliberately ignores `X-Forwarded-For`:
+  trusting a client-set header would let anyone claim a new identity per
+  request, turning the limiter into a memory allocator for the attacker.
+  `/events` is exempt — it is one long-lived request that then sends many
+  messages, and dropping a live feed because of an unrelated burst of reads would
+  be the wrong answer — and is bounded instead by `MaxEventStreams` (256)
+  node-wide and `MaxEventStreamsPerClient` (8).
 - **What this node can serve:** `/info` publishes `body_height`, `filter_base`
   and the pruning counters, and `/block/{i}`, `/cfilter/{i}` and `/cfheaders`
   answer **410 Gone** rather than 404 for data this node has pruned (§12). The
@@ -1936,7 +2021,7 @@ govern — the proof-of-work targets and `lwmaWindow` in
 | `MaxTickerLen`        | 8                | native-asset ticker length cap            |
 | `MaxAssetSupply`      | 2^62             | native-asset supply cap (overflow-safe)   |
 | `DustThreshold`       | 1000             | min coin transfer once UpgradeDustLimit is active |
-| `MaxFutureDrift`      | 120 s            | how far ahead a timestamp may be          |
+| `MaxFutureDrift`      | 120 s            | how far ahead a timestamp may be (regtest: 1 day) |
 | `DefaultMinRelayFee`  | 10 /byte         | base of the dynamic fee floor (policy, per byte) |
 | `MaxRelayTxBytes`     | 100 000          | largest tx a node will queue/gossip (policy, not consensus) |
 | `MaxPerSender`        | 64               | queued txs one address may hold (policy)  |
@@ -1984,47 +2069,47 @@ govern — the proof-of-work targets and `lwmaWindow` in
 | Decision | Why | Trade-off |
 |----------|-----|-----------|
 | Unbounded PoW difficulty (LWMA, no hard cap) + `NoRetarget` for devnet | Real economic security — rewriting history costs ever-growing work; a devnet still gets instant blocks | Genesis starts easy; security only exists once real hashpower is present |
-| Canonical binary consensus encoding (not JSON) | txid/size/signing are reproducible by any implementation, so a second client can't silently fork | The wire transport is still JSON (a separate efficiency concern) |
-| Height-activated consensus upgrades | Rule changes roll out on a coordinated flag-day, not an uncoordinated fork | No miner version-bit signaling yet (needs a header version field) |
-| Mempool admission checks the sender's confirmed state | Occupying the pool costs real balance, so it cannot be filled for free by an account holding nothing | A recipient cannot spend funds that are still unconfirmed (§21) |
+| Canonical binary consensus encoding (not JSON) | txid/size/signing are reproducible by any implementation, so a second client can't silently fork | The wire transport is a separate encoding (binary records negotiated per peer, JSON still accepted) — two formats besides the consensus one |
+| Height-activated consensus upgrades | Rule changes roll out on a coordinated flag-day, not an uncoordinated fork | Heights are operator configuration; a BIP9 miner vote (`versionbits.go`) is the alternative route to setting one |
+| Mempool admission checks the sender's confirmed state | Occupying the pool costs real balance, so it cannot be filled for free by an account holding nothing | Unconfirmed incoming coin counts only through bounded package relay (§10); a child cannot arrive before its parent |
 | Multi-recipient outputs encoded only when present | The new form costs nothing to add: every existing txid, signature and stored chain stays valid | One transaction shape has two encodings to reason about |
 | Verification cost metered per block, and cached across mempool and chain | A block cannot cost more to check than to produce, and a signature is verified once rather than twice | Another consensus limit to agree on; the cache is memory |
 | Permissionless by default; `-netkey` opt-in for a private net | Anyone can join — the defining property of a cryptocurrency | The open handshake is anonymous (no MITM authentication); safety rests on many peers + identity + eclipse caps |
-| Inbound caps (total + per-IP-group) + per-peer rate limiting | Eclipse/DoS resistance for an open network | Heuristic caps, not a full addrman/ASN-diversity scheme |
+| Inbound caps (total + per-IP-group) + per-peer rate limiting | Eclipse/DoS resistance for an open network | Heuristic caps; the address manager groups by /16, not by ASN (§11) |
 | Account+nonce, not UTXO | Simpler state & replay logic to read | Coinbase maturity needs a history scan instead of per-coin locks |
 | Smaller-tip-hash tie-break | Deterministic → all nodes converge; monotonic → no flapping | Not first-seen; a heavier/smaller-hash block always wins |
 | Coinbase maturity by history scan | No new state, reverses on reorg for free | O(maturity) scan per spend check (tiny here) |
 | Two-layer fees: consensus base fee + relay-policy floor | Base fee (burned, in-header) is a real fee market; the relay floor tunes what a node queues | Two knobs to understand; the relay floor doesn't affect block validity |
 | Base fee committed in the header | Light clients see it; it's covered by PoW; supply drop is verifiable | Changing the header format invalidates old chains (fine for a dev chain) |
-| Fees priced per byte; blocks bounded by bytes | Block space is a metered, priced resource; a big tx pays its share; the mempool ranks by fee rate | A cheap `Size()` (JSON length) approximates real serialized weight |
+| Fees priced per byte; blocks bounded by bytes | Block space is a metered, priced resource; a big tx pays its share; the mempool ranks by fee rate | `Size()` is the canonical encoding's length, not the wire or store form a node actually holds |
 | Base fee *congestion signal* is tx-count until `bytebasefee`, then bytes | Byte signal matches what the fee prices; height activation keeps old chains replaying | Two formulas in the code, selected by height; documented in §9 |
 | Finality: max-reorg-depth + checkpoints | Settled history can't be rewritten; a fresh/lagging node can't be fed a bogus deep chain | A genuinely longer fork past the depth is also refused (a node stuck offline too long must resync from a trusted store) |
 | 256-bit compact target (nBits) + LWMA retarget | Continuous difficulty, smooth per-block retargeting, and fixes the genesis-timestamp collapse | Header change (genesis hash changed); compact encoding is lossy in the low bits |
-| Snapshot fast-sync, verified against the state root | Trustless bootstrap without replaying settled history — composes checkpoints + state roots | The fast-synced (pruned) chain runs in memory; persisting it needs a base-offset store format (future work) |
+| Snapshot fast-sync, verified against the state root | Trustless bootstrap without replaying settled history — composes checkpoints + state roots | `dnas fastsync` runs in memory and writes no store (a pruning node's compacted store persists the same shape, §12) |
 | Dandelion++ on by default | Transaction-origin privacy | Adds relay latency, bounded by the embargo; a small devnet fluffs within a few hops |
 | Light wallet signs locally | A real self-custodial wallet — the key never leaves the client | The next nonce is tracked locally between confirmations |
 | Native assets in the account, committed in the state root | Tokens with light-client-provable balances; `omitempty` keeps coin-only state (and genesis) unchanged | Fees are always coin (no per-asset fee market); it's balances, not a scripting/contract system |
 | External miner protocol (`getblocktemplate`/`submitblock`) | Mining decoupled from the node — hashpower can live elsewhere | A stale template is rejected; the miner refetches |
 | Adversarial sim via an injected transport | Stress reorg/finality/sync/partitions in-process, deterministically | Test-only; a reliable stream transport models latency/partitions, not packet loss |
 | State root in the header, over a TRIE | Light clients prove balances AND that an address holds nothing | Another header field, and the trie root is a consensus change from the earlier Merkle fold |
-| Regtest = on-demand `/generate`, not fast continuous mining | Deterministic, controlled block production; no runaway chain | A separate mode; isolated by netkey rather than a distinct genesis |
+| Regtest = on-demand `/generate`, not fast continuous mining | Deterministic, controlled block production; no runaway chain | A separate mode, with its own genesis and signing preimage (§5.1) as well as its own default netkey |
 | Miner throttles empty blocks by one `TargetBlockTime`, overridable per node | An idle network doesn't fill with coinbase-only blocks | It caps how fast an idle chain advances regardless of hashpower, so devnets and tests must lower `EmptyBlockInterval` rather than wait it out |
 | Network id bound into genesis, the signing preimage and the handshake | A chain and its signatures belong to exactly one network; cross-network replay and accidental peering become impossible | A third thing every node must be configured with identically; mainnet keeps the empty id so nothing already stored changes |
 | Fee sponsorship with no sponsor nonce | An address holding nothing can transact; replay is already prevented by the sender's nonce, and the payer's own in-flight transactions are undisturbed | The pool must track a per-payer total, and a sponsor's affordability is state the sender cannot see |
 | Vault as a third hand-rolled script kind | A real new spending condition (delayed hot key, instant cold recovery) today, reusing the multisig/HTLC plumbing | One more special case consensus must carry until a script VM subsumes it; the height rule costs a second verification |
-| Address index opt-in, in memory | An explorer or wallet on a full node stops re-deriving history from filters | Its size is not bounded by the chain, and it is rebuilt at every startup |
+| Address index opt-in, logged to disk | An explorer or wallet on a full node stops re-deriving history from filters | Its size is not bounded by the chain, and RAM still holds an offset per posting (§21) |
 | Mempool reconciliation once per peer, after catch-up | A node that was offline learns pending payments instead of waiting for a rebroadcast | Asking before catch-up would reject everything (admission needs confirmed state), so it is one request, not a continuous protocol |
 | Shares as pool accounting outside consensus | A pool can pay for hashpower that has not found a block, and the mining path gets exercised far harder | The ledger is unauthenticated and node-local: it is lost on restart and a node operator could fake it |
 | Faucet allowed by the network, not by config | No flag, config key or API call can make a real chain give coin away | Testnet coin is free for anyone who can reach the node; the cooldown is a speed bump, not a defence |
 | Node identity in its own key file, never the wallet | The identity public key goes to every peer, and an address is a hash of a public key — sharing them publishes the node's wallet address | One more file to keep; an in-process node with no identity still falls back to the wallet (with a warning) |
 | Self-connections detected by identity, not address | The same host is reachable under several spellings, so a string comparison cannot see it; identity always can | The alias is only learned by completing a handshake with ourselves once |
-| Bulk reads paged, response shape unchanged | A node can no longer be asked to serialize its whole chain into one response, and clients page instead | Callers must page; and paging bounds the response, not the cumulative fold behind filter headers |
+| Bulk reads paged, response shape unchanged | A node can no longer be asked to serialize its whole chain into one response, and clients page instead | Callers must page; filter headers are served from the incrementally maintained chain (§12), so a page costs its range |
 | Light client keeps its verified headers | A command downloads only what is new instead of the whole chain, which is what "light" was supposed to mean | A cache file per wallet, and a reorg below its tip forces a full rebuild |
 | An unmineable transaction is displaced for free | A vault's cold-key rescue cannot be held hostage by a parked hot-key spend at the same nonce | One narrow exception to replace-by-fee that both the pool and its readers must know about |
 | Reorg history in a bounded in-memory ring | The one question worth asking after a surprise becomes answerable, without unbounded memory | Lost on restart; it is telemetry, not chain state |
 | /health separate from /info, exiting non-zero in the CLI | A supervisor can tell "running" from "usable"; /info answers 200 while syncing, un-peered or stale | Another endpoint, and a readiness policy (stale-tip window) that is a judgement call |
 | Log levels + optional JSON, wrapping the stdlib logger | A node's output can be quietened, turned up, or counted | Two output formats to keep readable; call sites carry key/value fields |
-| Checksums client-side only | Avoids a consensus validation cascade | A malicious client can still burn its own coins |
+| Checksums client-side until `checkedaddresses` activates | Avoids a consensus validation cascade on an existing chain; the upgrade makes it a rule at an agreed height | Below the activation height a malicious client can still burn its own coins |
 | SLIP-0010 HD derivation | A mnemonic written down here restores in a standard wallet, which is what made a fresh address per invoice worth exporting | The pre-SLIP-0010 scheme still has to be derivable (`DeriveLegacy`) for keys made before the change |
 | TUI as its own module | Keeps external deps' `go.sum` off the internal v0.0.0 modules | It cannot import `core` or `wallet` at all — a workspace `use ../core` still resolves `wallet` through the proxy, because the module path looks like a sub-module and Go wants a `wallet/v0.0.0` tag. Multisig/HD go through API helpers, and verification and signing shell out to the binary |
 | Static (CGO-free) binaries | One binary runs on any matching kernel | lintian flags "statically-linked" (acknowledged via an overrides file) |
@@ -2059,8 +2144,8 @@ govern — the proof-of-work targets and `lwmaWindow` in
   transaction/header/Merkle/amount decoding and address/mnemonic validation.
 - **In-process integration tests** (`node/integration_test.go`) spin up multiple
   nodes on ephemeral ports and assert sync/discovery/convergence. They run the real
-  miner, so they shorten `EmptyBlockInterval`: at the production default, three
-  blocks cost 15 s of waiting before any hashing, which under `-race` on a loaded CI
+  miner, so they shorten `EmptyBlockInterval`: at the production default (one
+  60 s `TargetBlockTime`), three blocks cost three minutes of waiting before any hashing, which under `-race` on a loaded CI
   runner ate the entire deadline. `node/lifecycle_test.go` covers the other half of
   that story — that `Shutdown` really stops the node's loops, so nodes left behind
   by a finished test can't slow down or interfere with the next one.
@@ -2113,11 +2198,12 @@ govern — the proof-of-work targets and `lwmaWindow` in
   undefined"; and a CLI flag written *after* a positional argument
   (`dnas assets show ID -api URL`) silently queried the default node, because
   Go's flag parser stops at the first positional.
-- **What regtest cannot deliver.** Block timestamps advance a second per block
-  and `MaxFutureDrift` is 120 seconds, so a single `/generate` call stops around
-  120 blocks in — a node refuses its own block as too far in the future. Any test
-  needing a deeper chain (pruning's 132-body floor, for instance) belongs in the
-  unit suites, where the chain is built directly, rather than in `e2e/`.
+- **What regtest could not deliver.** Block timestamps advance a second per
+  block and `MaxFutureDrift` was 120 seconds there too, so a single `/generate`
+  call stopped around 120 blocks in — a node refused its own block as too far in
+  the future. Tests needing a deeper chain (pruning's 132-body floor) had to live
+  in the unit suites. Regtest now allows a day of drift, and `e2e/` mines past
+  the prune window and a 300-block chain directly.
 
 - **Performance benchmarks with a recorded baseline**
   ([core/bench_test.go](core/bench_test.go), [scripts/bench.sh](scripts/bench.sh)).
@@ -2147,8 +2233,8 @@ the default runs; `make bench` / `make bench-check` measure and compare.
 
 Everything a node had to say went through `log.Printf` at one volume: every
 accepted block, every peer connect and disconnect, with no way to quieten a busy
-node or turn up detail on one problem. On a chain producing a block every five
-seconds that is a log nobody reads, which is the same as no log at all.
+node or turn up detail on one problem. On a chain then producing a block every
+five seconds that was a log nobody reads, which is the same as no log at all.
 
 `node/logging.go` adds levels (`error`, `warn`, `info`, `debug`; `-loglevel`) and
 an optional machine-readable form (`-logjson`), one JSON object per line with the
@@ -2181,7 +2267,8 @@ it drivable by a script and testable at all.
 ## 20. Build and release
 
 - **[Makefile](Makefile)** is the entry point: `build`, `wasm`, `test`,
-  `test-race`, `bench`, `vet`, `fmt`, `dist`, `deb`, `install`, `demo`.
+  `test-race`, `test-upgrades`, `bench`, `vet`, `fmt`, `dist`, `deb`, `rpm`,
+  `install`, `demo`.
 - **`make wasm`** compiles [cmd/wasmverify](cmd/wasmverify) for `js/wasm` into
   `api/wasmdist/`, alongside the `wasm_exec.js` shim copied from the toolchain
   that built it (the two must match). Both are gitignored build artifacts; the
@@ -2216,12 +2303,13 @@ it drivable by a script and testable at all.
   drops it) and neither does a source tarball, so both silently fell back to a
   hard-coded `0.1.0` or reported `dev`. Now the file is the source of truth and
   git only adds the detail it alone knows — which commit, and whether the tree
-  is dirty: `0.4.0`, `0.4.0+g1a2b3c4`, `0.4.0+g1a2b3c4.dirty`. `VERSION=1.2.3`
+  is dirty: `0.5.0`, `0.5.0+g1a2b3c4`, `0.5.0+g1a2b3c4.dirty`. `VERSION=1.2.3`
   in the environment overrides the lot, and [CHANGELOG.md](CHANGELOG.md) records
   what each release contains (a test fails if the two disagree).
 - **CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs two jobs on
-  every push and pull request: a gofmt check plus `make vet`, `make build` and
-  `make test-race`, and — in parallel — the containerized black-box suite via
+  every push and pull request: a gofmt check plus `make vet`, `make build`,
+  `make test-race` and `make test-upgrades` (the suites again with every
+  consensus upgrade active), and — in parallel — the containerized black-box suite via
   `make e2e-docker` (§19). On a version tag (`v*`), and only if both pass, a
   release job runs `make dist` + `make deb` and uploads the tarballs and `.deb`s
   as build artifacts. Note the trigger is `v*`: the existing `0.2` tag has no
@@ -2240,7 +2328,8 @@ See [scripts/README.md](scripts/README.md) for the script details.
   rather than an ASN**, so an attacker with addresses across enough distinct
   ranges still wins: this raises the cost of an eclipse, it does not settle it.
   There is no proof-of-work/stake peer gating. The open handshake is anonymous —
-  it has no MITM authentication; safety rests on connecting to many peers. Bans
+  it has no MITM authentication unless the operator pins a peer's identity
+  (`<pubkey>@host:port`); otherwise safety rests on connecting to many peers. Bans
   persist across a graceful restart but a hard kill can lose them (re-learned
   from peers).
 - Consensus is defined by a canonical binary encoding (portable across
@@ -2334,8 +2423,9 @@ See [scripts/README.md](scripts/README.md) for the script details.
   on a real network difficulty tracks hashpower without bound; only a devnet /
   regtest (`NoRetarget`) holds it at the easy genesis floor for instant blocks.
 - Snapshot fast-sync bootstraps trustlessly (state verified against the header
-  state root, anchored by a checkpoint) but the resulting pruned chain runs in
-  memory — persisting it through the index-based block store is future work. A
+  state root, anchored by a checkpoint) but `dnas fastsync` runs in memory and
+  writes no store, even though a pruning node's compacted store (§12) already
+  persists the same shape. A
   fast-synced node also cannot fold the filter commitments of bodies it never
   saw, so it reports `filter_base` above its snapshot and answers 410 below it:
   it can validate the chain it has, and it cannot serve a light client the old
@@ -2440,9 +2530,10 @@ See [scripts/README.md](scripts/README.md) for the script details.
   proof-of-work variance means a short window describes luck as much as
   hashpower; a window whose blocks share a timestamp reports no rate at all
   rather than an infinite one.
-- Paging bounds responses, not always work: a range of filter headers still
-  requires folding the chain from genesis, since that chain is cumulative. A
-  client holding its own verified prefix (the SPV header cache) pays neither.
+- Paging bounds responses, and for filter headers the work too: the node keeps
+  the cumulative chain incrementally (§12) and serves a page as a slice of it. A
+  client holding its own verified prefix (the SPV header cache) folds new
+  filters onto it instead of refetching the chain.
 - `/health`'s stale-tip window is a fixed multiple of `TargetBlockTime`, not
   something the operator can tune.
 
@@ -2480,7 +2571,7 @@ See [scripts/README.md](scripts/README.md) for the script details.
   That is the intended behaviour: the fallback IS the bug class being removed.
 
 Each limitation is a chosen stopping point. [ROADMAP.md](ROADMAP.md) turns this
-list into a prioritized plan (on-disk state trie, second implementation, script
-VM, addrman/BIP152, and the rest).
+list into a prioritized plan (reading state through the trie, a second
+implementation, and the rest).
 
 It is a toy. Do not point it at the internet.

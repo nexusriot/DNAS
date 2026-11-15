@@ -53,12 +53,24 @@ type NetworkParams struct {
 	// Faucet allows the node to give coin away on request (see the node's faucet).
 	// Never true on mainnet: a faucet exists to make a throwaway chain usable.
 	Faucet bool
+	// FutureDrift is how many seconds ahead of network time a block may claim;
+	// zero means MaxFutureDrift.
+	//
+	// Regtest needs more, because it mines faster than the clock: /generate
+	// stamps each block at least one second after its parent, so a burst runs
+	// ahead of real time by a second per block. At the 120 s used elsewhere it
+	// failed after about 120 blocks ("timestamp too far in the future") and stayed
+	// failing until the clock caught up — which broke the ordinary regtest uses,
+	// maturing coinbases and building a long chain to test against. The bound
+	// exists to stop timestamp games with the difficulty, and regtest does not
+	// retarget, so a day costs nothing there.
+	FutureDrift int64
 }
 
 var networks = map[string]NetworkParams{
 	MainNet: {Name: MainNet, ID: "", DefaultNetKey: "", NoRetarget: false, Faucet: false},
 	TestNet: {Name: TestNet, ID: "dnas-testnet", DefaultNetKey: "", NoRetarget: false, Faucet: true},
-	RegTest: {Name: RegTest, ID: "dnas-regtest", DefaultNetKey: "dnas-regtest", NoRetarget: true, Faucet: true},
+	RegTest: {Name: RegTest, ID: "dnas-regtest", DefaultNetKey: "dnas-regtest", NoRetarget: true, Faucet: true, FutureDrift: 24 * 3600},
 }
 
 var (
@@ -97,6 +109,15 @@ func Network() NetworkParams {
 	networkMu.RLock()
 	defer networkMu.RUnlock()
 	return network
+}
+
+// FutureDrift is how many seconds ahead of network time a block on the network
+// in force may claim (see NetworkParams.FutureDrift).
+func FutureDrift() int64 {
+	if d := Network().FutureDrift; d > 0 {
+		return d
+	}
+	return MaxFutureDrift
 }
 
 // NetworkName is the name of the network in force.

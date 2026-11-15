@@ -46,13 +46,13 @@ const (
 	MsgGetBlocks  MsgType = "getblocks"  // request a range of block bodies
 	MsgBlocks     MsgType = "blocks"     // a batch of block bodies
 
-	// Whole-chain exchange, used only as a fork/bootstrap fallback.
 	// Compact filters over the wire (BIP157/158-shaped), gated on CapCFilters.
 	MsgGetCFilters  MsgType = "getcfilters"  // request filters for a height range
 	MsgCFilters     MsgType = "cfilters"     // the filters for that range
 	MsgGetCFHeaders MsgType = "getcfheaders" // request the filter-header chain
 	MsgCFHeaders    MsgType = "cfheaders"    // that stretch of the filter-header chain
 
+	// Whole-chain exchange, used only as a fork/bootstrap fallback.
 	MsgGetChain MsgType = "getchain"
 	MsgChain    MsgType = "chain"
 

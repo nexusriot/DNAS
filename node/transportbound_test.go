@@ -32,11 +32,11 @@ func (c *bufConn) SetWriteDeadline(time.Time) error { return nil }
 func securePair(t *testing.T) (a, b *secureConn, aOut, bIn *bytes.Buffer) {
 	t.Helper()
 	key := bytes.Repeat([]byte{7}, 32)
-	ka, err := directionCipher(key, []byte("pubA"), []byte("saltA"))
+	ka, err := directionCipher(key, []byte{TransportVersion}, []byte("pubA"), []byte("saltA"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	kb, err := directionCipher(key, []byte("pubB"), []byte("saltB"))
+	kb, err := directionCipher(key, []byte{TransportVersion}, []byte("pubB"), []byte("saltB"))
 	if err != nil {
 		t.Fatal(err)
 	}

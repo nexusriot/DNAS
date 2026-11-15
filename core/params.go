@@ -132,6 +132,7 @@ const (
 	DefaultMinRelayFee uint64 = 10
 	// MaxFutureDrift is how many seconds ahead of local time a block may claim
 	// before we reject it (loosely; late blocks are accepted once time passes).
+	// A network may allow more (regtest does): see FutureDrift.
 	MaxFutureDrift int64 = 120
 
 	// EIP-1559-style base fee, priced PER BYTE. Unlike the mempool's relay floor

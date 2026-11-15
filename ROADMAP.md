@@ -108,8 +108,8 @@ sections matter most for "toy → real".
 
   What remains: (a) the restart replay is O(chain) — a tip marker in the file
   header would let a clean restart skip it; (b) `Lookup` has no error return,
-  so a read error on the file is indistinguishable from an absent account;
-  (c) memory is still the default, and `-diskstate` has not been benchmarked
+  so a read error on the file panics rather than being something a caller can
+  handle; (c) memory is still the default, and `-diskstate` has not been benchmarked
   against a large ledger.
 - ~~**`[M]` Prune the STORE, not just memory.**~~ **Done.** `-prune` bounded a
   node's resident size while the file kept every original record, so a pruning
@@ -278,12 +278,10 @@ sections matter most for "toy → real".
   by ASN**. Two ranges can share an operator, so this raises the cost of an
   eclipse rather than settling it. Real ASN diversity needs routing data this
   project has no business shipping.
-- **`[M]` Authenticated / Tor-friendly transport.** The open handshake is anonymous
-  and has no MITM authentication (§21). Optional peer-key pinning, an onion
-  transport, and NAT traversal would harden and widen reach without giving up the
-  permissionless default. Peer-key pinning now has something to pin: a node's
-  identity is a stable key of its own ([node/identity.go](node/identity.go))
-  rather than its wallet key.
+- **`[M]` Authenticated / Tor-friendly transport.** *Peer-key pinning is done*
+  (`<pubkey>@host:port` in `-peers`, for nodes and light clients). The rest — an
+  onion transport and NAT traversal — would widen reach without giving up the
+  permissionless default; an unpinned handshake is still anonymous (§21).
 - ~~**`[M]` Network-adjusted time.**~~ **Done.** Timestamp validation read the
   local clock, which made one machine's wrong clock that machine's consensus
   problem: an hour behind and it rejects every block the network produces; an
@@ -332,9 +330,12 @@ sections matter most for "toy → real".
   `dnas fastsync -peers …` dial each peer, do the node handshake with an
   ephemeral identity, page the filter-header chain
   ([node/lightclient.go](node/lightclient.go)), and refuse a split with the API
-  node before a non-match counts as absence. What remains is that filters and
-  blocks themselves still come over HTTP from one node; only the header chain
-  that binds them is cross-checked.
+  node before a non-match counts as absence. Every `dnas spv` command that
+  verifies the header chain also asks each `-peers` peer where its chain leaves
+  the API node's ([cmd/dnas/crosscheck.go](cmd/dnas/crosscheck.go)): a heavier
+  branch is refused, and the tip must be confirmed by min(2, peers). What
+  remains is that filters and blocks themselves still come over HTTP from one
+  node; only the header chain that binds them is cross-checked.
 
 ## 3. Programmability
 

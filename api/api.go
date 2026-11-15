@@ -4,6 +4,7 @@ package api
 import (
 	"crypto/subtle"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -277,6 +278,7 @@ func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 		MinRelayFee:    s.node.Mempool().MinFee(),
 		BaseFee:        chain.NextBaseFee(),
 		Peers:          s.node.PeerAddrs(),
+		Identity:       s.node.IdentityKey(),
 		Addrs:          s.node.AddrStats(),
 		Mining:         s.node.Mining(),
 		AddressIndex:   chain.AddressIndexed(),
@@ -757,6 +759,9 @@ func (s *Server) mine(w http.ResponseWriter, r *http.Request) {
 // generate mines N blocks immediately (regtest only): POST {"n": N}. It is the
 // on-demand block primitive for tests and demos, so they don't wait on the idle
 // mining interval. Refused with 403 outside regtest.
+// maxGenerate bounds one /generate request.
+const maxGenerate = 10000
+
 func (s *Server) generate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeErr(w, http.StatusMethodNotAllowed, "POST only")
@@ -772,6 +777,12 @@ func (s *Server) generate(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.N <= 0 {
 		req.N = 1
+	}
+	// One request mines synchronously, so an unbounded n was a single call
+	// that kept the node mining for as long as the caller liked.
+	if req.N > maxGenerate {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf("n is at most %d per request", maxGenerate))
+		return
 	}
 	hashes, err := s.node.Generate(req.N)
 	if err != nil {
@@ -1420,10 +1431,9 @@ func (s *Server) headers(w http.ResponseWriter, r *http.Request) {
 
 // header returns a single block header by height: /header/{index}.
 func (s *Server) header(w http.ResponseWriter, r *http.Request) {
-	idxStr := strings.TrimPrefix(r.URL.Path, "/header/")
-	idx, err := strconv.ParseUint(idxStr, 10, 64)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid height")
+	idx, status, msg := s.blockRef(strings.TrimPrefix(r.URL.Path, "/header/"))
+	if status != 0 {
+		writeErr(w, status, msg)
 		return
 	}
 	h, ok := s.node.Chain().HeaderAt(idx)
@@ -1434,14 +1444,34 @@ func (s *Server) header(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, h)
 }
 
-// block returns a single full block body by height: /block/{index}. A light
+// blockRef resolves the {ref} of /block/{ref} and /header/{ref}: a decimal
+// height, or a 64-character block hash looked up in the chain's hash index.
+// A hash that is not on the active chain — never seen, or reorganized away —
+// is 404, the same answer as a height above the tip. On success status is 0.
+func (s *Server) blockRef(ref string) (height uint64, status int, msg string) {
+	if len(ref) == 64 {
+		if _, err := hex.DecodeString(ref); err == nil {
+			h, ok := s.node.Chain().HeightOf(strings.ToLower(ref))
+			if !ok {
+				return 0, http.StatusNotFound, "no such block on the active chain"
+			}
+			return h, 0, ""
+		}
+	}
+	h, err := strconv.ParseUint(ref, 10, 64)
+	if err != nil {
+		return 0, http.StatusBadRequest, "invalid height or block hash"
+	}
+	return h, 0, ""
+}
+
+// block returns a single full block body by height or hash: /block/{ref}. A light
 // client fetches only the blocks its compact filter flagged, rather than the
 // whole chain.
 func (s *Server) block(w http.ResponseWriter, r *http.Request) {
-	idxStr := strings.TrimPrefix(r.URL.Path, "/block/")
-	idx, err := strconv.ParseUint(idxStr, 10, 64)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid height")
+	idx, status, msg := s.blockRef(strings.TrimPrefix(r.URL.Path, "/block/"))
+	if status != 0 {
+		writeErr(w, status, msg)
 		return
 	}
 	b, err := s.node.Chain().BlockBodyAt(idx)

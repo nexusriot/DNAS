@@ -24,9 +24,16 @@ Module `github.com/nexusriot/DNAS/wallet` — key management for DNAS.
   temp file and a rename, since an interrupted write must not leave a truncated
   backup where the previous good one was; it refuses an empty passphrase, and a
   malformed nonce is rejected rather than panicking inside GCM.
+- **Bech32m spelling** (`bech32.go`: `ToBech32`, `FromBech32`, `IsBech32`,
+  `NormalizeAddress`) — an interchange encoding of the same 20 bytes with a
+  stronger typo-detecting checksum. Clients accept either spelling and normalize
+  to the canonical `dnas`+hex one before signing; consensus sees only that one.
 - BIP39 mnemonics (`bip39.go`, canonical embedded English wordlist) +
   HD derivation (`hd.go`: `NewHD`, `HDFromMnemonic`, `Derive(index)`) so one
-  seed backs up many addresses.
+  seed backs up many addresses. `Derive` is SLIP-0010 (`slip10.go`:
+  `DeriveAccount`, `DerivePath`, `AccountPath`, hardened
+  `m/44'/coin'/account'/0'/index'`); `DeriveLegacy` keeps the pre-SLIP-0010
+  scheme reachable for mnemonics used before the change.
 - Multisig (`MultisigAddress(threshold, pubkeys)`): the address of an M-of-N
   script, same format/checksum as a normal address.
 - HTLC (`htlc.go`, `HTLCAddress(hashHex, recipientHex, senderHex, timeout)`): the

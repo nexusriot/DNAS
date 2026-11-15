@@ -74,11 +74,25 @@ Module `github.com/nexusriot/DNAS/node` — the peer-to-peer daemon.
 - `secure.go` — `secureConn`: an X25519 handshake + AES-256-GCM encrypted,
   length-framed message stream, with a key per direction, counter nonces the
   reader requires in order, and frames of at most 1 MiB (a longer message
-  spans several). **Permissionless by default** — with no network key
+  spans several). The handshake opens with a transport version byte
+  (`TransportVersion`, `MinTransportVersion`); the session runs at the lower of
+  the two sides' versions, and each side's byte is bound into its send key so a
+  rewritten byte breaks the session rather than downgrading it. **Permissionless by default** — with no network key
   the handshake is anonymous (anyone may connect); a non-empty key authenticates a
   private net (HMAC-gated). Returns a session id used to bind node identities.
 - Node identity: after the encrypted handshake, each side signs the session id
   with its Ed25519 key (`MsgIdentity`) to prove who it is (open net or not).
+- `pin.go` — identity pinning: a configured peer `<pubkey>@host:port`
+  (`ParsePeerAddr`) must prove that key on every dial, or the connection is
+  dropped. Pins come from `-peers` or `AddPeer` (`/addpeer`), never from gossip,
+  and a pinned address is never gossiped with its pin. The node logs its own
+  identity at startup in pin form, and the API reports it in `/info`.
+- `lightclient.go` — the peer-protocol light client: `dialLight` (handshake,
+  identity, optional pin, version), `FetchCFHeaders` / `CompareCFHeaderChains`
+  for filter headers, and `FetchHeadersAfter`, which sends a locator and returns
+  the peer's headers after the fork point — what `dnas spv -peers` uses to
+  cross-check the API node's tip. `getheaders` is always answered, with an empty
+  batch naming its start height when the peer has nothing newer.
 - Eclipse/DoS resistance: inbound connections are admitted (`admitInbound`) under
   a total and per-IP-group cap (loopback exempt); each peer read loop runs a
   token-bucket `rateLimiter` (`ratelimit.go`) and the whole-chain request is
@@ -148,7 +162,7 @@ Module `github.com/nexusriot/DNAS/node` — the peer-to-peer daemon.
   connection, jobs pushed when the tip moves, line-delimited JSON-RPC
   subscribe/authorize/notify/submit. The framing is Stratum's; the job is a DNAS
   candidate block, so it is not Bitcoin-miner compatible and does not pretend to be.
-  Sessions are capped (1024 overall, 64 per address), must authorize within 30s
+  Sessions are capped (1024 overall, 64 per IP), must authorize within 30s
   and are dropped after 10 minutes of silence.
 - `pool.go` — pool accounting: per-miner vardiff share targets and a PPLNS
   payout window (`/pool`), persisted with the node's soft state. The share
@@ -161,8 +175,11 @@ Module `github.com/nexusriot/DNAS/node` — the peer-to-peer daemon.
 - `protocol.go` — the message envelope and message types: `identity`,
   `version` (protocol version + capability negotiation), `hello`,
   `getpeers`/`peers`, `tx` (with a Dandelion++ `stem` flag),
-  `inv`/`getdata`/`block`, `getheaders`/`headers` (+locator),
-  `getblocks`/`blocks`, `getchain`/`chain`, and `ping`/`pong` (keepalive).
+  `txinv`/`gettx`/`txs`, `getmempool`/`mempool`,
+  `inv`/`getdata`/`block`, `cmpctblock`/`getblocktxn`/`blocktxn`,
+  `getheaders`/`headers` (+locator), `getblocks`/`blocks`,
+  `getcfilters`/`cfilters`, `getcfheaders`/`cfheaders`, `getchain`/`chain`,
+  and `ping`/`pong` (keepalive).
 - `dandelion.go` — Dandelion++ transaction relay: a new tx is forwarded down a
   private **stem** to one epoch-stable successor, then **fluffs** into a normal
   broadcast (by chance, on embargo timeout, or when no capable successor exists),
@@ -175,8 +192,8 @@ Module `github.com/nexusriot/DNAS/node` — the peer-to-peer daemon.
   (`simnet_test.go`), for adversarial reorg/finality/sync convergence testing.
 - `events.go` — a tiny in-process publish/subscribe bus. `Node.Subscribe()`
   hands out a buffered `<-chan Event` plus an unsubscribe func; an
-  `Event{Type: "block"|"reorg"|"tx", …}` is emitted on mined/accepted/synced
-  blocks, reorgs, and mempool txs. A slow subscriber drops events rather than
+  `Event{Type: "block"|"reorg"|"tx"|"audit_failed", …}` is emitted on
+  mined/accepted/synced blocks, reorgs, mempool txs, and a failed self-audit. A slow subscriber drops events rather than
   blocking the node. The API's `/events` SSE endpoint consumes it.
 - `webhook.go` — `-webhook URL` POSTs every event to a service that wants to be
   *called* rather than hold an SSE connection open. Delivery runs off a bounded
@@ -186,12 +203,17 @@ Module `github.com/nexusriot/DNAS/node` — the peer-to-peer daemon.
   node's height so a receiver can spot a gap. `WebhookStats` feeds `/webhooks`,
   because a silently failing webhook is otherwise invisible from outside.
 - **Dial backoff** — a failed dial doubles its retry interval up to
-  `dialRetryMax` (5 minutes), and an established connection resets it. A dead
+  `dialRetryMax` (5 minutes), and an established session resets it. A socket
+  that connects but is refused — a pin the peer does not match, a wrong netkey,
+  another network — counts as failed for the backoff (not for the addrman,
+  since the address is reachable); it used to reset the delay, so a stale pin
+  meant a full handshake every 3 seconds forever. A dead
   seed address was previously retried every 3 seconds for the node's whole
   uptime: 1200 attempts an hour, per address, which at the far end looks exactly
   like being scanned.
 - `persist.go` — when `Config.StateDir` is set, the node persists `peers.json`,
-  `addrs.json`, `bans.json`, and `mempool.json` there, loading them on `Start`
+  `addrs.json`, `bans.json`, `mempool.json`, and the share ledger, PPLNS window
+  and reorg log (`shares.json`, `pool.json`, `reorgs.json`) there, loading them on `Start`
   and rewriting them on graceful `Shutdown` (via temp-file+rename). `addrs.json`
   is the address manager's table; its `tried` half is the node's own evidence
   about which peers are real, and losing it means trusting gossip again on every

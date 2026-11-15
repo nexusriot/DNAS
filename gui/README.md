@@ -10,6 +10,7 @@ python3 gui/dnas_gui.py --dnas ./dnas            # then "Launch local node" in t
 
 # spend YOUR key instead of the node's: signed locally by the dnas binary
 python3 gui/dnas_gui.py --api localhost:8080 --key mine.json --dnas ./dnas
+#   (--wallet FILE: the light-wallet state file used with --key; default spvwallet.json)
 ```
 
 Features: live overview (**network**, height, difficulty, work, mempool, **min
@@ -41,7 +42,7 @@ than the node's.
 
 The signing is delegated to the `dnas` binary rather than implemented in Python.
 Doing it here would mean re-implementing Ed25519 signing *and* the canonical
-transaction encoding — and the SPV rot below is exactly what a hand-written copy
+transaction encoding — and the SPV rot above is exactly what a hand-written copy
 of consensus-critical code in a UI turns into. A broken setup is reported before
 the window opens.
 

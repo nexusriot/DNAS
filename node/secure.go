@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -18,8 +19,26 @@ import (
 
 const (
 	handshakeTimeout = 10 * time.Second
-	maxFrame         = 64 << 20 // 64 MiB, an upper bound on a single message
-	handshakeLen     = 32 + 16 + 32
+	maxFrame         = 64 << 20         // 64 MiB, an upper bound on a single message
+	handshakeLen     = 1 + 32 + 16 + 32 // version, X25519 public key, salt, HMAC
+
+	// TransportVersion is the newest encrypted-transport version this build
+	// speaks, and MinTransportVersion the oldest it accepts. Each side opens
+	// the handshake with its TransportVersion; the session runs at the lower
+	// of the two, and a peer below MinTransportVersion is refused with an error
+	// that names both numbers.
+	//
+	// The handshake message itself — version byte, key, salt, HMAC — is the
+	// one thing a version may never change, because it is read before the
+	// version is known. Everything after it (key schedule, nonces, framing) is
+	// the version's to choose: a future v3 branches on secureConn.version, and
+	// a v3 node still talks to a v2 one at v2 until MinTransportVersion moves.
+	//
+	// Version 1 was the original transport: one key for both directions and
+	// random nonces. It had no version byte, so a v1 node cannot even complete
+	// this handshake — which is why the byte now exists.
+	TransportVersion    uint8 = 2
+	MinTransportVersion uint8 = 2
 
 	// maxSecureChunk is the most plaintext one encrypted frame carries. A
 	// message larger than this is split across several frames by Write and
@@ -49,13 +68,14 @@ const (
 // key and random nonces, an on-path attacker could do all three: every frame
 // either side ever sent was a valid frame in both directions, forever.
 type secureConn struct {
-	conn net.Conn
-	send cipher.AEAD
-	recv cipher.AEAD
-	wseq uint64 // counter of the next frame written
-	rseq uint64 // counter the next frame read must carry
-	rbuf []byte // decrypted bytes of the current frame not yet consumed by Read
-	wmu  sync.Mutex
+	conn    net.Conn
+	version uint8 // the negotiated transport version
+	send    cipher.AEAD
+	recv    cipher.AEAD
+	wseq    uint64 // counter of the next frame written
+	rseq    uint64 // counter the next frame read must carry
+	rbuf    []byte // decrypted bytes of the current frame not yet consumed by Read
+	wmu     sync.Mutex
 }
 
 // secureHandshake performs an X25519 key exchange, optionally authenticated by a
@@ -82,10 +102,12 @@ func secureHandshake(conn net.Conn, psk []byte) (*secureConn, []byte, error) {
 		return nil, nil, err
 	}
 	pub := priv.PublicKey().Bytes() // 32 bytes
+	ver := []byte{localTransportVersion}
 	msg := make([]byte, 0, handshakeLen)
+	msg = append(msg, ver...)
 	msg = append(msg, pub...)
 	msg = append(msg, salt...)
-	msg = append(msg, hmacSum(psk, pub, salt)...)
+	msg = append(msg, hmacSum(psk, ver, pub, salt)...)
 
 	// Send and receive concurrently so this works even over a synchronous
 	// (unbuffered) connection such as net.Pipe.
@@ -100,9 +122,13 @@ func secureHandshake(conn net.Conn, psk []byte) (*secureConn, []byte, error) {
 		return nil, nil, err
 	}
 
-	peerPub, peerSalt, peerMAC := in[:32], in[32:48], in[48:80]
-	if !hmac.Equal(peerMAC, hmacSum(psk, peerPub, peerSalt)) {
+	peerVer, peerPub, peerSalt, peerMAC := in[:1], in[1:33], in[33:49], in[49:81]
+	if !hmac.Equal(peerMAC, hmacSum(psk, peerVer, peerPub, peerSalt)) {
 		return nil, nil, errors.New("peer authentication failed (wrong network key)")
+	}
+	version, err := negotiateTransport(ver[0], peerVer[0])
+	if err != nil {
+		return nil, nil, err
 	}
 	pk, err := curve.NewPublicKey(peerPub)
 	if err != nil {
@@ -114,24 +140,48 @@ func secureHandshake(conn net.Conn, psk []byte) (*secureConn, []byte, error) {
 	}
 
 	key := deriveKey(shared, psk, salt, peerSalt)
-	send, err := directionCipher(key, pub, salt)
+	// Each side's ADVERTISED version goes into the key for the traffic it
+	// sends. On an open network nothing else authenticates the version byte, so
+	// an on-path attacker could lower it to force an older transport; with the
+	// byte in the key, a side that saw a different number than the peer sent
+	// derives a different key, and the first frame fails to decrypt.
+	send, err := directionCipher(key, ver, pub, salt)
 	if err != nil {
 		return nil, nil, err
 	}
-	recv, err := directionCipher(key, peerPub, peerSalt)
+	recv, err := directionCipher(key, peerVer, peerPub, peerSalt)
 	if err != nil {
 		return nil, nil, err
 	}
-	return &secureConn{conn: conn, send: send, recv: recv}, sessionID(pub, peerPub, salt, peerSalt), nil
+	sc := &secureConn{conn: conn, version: version, send: send, recv: recv}
+	return sc, sessionID(ver[0], peerVer[0], pub, peerPub, salt, peerSalt), nil
+}
+
+// localTransportVersion is what this node advertises. A variable only so the
+// tests can play an older or newer peer.
+var localTransportVersion = TransportVersion
+
+// negotiateTransport picks the session's version from the two advertised
+// ones: the lower, provided this build still speaks it.
+func negotiateTransport(local, peer uint8) (uint8, error) {
+	v := local
+	if peer < v {
+		v = peer
+	}
+	if v < MinTransportVersion {
+		return 0, fmt.Errorf("peer speaks transport v%d; this node needs at least v%d", peer, MinTransportVersion)
+	}
+	return v, nil
 }
 
 // directionCipher derives the AEAD for the traffic SENT by the side whose
 // handshake contribution is (pub, salt). Both peers compute both directions'
 // keys, so each side's send key is the other's receive key, and the two keys
 // differ because the two contributions do.
-func directionCipher(sessionKey, pub, salt []byte) (cipher.AEAD, error) {
+func directionCipher(sessionKey, ver, pub, salt []byte) (cipher.AEAD, error) {
 	h := hmac.New(sha256.New, sessionKey)
 	h.Write([]byte("dnas-direction-v2"))
+	h.Write(ver)
 	h.Write(pub)
 	h.Write(salt)
 	block, err := aes.NewCipher(h.Sum(nil))
@@ -151,15 +201,17 @@ func counterNonce(seq uint64) []byte {
 // sessionID deterministically derives a per-session identifier from the
 // handshake transcript, ordering the two peers' contributions so both compute
 // the same value regardless of role.
-func sessionID(pubA, pubB, saltA, saltB []byte) []byte {
+func sessionID(verA, verB uint8, pubA, pubB, saltA, saltB []byte) []byte {
 	if bytes.Compare(pubA, pubB) > 0 {
 		pubA, pubB = pubB, pubA
+		verA, verB = verB, verA
 	}
 	if bytes.Compare(saltA, saltB) > 0 {
 		saltA, saltB = saltB, saltA
 	}
 	h := sha256.New()
 	h.Write([]byte("dnas-session-v2"))
+	h.Write([]byte{verA, verB})
 	h.Write(pubA)
 	h.Write(pubB)
 	h.Write(saltA)

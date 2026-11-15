@@ -486,7 +486,7 @@ func runNode(args []string) {
 	listen := fs.String("listen", cfg.str("listen", ":3000"), "p2p listen address")
 	advertise := fs.String("advertise", cfg.str("advertise", ""), "address peers should dial us at (default: -listen)")
 	apiAddr := fs.String("api", cfg.str("api", ":8080"), "HTTP API address")
-	peersStr := fs.String("peers", cfg.str("peers", ""), "comma-separated seed peer addresses")
+	peersStr := fs.String("peers", cfg.str("peers", ""), "comma-separated seed peer addresses; <pubkey>@host:port pins the node identity the peer must prove")
 	dnsSeeds := fs.String("dnsseeds", cfg.str("dnsseeds", ""), "comma-separated DNS seed hostnames to bootstrap from when short of peers")
 	walletPath := fs.String("wallet", cfg.str("wallet", "wallet.json"), "wallet key file (created if missing)")
 	dbPath := fs.String("db", cfg.str("db", "chain.db"), "blockchain append-only store file")

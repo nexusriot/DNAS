@@ -1,7 +1,8 @@
 # DNAS build & packaging.
 #
 # Common targets:  make build | test | dist | deb | install | clean
-# Override VERSION (defaults to `git describe`), PREFIX, PLATFORMS, ARCHES, GO.
+# Override VERSION (defaults to scripts/version.sh: the VERSION file plus git detail),
+# PREFIX, PLATFORMS, ARCHES, GO.
 
 GO        ?= go
 PREFIX    ?= /usr/local

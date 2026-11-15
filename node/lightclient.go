@@ -3,6 +3,7 @@ package node
 import (
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/nexusriot/DNAS/core"
@@ -27,6 +28,158 @@ type CFHeaderSet struct {
 	Headers []string
 }
 
+// lightSession is one completed light-client connection: encrypted,
+// identity-authenticated and version-negotiated, ready for requests.
+type lightSession struct {
+	addr string
+	conn net.Conn
+	sc   *secureConn
+	r    *msgReader
+	w    *msgWriter
+	ver  Message // the peer's version message (caps, version, network)
+}
+
+func (ls *lightSession) Close() error { return ls.conn.Close() }
+
+// dialLight dials a peer and runs the same handshake a node does, with an
+// ephemeral identity (a light client holds no coin). addr may carry a pinned
+// node identity as "<pubkey>@host:port" (see ParsePeerAddr); the peer must
+// then prove it holds that key, or the session is refused.
+func dialLight(addr string, psk []byte, caps []string) (*lightSession, error) {
+	hostport, pinned, err := ParsePeerAddr(addr)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := net.DialTimeout("tcp", hostport, handshakeTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("%s: dial: %w", hostport, err)
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			conn.Close()
+		}
+	}()
+	sc, sid, err := secureHandshake(conn, psk)
+	if err != nil {
+		return nil, fmt.Errorf("%s: handshake: %w", hostport, err)
+	}
+	id, err := wallet.New()
+	if err != nil {
+		return nil, err
+	}
+	w := newMsgWriter(sc)
+	r := newMsgReader(sc)
+	if err := w.Encode(Message{Type: MsgIdentity, PubKey: id.PublicKeyHex(), Sig: id.Sign(sid)}); err != nil {
+		return nil, err
+	}
+	var peer Message
+	_ = sc.SetReadDeadline(time.Now().Add(handshakeTimeout))
+	if err := r.Decode(&peer); err != nil {
+		return nil, fmt.Errorf("%s: identity: %w", hostport, err)
+	}
+	if peer.Type != MsgIdentity || !wallet.Verify(peer.PubKey, peer.Sig, sid) {
+		return nil, fmt.Errorf("%s: identity authentication failed", hostport)
+	}
+	if pinned != "" && !strings.EqualFold(peer.PubKey, pinned) {
+		return nil, fmt.Errorf("%s: identity %s does not match the pinned %s", hostport, short(peer.PubKey), short(pinned))
+	}
+	if err := w.Encode(Message{
+		Type: MsgVersion, Version: ProtocolVersion, Caps: caps,
+		Network: core.NetworkName(), Time: time.Now().Unix(),
+	}); err != nil {
+		return nil, err
+	}
+	_ = sc.SetReadDeadline(time.Now().Add(handshakeTimeout))
+	var ver Message
+	if err := r.Decode(&ver); err != nil {
+		return nil, fmt.Errorf("%s: version: %w", hostport, err)
+	}
+	if ver.Type != MsgVersion || ver.Version < MinProtocolVersion {
+		return nil, fmt.Errorf("%s: incompatible protocol version", hostport)
+	}
+	peerNet := ver.Network
+	if peerNet == "" {
+		peerNet = core.MainNet
+	}
+	if peerNet != core.NetworkName() {
+		return nil, fmt.Errorf("%s is on %s, this client is on %s", hostport, peerNet, core.NetworkName())
+	}
+	w.useBinary(ver.Version)
+	ok = true
+	return &lightSession{addr: hostport, conn: conn, sc: sc, r: r, w: w, ver: ver}, nil
+}
+
+// readFor reads until a message of type want arrives, answering pings so a
+// slow peer is not dropped for silence. Anything else the node sends during
+// the handshake (hello, peer lists, its own header request) is ignored: this
+// client asked one question.
+func (ls *lightSession) readFor(want MsgType) (Message, error) {
+	deadline := time.Now().Add(handshakeTimeout)
+	for i := 0; i < 64; i++ {
+		_ = ls.sc.SetReadDeadline(deadline)
+		var m Message
+		if err := ls.r.Decode(&m); err != nil {
+			return Message{}, err
+		}
+		switch m.Type {
+		case want:
+			return m, nil
+		case MsgPing:
+			_ = ls.w.Encode(Message{Type: MsgPong})
+		}
+	}
+	return Message{}, fmt.Errorf("no %s answer", want)
+}
+
+// HeadersAfter is one peer's answer to a locator: the headers it holds after
+// the highest locator block it shares (Fork), up to one batch.
+type HeadersAfter struct {
+	Addr    string
+	Fork    uint64        // the highest height the locator and the peer share
+	Headers []core.Header // the peer's headers from Fork+1, at most one batch
+}
+
+// FetchHeadersAfter dials addr and asks for the headers after the fork point of
+// locator (see Blockchain.Locator), which is how a light client learns whether
+// a peer is on the same chain as the node it is otherwise talking to, ahead of
+// it, behind it, or on a branch of its own. addr may carry a pinned identity.
+func FetchHeadersAfter(addr string, psk []byte, locator []string) (HeadersAfter, error) {
+	out := HeadersAfter{Addr: addr}
+	if len(locator) == 0 {
+		return out, fmt.Errorf("empty locator")
+	}
+	ls, err := dialLight(addr, psk, nil)
+	if err != nil {
+		return out, err
+	}
+	defer ls.Close()
+	out.Addr = ls.addr
+	if err := ls.w.Encode(Message{Type: MsgGetHeaders, Locator: locator}); err != nil {
+		return out, err
+	}
+	m, err := ls.readFor(MsgHeaders)
+	if err != nil {
+		return out, fmt.Errorf("%s: %w", ls.addr, err)
+	}
+	if len(m.Headers) > maxHeadersBatch {
+		return out, fmt.Errorf("%s: answered %d headers, more than a batch", ls.addr, len(m.Headers))
+	}
+	out.Headers = m.Headers
+	switch {
+	case len(m.Headers) > 0:
+		if m.Headers[0].Index == 0 {
+			return out, fmt.Errorf("%s: answered with a genesis header", ls.addr)
+		}
+		out.Fork = m.Headers[0].Index - 1
+	case m.From > 0:
+		out.Fork = m.From - 1
+	default:
+		return out, fmt.Errorf("%s: an empty answer that names no fork point (a node from before this field)", ls.addr)
+	}
+	return out, nil
+}
+
 // FetchCFHeaders dials addr and returns the filter-header chain for heights
 // from..to inclusive. Errors from the peer are prefixed with addr. psk is the network key; empty is the open network.
 // The identity used for the handshake is ephemeral: a light client holds no coin.
@@ -36,54 +189,14 @@ func FetchCFHeaders(addr string, psk []byte, from, to uint64) (CFHeaderSet, erro
 	if to < from {
 		return out, fmt.Errorf("filter-header range %d..%d is empty", from, to)
 	}
-	conn, err := net.DialTimeout("tcp", addr, handshakeTimeout)
-	if err != nil {
-		return out, fmt.Errorf("%s: dial: %w", addr, err)
-	}
-	defer conn.Close()
-
-	sc, sid, err := secureHandshake(conn, psk)
-	if err != nil {
-		return out, fmt.Errorf("%s: handshake: %w", addr, err)
-	}
-	id, err := wallet.New()
+	ls, err := dialLight(addr, psk, []string{CapCFilters})
 	if err != nil {
 		return out, err
 	}
-	w := newMsgWriter(sc)
-	r := newMsgReader(sc)
-	if err := w.Encode(Message{Type: MsgIdentity, PubKey: id.PublicKeyHex(), Sig: id.Sign(sid)}); err != nil {
-		return out, err
-	}
-	var peer Message
-	_ = sc.SetReadDeadline(time.Now().Add(handshakeTimeout))
-	if err := r.Decode(&peer); err != nil {
-		return out, fmt.Errorf("%s: identity: %w", addr, err)
-	}
-	if peer.Type != MsgIdentity || !wallet.Verify(peer.PubKey, peer.Sig, sid) {
-		return out, fmt.Errorf("%s: identity authentication failed", addr)
-	}
-	if err := w.Encode(Message{
-		Type: MsgVersion, Version: ProtocolVersion, Caps: []string{CapCFilters},
-		Network: core.NetworkName(), Time: time.Now().Unix(),
-	}); err != nil {
-		return out, err
-	}
-	_ = sc.SetReadDeadline(time.Now().Add(handshakeTimeout))
-	var ver Message
-	if err := r.Decode(&ver); err != nil {
-		return out, fmt.Errorf("%s: version: %w", addr, err)
-	}
-	if ver.Type != MsgVersion || ver.Version < MinProtocolVersion {
-		return out, fmt.Errorf("%s: incompatible protocol version", addr)
-	}
-	peerNet := ver.Network
-	if peerNet == "" {
-		peerNet = core.MainNet
-	}
-	if peerNet != core.NetworkName() {
-		return out, fmt.Errorf("%s is on %s, this client is on %s", addr, peerNet, core.NetworkName())
-	}
+	defer ls.Close()
+	addr = ls.addr
+	out.Addr = addr
+	w, ver := ls.w, ls.ver
 	hasCF := false
 	for _, c := range ver.Caps {
 		if c == CapCFilters {
@@ -93,7 +206,6 @@ func FetchCFHeaders(addr string, psk []byte, from, to uint64) (CFHeaderSet, erro
 	if !hasCF {
 		return out, fmt.Errorf("%s does not serve compact filters", addr)
 	}
-	w.useBinary(ver.Version)
 
 	next := from
 	out.From = from
@@ -101,7 +213,7 @@ func FetchCFHeaders(addr string, psk []byte, from, to uint64) (CFHeaderSet, erro
 		if err := w.Encode(Message{Type: MsgGetCFHeaders, From: next, To: to}); err != nil {
 			return out, err
 		}
-		m, err := readCFHeaders(sc, r, w)
+		m, err := ls.readFor(MsgCFHeaders)
 		if err != nil {
 			return out, fmt.Errorf("%s: %w", addr, err)
 		}
@@ -134,28 +246,6 @@ func FetchCFHeaders(addr string, psk []byte, from, to uint64) (CFHeaderSet, erro
 		next += uint64(len(hs))
 	}
 	return out, nil
-}
-
-// readCFHeaders reads until a filter-header answer arrives, answering pings
-// so a slow peer is not dropped for silence. Anything else the node sends
-// during the handshake (hello, peer lists, its own header request) is ignored:
-// this client asked one question.
-func readCFHeaders(sc *secureConn, r *msgReader, w *msgWriter) (Message, error) {
-	deadline := time.Now().Add(handshakeTimeout)
-	for i := 0; i < 64; i++ {
-		_ = sc.SetReadDeadline(deadline)
-		var m Message
-		if err := r.Decode(&m); err != nil {
-			return Message{}, err
-		}
-		switch m.Type {
-		case MsgCFHeaders:
-			return m, nil
-		case MsgPing:
-			_ = w.Encode(Message{Type: MsgPong})
-		}
-	}
-	return Message{}, fmt.Errorf("no filter-header answer")
 }
 
 // CompareCFHeaderChains reports whether every set is the same chain from

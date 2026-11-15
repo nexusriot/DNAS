@@ -10,10 +10,11 @@
 # Git still contributes what only git knows: whether this build is the released
 # commit or something after it. So:
 #
-#   0.4.0                    a clean tree at the commit tagged for that release
-#   0.4.0+g1a2b3c4           built from some other commit
-#   0.4.0+g1a2b3c4.dirty     ...with uncommitted changes
-#   0.4.0                    no git at all (tarball, container)
+#   0.5.0                    a clean tree at the commit tagged for that release
+#   0.5.0+g1a2b3c4           built from some other commit
+#   0.5.0+g1a2b3c4.dirty     ...with uncommitted changes
+#   0.5.0+dirty              the tagged commit, with uncommitted changes
+#   0.5.0                    no git at all (tarball, container)
 #
 # Override the whole thing with VERSION=1.2.3 in the environment.
 set -euo pipefail
@@ -57,7 +58,9 @@ if [ -z "$tagged" ]; then
 	[ -n "$sha" ] && suffix="+g${sha}"
 fi
 if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
-	suffix="${suffix}.dirty"
+	# Semver build metadata starts with "+": the tagged-but-dirty case is
+	# "0.5.0+dirty", not "0.5.0.dirty", which would read as a fourth number.
+	if [ -n "$suffix" ]; then suffix="${suffix}.dirty"; else suffix="+dirty"; fi
 fi
 
 printf '%s%s\n' "$base" "$suffix"

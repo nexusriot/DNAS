@@ -328,7 +328,8 @@ each defence assumes, and what is explicitly out of scope, see
 - **Permissionless, encrypted, identified links.** Every connection begins with a
   symmetric X25519 key exchange and AES-256-GCM encryption — a key per direction
   and a counter nonce, so frames cannot be replayed, reordered or reflected, and
-  frames of at most 1 MiB. By **default there is
+  frames of at most 1 MiB. The handshake opens with a transport version byte, so
+  a later transport can be negotiated instead of splitting the network. By **default there is
   no shared key — the network is open**: anyone may connect (the defining property
   of a cryptocurrency). Supplying a `-netkey` instead authenticates a *private*
   network (a peer without the key fails an HMAC check). Either way each peer proves
@@ -398,9 +399,9 @@ each defence assumes, and what is explicitly out of scope, see
   no longer reset). The chain itself remains authoritative and re-syncs from
   peers regardless.
 - **Optional API auth.** Setting `DNAS_API_TOKEN` locks every mutating endpoint
-  (`/send`, `/tx`, `/mine`, `/generate`, `/submitblock`) behind an
-  `Authorization: Bearer <token>` header (constant-time compared); read endpoints
-  stay open. Unset, the API is fully open — the localhost/toy default. All
+  (`/send`, `/tx`, `/mine`, `/generate`, `/submitblock`, … — the 🔒 rows under
+  HTTP API) behind an `Authorization: Bearer <token>` header (constant-time
+  compared); read endpoints stay open, except the O(ledger) `/audit`. Unset, the API is fully open — the localhost/toy default. All
   bundled clients send the token when the env var is set.
 
 ## Layout
@@ -496,7 +497,7 @@ VERSION=1.2.3 ./scripts/build.sh
 **Versioning.** The release number is in the [VERSION](VERSION) file and
 `scripts/version.sh` turns it into what a build stamps — the bare number on a
 clean tree at the release commit, otherwise with the commit and dirty state
-appended (`0.4.0+g1a2b3c4.dirty`). Keeping it in the tree rather than in a git
+appended (`0.5.0+g1a2b3c4.dirty`). Keeping it in the tree rather than in a git
 tag means the version survives where git does not: the e2e container excludes
 `.git`, and so does a source tarball. `make version` prints it, `dnas version`
 reports what a binary was stamped with, and [CHANGELOG.md](CHANGELOG.md) says
@@ -515,7 +516,7 @@ go run ./cmd/dnas node -listen :3000 -api :8080 -mine
 # encrypt the wallet at rest (also honored by `dnas wallet new/address`)
 export DNAS_WALLET_PASSPHRASE='correct horse battery staple'
 
-# require a bearer token on write endpoints (/send, /tx, /mine); reads stay open
+# require a bearer token on write endpoints (/send, /tx, /mine, …); reads stay open (bar /audit)
 export DNAS_API_TOKEN='a-long-random-secret'
 ```
 
@@ -541,7 +542,7 @@ free.
 | `-listen`    | `:3000`        | p2p listen address                             |
 | `-advertise` | = `-listen`    | address peers should dial us at                |
 | `-api`       | `:8080`        | HTTP API address                               |
-| `-peers`     | —              | comma-separated seed peer addresses            |
+| `-peers`     | —              | comma-separated seed peer addresses; `<pubkey>@host:port` pins the identity the peer must prove |
 | `-dnsseeds`  | —              | DNS seed hostnames (`host` or `host:port`) to bootstrap from when short of peers |
 | `-wallet`    | `wallet.json`  | wallet key file (created if missing)           |
 | `-db`        | `chain.db`     | append-only blockchain store file              |
@@ -572,7 +573,7 @@ free.
 | `-dandelion` | on             | relay new transactions via Dandelion++ stem/fluff (origin privacy) |
 | `-checkpoints` | —            | finality checkpoints, comma-separated `height:hash` pairs |
 | `-emptyinterval` | `0`          | seconds the miner idles before minting an EMPTY block (0 = one target block time, currently 60s) |
-| `-upgrades`  | —              | consensus upgrade activations, comma-separated `name:height` pairs (known: `dustlimit`, `multioutput`, `vault`, `feesponsor`, `checkedaddresses`, `uniquecoinbase`, `assetops`, `filtercommit`, `historyroot`, `nonfungible`, `nameservice`, `script`, `bytebasefee`) |
+| `-upgrades`  | —              | consensus upgrade activations, comma-separated `name:height` pairs (known: `dustlimit`, `multioutput`, `vault`, `feesponsor`, `checkedaddresses`, `uniquecoinbase`, `assetops`, `filtercommit`, `historyroot`, `nonfungible`, `nameservice`, `script`, `bytebasefee`, `canonicalwitness`) |
 | `-deployments` | —            | BIP9 miner votes, comma-separated `name:bit:start:timeout:window:threshold` |
 | `-signalbits` | —             | version bits this node's miner signals, comma-separated (e.g. `0,2`) |
 | `-stratum`   | —              | listen for pool miners on this address (e.g. `:3333`); empty disables it |
@@ -607,7 +608,7 @@ go run ./cmd/dnas node -listen :3001 -api :8081 -peers localhost:3000 -mine \
 
 | Method | Path              | Purpose                                                       |
 |--------|-------------------|---------------------------------------------------------------|
-| GET    | `/info`           | network, height, tip, next difficulty, work, mempool, min relay fee, base fee, peers, mining, address-index/faucet/webhook availability, the address manager's tables (`addrs`: new/tried counts and how many network groups the outbound peers occupy), the on-disk store's size and what compaction has reclaimed (`store`), and what this node can serve (`body_height`, `filter_base`, `pruned`) |
+| GET    | `/info`           | network, height, tip, next difficulty, work, mempool, min relay fee, base fee, peers, this node's `identity` (what others pin it by), mining, address-index/faucet/webhook availability, the address manager's tables (`addrs`: new/tried counts and how many network groups the outbound peers occupy), the on-disk store's size and what compaction has reclaimed (`store`), and what this node can serve (`body_height`, `filter_base`, `pruned`) |
 | GET    | `/chain`          | block bodies, paged: `?from=HEIGHT&limit=N`, or `?last=N` for the newest N |
 | GET    | `/balance/{addr}` | balance (raw + formatted)                                     |
 | GET    | `/account/{addr}` | balance (raw + formatted), nonce, and any native-asset balances |
@@ -625,7 +626,7 @@ go run ./cmd/dnas node -listen :3001 -api :8081 -peers localhost:3000 -mine \
 | GET    | `/peers`          | connected peers in detail (identity, version, caps, direction, uptime, ban score) |
 | GET    | `/bans`           | scored and banned keys, with the threshold                    |
 | POST   | `/unban` 🔒       | `{"key":"…"}` — clear a ban score                             |
-| POST   | `/addpeer` 🔒     | `{"addr":"host:port"}` — dial a peer now                      |
+| POST   | `/addpeer` 🔒     | `{"addr":"[<pubkey>@]host:port"}` — dial a peer now (a pubkey pins its identity) |
 | POST   | `/droppeer` 🔒    | `{"peer":"addr-or-identity"}` — close a connection            |
 | GET    | `/chainstats`     | `?window=N` → hashrate, block intervals, fee flow, miners     |
 | GET    | `/reorgs`         | chain switches this node has lived through                    |
@@ -639,8 +640,8 @@ go run ./cmd/dnas node -listen :3001 -api :8081 -peers localhost:3000 -mine \
 | POST   | `/submitshare` 🔒 | submit a hash meeting the easier **share** target (pool accounting) |
 | GET    | `/shares`         | the share ledger: submitted / accepted / stale, and per-miner totals |
 | GET    | `/headers`        | block headers, paged: `?from=HEIGHT&limit=N` or `?last=N` (SPV) |
-| GET    | `/header/{index}` | one block header (SPV)                                        |
-| GET    | `/block/{index}`  | one full block body (light clients fetch only flagged blocks); **410** when this node has pruned it |
+| GET    | `/header/{index}` | one block header (SPV); `{index}` may also be a 64-hex block hash on the active chain |
+| GET    | `/block/{index}`  | one full block body (light clients fetch only flagged blocks), by height or block hash; **410** when this node has pruned it |
 | GET    | `/proof/{txhash}` | transaction-inclusion merkle proof (SPV)                      |
 | GET    | `/stateproof/{addr}` | proof of an address's balance/nonce vs the header state root — or, for an address with no account, a proof that it holds **nothing** (`found:false`, still verifiable) |
 | GET    | `/snapshot/{height}` | full account state at a height (fast-sync; `/snapshot/latest`) |
@@ -658,7 +659,7 @@ go run ./cmd/dnas node -listen :3001 -api :8081 -peers localhost:3000 -mine \
 | POST   | `/send` 🔒        | `{"to","amount","fee","expiry"?,"lock_until"?,"memo"?,"nonce"?}` — signed by the node wallet |
 | POST   | `/tx` 🔒          | submit a fully-signed transaction (plain / multisig / HTLC / vault / fee-sponsored) |
 | POST   | `/mine` 🔒        | `{"on":bool}` — toggle mining at runtime                      |
-| POST   | `/generate` 🔒    | `{"n":N}` — regtest only: mine N blocks on demand             |
+| POST   | `/generate` 🔒    | `{"n":N}` — regtest only: mine N blocks on demand (at most 10000 per request) |
 | POST   | `/faucet` 🔒      | `{"address":"…"}` — testnet/regtest only: pay out of the node's wallet |
 | POST   | `/multisig/address` | `{"threshold","pubkeys":[…]}` → M-of-N multisig address (stateless helper) |
 | POST   | `/htlc/address`   | `{"hash","recipient","sender","timeout"}` → HTLC address (stateless helper) |
@@ -669,7 +670,10 @@ go run ./cmd/dnas node -listen :3001 -api :8081 -peers localhost:3000 -mine \
 
 Every request is rate-limited per client IP (a token bucket, `-apirate`/
 `-apiburst`, generous enough that a person clicking around the explorer never
-sees it). A refused request answers **429** with `Retry-After`. The limit covers
+sees it). Requests are priced by cost — a cheap read is one token, a proof
+three, a `/snapshot` or `/audit` thirty, a paged read more the more it asks for.
+A refused request answers **429** with `Retry-After`, which the `dnas` CLI
+honours: it waits and retries a refused GET rather than failing part way. The limit covers
 reads as well as writes, because the expensive requests here are reads — a paged
 `/chain`, a `/snapshot`, a `/stateproof`.
 
@@ -710,9 +714,13 @@ dnas spv -api localhost:8080 scan    <address> # find/prove non-inclusion of an 
 dnas spv -api localhost:8080 balance <address> # prove an address's balance against the state root
 dnas spv -api localhost:8080 history <address> # reconstruct a wallet's history (light wallet)
 
-# cross-check the filter-header chain against two or more peers (p2p ports)
-# before a filter non-match is accepted as proof that an address is absent
+# cross-check against peers (p2p ports): every command asks each peer where its
+# chain leaves the API node's and refuses a heavier branch; with two or more,
+# scan/history also require them to agree on the filter-header chain before a
+# non-match is accepted as proof that an address is absent
 dnas spv -api localhost:8080 -peers node-a:3000,node-b:3000 scan <address>
+# pin a peer's node identity (its "identity" in /peers): any other key is refused
+dnas spv -api localhost:8080 -peers <pubkey>@node-a:3000,node-b:3000 balance <address>
 dnas fastsync -api localhost:8080 -peers node-a:3000 <address>
 
 # a regtest node mines on demand instead of waiting on the block interval
@@ -850,7 +858,7 @@ dnas spv wallet -key F cancel <txhash> [fee]
 dnas peers                              # connections, in detail
 dnas peers bans                         # who is scored, and how close to the limit
 dnas peers unban <identity-or-ip>
-dnas peers add <host:port>              # dial now, no restart
+dnas peers add [<pubkey>@]<host:port>   # dial now, no restart (a pubkey pins it)
 dnas peers drop <addr-or-identity>
 dnas stats [-window N]                  # hashrate, block timing, fee flow, miners
 dnas reorgs                             # chain switches this node has lived through
@@ -940,7 +948,7 @@ end to end:
 - **expiry** — a transaction whose expiry is in the past is refused;
 - **fee floor / wallet tools** — the current dynamic minimum relay fee, plus a
   derived 2-of-3 multisig address and a freshly generated BIP39 HD wallet;
-- **SPV** — an independent Python light client fetches a header + merkle proof
+- **SPV** — the light client (`dnas spv verify`) fetches a header + merkle proof
   and verifies the transfer's inclusion (header PoW + proof fold).
 
 `./scripts/htlc-demo.sh` is a focused companion demo: on a single mining node it

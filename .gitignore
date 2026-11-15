@@ -24,9 +24,17 @@ w*.json
 spvwallet*.json
 alice.json
 bob.json
+# The node's soft state (node/persist.go), written beside -db — which can be a
+# subdirectory, so these have no leading slash. The pool's share ledger and
+# PPLNS window are a pool's accounting and the reorg log is an incident record;
+# local state either way.
 peers.json
+addrs.json
 bans.json
 mempool.json
+shares.json
+pool.json
+reorgs.json
 node.json
 *.log
 pid

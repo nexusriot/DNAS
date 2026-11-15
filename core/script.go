@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/nexusriot/DNAS/wallet"
 )
@@ -615,4 +616,31 @@ func smallInt(item []byte) int {
 // merkle root rather than by the signature inside it.
 func SignScriptWitness(w *wallet.Wallet, tx Transaction) string {
 	return w.Sign(tx.signingBytes())
+}
+
+// canonicalScriptHex is the rule against witness malleability: a script
+// spend's predicate and witness items must be lowercase hex. The mempool applies
+// it always (relay policy); blocks are held to it from UpgradeCanonicalWitness.
+//
+// Hex is case-insensitive when decoded, so "ab" and "AB" are the same witness
+// to the script VM — but the txid hashes the text, and the witness is not
+// covered by the signature (it cannot be: it CONTAINS the signature). So
+// anyone relaying a script spend could flip the case of a witness item and
+// produce a second, equally valid transaction with a different id, which
+// breaks anything that tracks a payment by txid. Every wallet here writes
+// lowercase; refusing anything else at the mempool stops honest nodes from
+// relaying the mutated copy, and the upgrade stops a miner including one.
+func canonicalScriptHex(tx Transaction) error {
+	if tx.Script == nil {
+		return nil
+	}
+	if tx.Script.Script != strings.ToLower(tx.Script.Script) {
+		return errors.New("non-canonical script: hex must be lowercase")
+	}
+	for i, a := range tx.Script.Args {
+		if a != strings.ToLower(a) {
+			return fmt.Errorf("non-canonical witness item %d: hex must be lowercase", i)
+		}
+	}
+	return nil
 }
