@@ -53,6 +53,13 @@ type BlockFilter struct {
 	// another is not a mismatch that fails loudly — it silently answers "not in
 	// this block" for addresses that ARE in it, which is precisely the false
 	// negative that makes a non-match an unsound proof of non-inclusion.
+	//
+	// Carried is not the same as trusted. Neither Key nor BlockHash is inside
+	// the filter's commitment (only N and Data are), so a server can keep a
+	// filter that folds to the committed root and swap its key — and every
+	// address in the block then silently fails to match. A client that holds
+	// the header must check both with CheckFilterBinding before a non-match
+	// counts for anything.
 	Key string `json:"key,omitempty"`
 }
 
@@ -102,7 +109,7 @@ func BuildBlockFilter(b Block) BlockFilter {
 	}
 	seed := filterKeySeed(b)
 	if seed != b.Hash {
-		f.Key = seed // the matcher cannot re-derive it; see BlockFilter.Key
+		f.Key = seed // a matcher without the header cannot re-derive it; see BlockFilter.Key
 	}
 	k0, k1 := filterKey(seed)
 	modulus := uint64(n) * gcsM
@@ -321,10 +328,47 @@ func filterKeyFor(b Block) (uint64, uint64) { return filterKey(filterKeySeed(b))
 // is no longer anything it can re-derive from the filter's own BlockHash. So
 // the builder records it (BlockFilter.Key) and the matcher reads it back.
 func filterKeySeed(b Block) string {
-	if !IsUpgradeActive(UpgradeFilterCommit, b.Index) {
-		return b.Hash
+	return filterKeySeedOf(b.Index, b.Hash, b.PrevHash, b.MerkleRoot)
+}
+
+// filterKeySeedOf is filterKeySeed from the four values it actually reads, all
+// of which a header carries — which is what lets a light client check a served
+// filter's key instead of taking it on the server's word (CheckFilterBinding).
+func filterKeySeedOf(index uint64, hash, prevHash, merkleRoot string) string {
+	if !IsUpgradeActive(UpgradeFilterCommit, index) {
+		return hash
 	}
-	return hashBytes([]byte("dnas-cfilter-key:" + b.PrevHash + "|" + b.MerkleRoot))
+	return hashBytes([]byte("dnas-cfilter-key:" + prevHash + "|" + merkleRoot))
+}
+
+// CheckFilterBinding reports whether f is the filter for the block h describes:
+// the same height, the same block hash, and keyed by exactly the digest that
+// block's filter is built with.
+//
+// The filter-header chain (and, from UpgradeFilterCommit, the header's
+// FilterRoot) commits a filter's N and Data — not its Index, BlockHash or Key.
+// Checking the fold alone therefore leaves the key to whoever served the
+// filter, and a wrong key turns every address in the block into a non-match:
+// a forged proof of absence that still folds to the committed root. Every
+// client that treats a non-match as non-inclusion must call this first.
+func CheckFilterBinding(f BlockFilter, h Header) error {
+	if f.Index != h.Index {
+		return fmt.Errorf("filter is for height %d, header is %d", f.Index, h.Index)
+	}
+	if f.BlockHash != h.Hash {
+		return fmt.Errorf("filter %d names block %s, the header is %s", f.Index, short12(f.BlockHash), short12(h.Hash))
+	}
+	// What BuildBlockFilter writes: no key on an empty filter (there is
+	// nothing to hash) or when the seed is the block hash itself, otherwise
+	// the seed. Anything else is not a filter this block produces.
+	want := ""
+	if seed := filterKeySeedOf(h.Index, h.Hash, h.PrevHash, h.MerkleRoot); f.N > 0 && seed != h.Hash {
+		want = seed
+	}
+	if f.Key != want {
+		return fmt.Errorf("filter %d is keyed by %q, its header requires %q", f.Index, short12(f.Key), short12(want))
+	}
+	return nil
 }
 
 // filterKey derives the 128-bit SipHash key from a hex digest (its first 16
@@ -545,6 +589,30 @@ func VerifyCommittedFilter(f BlockFilter, prevRoot, committedRoot string) bool {
 		return false
 	}
 	return folded[0] == committedRoot
+}
+
+// VerifyFilterAgainstHeader is the whole check for a filter served on its own
+// against a header whose proof of work the caller verified: bound to that
+// header (CheckFilterBinding) AND folding, from the parent's committed root,
+// onto the FilterRoot the header itself commits.
+//
+// It takes the header rather than a root so the two halves cannot be fed from
+// different places — a committed root checked in isolation says nothing about
+// which key the filter was matched with. A header below UpgradeFilterCommit
+// commits no root, so there is nothing here to check against and that is an
+// error, not a pass: such a filter is only as good as the filter-header chain
+// the caller confirmed across peers.
+func VerifyFilterAgainstHeader(f BlockFilter, prevRoot string, h Header) error {
+	if err := CheckFilterBinding(f, h); err != nil {
+		return err
+	}
+	if h.FilterRoot == "" {
+		return fmt.Errorf("header %d commits no filter root", h.Index)
+	}
+	if !VerifyCommittedFilter(f, prevRoot, h.FilterRoot) {
+		return fmt.Errorf("filter %d does not fold to the root its header commits", f.Index)
+	}
+	return nil
 }
 
 // AdoptFilterHeaders installs a filter-header chain fetched from a peer,

@@ -14,8 +14,9 @@ import (
 )
 
 // runSPV implements `dnas spv ...`, a standalone light client. It trusts only
-// block headers (which it proof-of-work-verifies) and compact merkle proofs —
-// it never downloads block bodies or trusts the node's balances.
+// block headers (which it proof-of-work-verifies) and what can be checked
+// against them — merkle and state proofs, compact filters, and the few block
+// bodies a filter match calls for. It never trusts the node's balances.
 //
 //	dnas spv [-api URL] [-peers a,b] [-netkey KEY] sync
 //	dnas spv [-api URL] [-peers a,b] verify <txhash> prove a transaction is in the chain
@@ -31,8 +32,11 @@ import (
 // refused outright, and the tip must be confirmed by min(2, len(-peers)) of
 // them. scan and history also ask them for the filter-header chain and require
 // they agree with each other and with the API node before a filter non-match is
-// treated as absence; one peer cannot confirm that, so it needs two or more. -netkey is the shared key those peers expect; empty uses
-// the network default, which is no key on an open net.
+// treated as absence; one peer cannot confirm that, so it needs two or more.
+// The filters and the block bodies a match calls for are then fetched from the
+// peers as well, the API node serving only what no peer could (spvpeers.go).
+// -netkey is the shared key those peers expect; empty uses the network
+// default, which is no key on an open net.
 func runSPV(args []string) {
 	fs := flag.NewFlagSet("spv", flag.ExitOnError)
 	api := fs.String("api", "localhost:8080", "node HTTP API address")
@@ -64,6 +68,11 @@ func runSPV(args []string) {
 		// Ignoring the flag silently would let the operator believe a
 		// non-match had been cross-checked when it had not.
 		fmt.Println("warning: with one -peers address the tip is cross-checked but filter headers are NOT; give two or more")
+	}
+	if len(spvPeers) > 0 {
+		// Filters and block bodies come from the peers too (spvpeers.go).
+		spvPool = newSPVPeerPool(spvPeers, []byte(spvNetKey))
+		defer spvPool.Close()
 	}
 
 	switch rest[0] {
@@ -270,31 +279,18 @@ func verifiedFiltersFrom(base string, from uint64) ([]core.Header, []core.BlockF
 		from = uint64(len(headers))
 	}
 
-	filters, err := fetchFiltersFrom(base, from)
+	if from == uint64(len(headers)) {
+		return headers, nil, nil // nothing new since the last scan
+	}
+	// Each filter is folded onto the last verified filter header and must
+	// reproduce the chain the client holds, and must be bound to its header —
+	// height, block hash AND SipHash key, the parts no fold covers.
+	filters, err := fetchVerifiedFilters(base, headers, cfheaders, from, uint64(len(headers))-1)
 	if err != nil {
 		return nil, nil, err
 	}
 	if got, want := from+uint64(len(filters)), uint64(len(headers)); got != want {
 		return nil, nil, fmt.Errorf("got filters up to height %d for %d headers", got, want)
-	}
-	// Fold the new filters onto the last verified filter header and check they
-	// reproduce what the node advertised.
-	var prev string
-	if from > 0 {
-		prev = cfheaders[from-1]
-	}
-	recomputed, err := core.FoldFilterHeaders(prev, filters)
-	if err != nil {
-		return nil, nil, err
-	}
-	for i := range filters {
-		h := from + uint64(i)
-		if filters[i].BlockHash != headers[h].Hash {
-			return nil, nil, fmt.Errorf("filter %d is not bound to the verified header", h)
-		}
-		if recomputed[i] != cfheaders[h] {
-			return nil, nil, fmt.Errorf("filter %d is inconsistent with the node's filter-header chain", h)
-		}
 	}
 	return headers, filters, nil
 }
@@ -440,16 +436,9 @@ func spvHistory(base, addr string) error {
 		if !f.Match(addr) {
 			continue
 		}
-		b, err := fetchBlock(base, f.Index)
+		b, err := spvFetchBlock(base, headers[f.Index])
 		if err != nil {
 			return fmt.Errorf("fetch block %d: %w", f.Index, err)
-		}
-		hdr := headers[f.Index]
-		if b.Hash != hdr.Hash {
-			return fmt.Errorf("block %d body does not match the verified header", f.Index)
-		}
-		if core.MerkleRoot(b.Transactions) != hdr.MerkleRoot {
-			return fmt.Errorf("block %d transactions do not match the header merkle root", f.Index)
 		}
 		matched = append(matched, b)
 	}
@@ -596,24 +585,6 @@ func fetchProof(base, txHash string) (core.TxProof, error) {
 	var pr core.TxProof
 	err := getJSON(base+"/proof/"+txHash, &pr)
 	return pr, err
-}
-
-// fetchFiltersFrom pages through the compact filters from `from` to the end of
-// the chain. Filters are needed only for the blocks a wallet has not scanned
-// yet, so callers pass the height they left off at rather than always 0.
-func fetchFiltersFrom(base string, from uint64) ([]core.BlockFilter, error) {
-	var all []core.BlockFilter
-	for {
-		var page []core.BlockFilter
-		if err := getJSON(fmt.Sprintf("%s/cfilters?from=%d", base, from), &page); err != nil {
-			return nil, err
-		}
-		if len(page) == 0 {
-			return all, nil
-		}
-		all = append(all, page...)
-		from += uint64(len(page))
-	}
 }
 
 func fetchStateProof(base, addr string) (core.AccountProof, error) {

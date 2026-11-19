@@ -86,10 +86,54 @@ func (n *Node) trackRequest(p *peer, from, to uint64) {
 }
 
 // clearRequest forgets any outstanding request to p (it answered, or it is gone).
+// An answer with blocks in it also ends any "lacks this range" mark.
 func (n *Node) clearRequest(p *peer) {
 	n.syncMu.Lock()
 	defer n.syncMu.Unlock()
 	delete(n.inflight, p)
+	delete(n.lacking, p)
+}
+
+// lackMark records that a peer answered a block request with an empty batch:
+// it has nothing from height `from` on. It is a hint with an expiry, not a
+// verdict — the peer may catch up a moment later — so it only keeps the
+// scheduler from re-asking that peer for the same window every tick.
+type lackMark struct {
+	from uint64
+	at   time.Time
+}
+
+// lackMarkTTL is how long a "lacks this range" mark keeps a peer out of the
+// rotation for that range. The same as the request timeout: an empty answer
+// costs the peer no more of our patience than silence used to.
+const lackMarkTTL = blockRequestTimeout
+
+// onEmptyBlocks takes a peer's "I do not have that". It counts only as the
+// answer to the request we actually have outstanding with it — an unsolicited
+// empty batch must not free a slot that real bodies are still due on.
+func (n *Node) onEmptyBlocks(p *peer, from uint64) {
+	n.syncMu.Lock()
+	defer n.syncMu.Unlock()
+	req, ok := n.inflight[p]
+	if !ok || req.from != from {
+		return
+	}
+	delete(n.inflight, p)
+	n.lacking[p] = lackMark{from: from, at: time.Now()}
+}
+
+// lacksLocked reports whether p recently said it has nothing from a height at
+// or below h. syncMu held.
+func (n *Node) lacksLocked(p *peer, h uint64, now time.Time) bool {
+	m, ok := n.lacking[p]
+	if !ok {
+		return false
+	}
+	if now.Sub(m.at) >= lackMarkTTL {
+		delete(n.lacking, p)
+		return false
+	}
+	return m.from <= h
 }
 
 // syncLoop drives catch-up: it times out unanswered requests and keeps enough
@@ -198,9 +242,16 @@ func (n *Node) requestMoreBlocks() {
 		idle[0].send(n.getHeadersMsg())
 		return
 	}
+	now := time.Now()
 	for _, p := range idle {
 		if slots <= 0 || nextWindow > best {
 			return
+		}
+		n.syncMu.Lock()
+		lacks := n.lacksLocked(p, nextWindow, now)
+		n.syncMu.Unlock()
+		if lacks {
+			continue // it just told us it has nothing here
 		}
 		to := nextWindow + uint64(maxBlocksBatch) - 1
 		if to > best {

@@ -343,3 +343,84 @@ func TestDialBackoffResetsAfterAGoodConnection(t *testing.T) {
 		t.Fatalf("only %d attempts", attempts)
 	}
 }
+
+// A peer that answers "I do not have that" (an empty batch) is not a staller:
+// its slot is freed at once, it earns no ban score, and the scheduler does not
+// ask it for the same window again on the next tick.
+func TestEmptyBlocksAnswerFreesTheSlotWithoutPenalty(t *testing.T) {
+	n, _, _ := testNode(t)
+	n.noteBestHeight(50)
+	p, msgs := recordingPeer(t)
+	p.id = "behind-peer"
+	n.addPeer(p)
+
+	n.requestMoreBlocks()
+	var asked Message
+	select {
+	case asked = <-msgs:
+	case <-time.After(time.Second):
+		t.Fatal("the idle peer was not asked for anything")
+	}
+	if asked.Type != MsgGetBlocks {
+		// With nothing in flight the scheduler goes through headers first;
+		// put a ranged request in flight directly instead.
+		n.trackRequest(p, 1, 50)
+		asked = Message{Type: MsgGetBlocks, From: 1, To: 50}
+	}
+
+	// An empty batch for a DIFFERENT start is not the answer to this request.
+	n.onEmptyBlocks(p, asked.From+7)
+	n.syncMu.Lock()
+	_, still := n.inflight[p]
+	n.syncMu.Unlock()
+	if !still {
+		t.Fatal("an unsolicited empty batch freed a slot real bodies are due on")
+	}
+
+	n.handleMessage(p, Message{Type: MsgBlocks, From: asked.From})
+	n.syncMu.Lock()
+	_, still = n.inflight[p]
+	lacks := n.lacksLocked(p, asked.From, time.Now())
+	n.syncMu.Unlock()
+	if still {
+		t.Fatal("the empty answer did not free the request slot")
+	}
+	if !lacks {
+		t.Fatal("the peer's empty answer was not remembered")
+	}
+	if n.bans.scoreOf(p.id) != 0 {
+		t.Fatal("a peer that answered honestly was penalised")
+	}
+
+	// With a range in flight elsewhere, the next window goes to an idle peer
+	// that has NOT just said it lacks it — never back to the one that did.
+	busy := &peer{id: "busy"}
+	n.addPeer(busy)
+	n.trackRequest(busy, asked.From, asked.From+9)
+	fresh, freshMsgs := recordingPeer(t)
+	fresh.id = "fresh-peer"
+	n.addPeer(fresh)
+	n.requestMoreBlocks()
+	select {
+	case m := <-freshMsgs:
+		if m.Type != MsgGetBlocks || m.From != asked.From+10 {
+			t.Fatalf("the fresh peer got %s from %d, want getblocks from %d", m.Type, m.From, asked.From+10)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("the next window was not handed to the fresh peer")
+	}
+	select {
+	case m := <-msgs:
+		t.Fatalf("the peer that just said it lacks %d was sent %s from %d", asked.From, m.Type, m.From)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// The mark expires: the peer may have caught up.
+	n.syncMu.Lock()
+	n.lacking[p] = lackMark{from: asked.From, at: time.Now().Add(-lackMarkTTL - time.Second)}
+	expired := !n.lacksLocked(p, asked.From, time.Now())
+	n.syncMu.Unlock()
+	if !expired {
+		t.Fatal("a lack mark outlived its TTL")
+	}
+}

@@ -279,3 +279,161 @@ func CompareCFHeaderChains(sets []CFHeaderSet) error {
 	}
 	return nil
 }
+
+// LightPeer is one open light-client session with a full node, for fetching
+// compact filters and block bodies over the peer protocol rather than from one
+// node's HTTP API.
+//
+// Nothing a LightPeer returns is checked against a header chain: it does not
+// hold one. Its callers do — a filter against the verified filter-header chain
+// and CheckFilterBinding, a block against its header's hash and merkle root —
+// which is what makes the source of the bytes irrelevant to their validity and
+// lets a client take each answer from whichever peer gives one. What it does
+// check is SHAPE: heights in the order asked, nothing outside the range, no
+// pruned placeholder passed off as a body.
+//
+// A LightPeer is not safe for concurrent use; it carries one request at a time.
+type LightPeer struct {
+	s *lightSession
+}
+
+// DialLightPeer opens a session with addr (optionally "<pubkey>@host:port",
+// see ParsePeerAddr). psk is the network key; empty is the open network.
+func DialLightPeer(addr string, psk []byte) (*LightPeer, error) {
+	s, err := dialLight(addr, psk, []string{CapCFilters})
+	if err != nil {
+		return nil, err
+	}
+	return &LightPeer{s: s}, nil
+}
+
+// Addr is the peer's host:port, without any pinned identity.
+func (lp *LightPeer) Addr() string { return lp.s.addr }
+
+// Close ends the session.
+func (lp *LightPeer) Close() error { return lp.s.Close() }
+
+// ServesFilters reports whether the peer advertised the compact-filter
+// capability. Block bodies are served by every node.
+func (lp *LightPeer) ServesFilters() bool {
+	for _, c := range lp.s.ver.Caps {
+		if c == CapCFilters {
+			return true
+		}
+	}
+	return false
+}
+
+// CFilterSet is one peer's answer for a range of compact filters. Filters[i]
+// is the filter at height From+i. Base is the lowest height the peer said it
+// can answer for; a peer that has pruned the start of the range starts its
+// answer above it (From > the height asked) rather than inventing filters.
+type CFilterSet struct {
+	Addr    string
+	From    uint64
+	Base    uint64
+	Filters []core.BlockFilter
+}
+
+// CFilters fetches the compact filters for heights from..to inclusive, paging
+// as the peer's batch limit requires.
+//
+// A short answer is not an error: the set covers what the peer said it holds,
+// and From says where that starts. Callers that need the whole range check
+// len(Filters) themselves — and must not read the heights missing from it as
+// blocks without the address, which is the whole reason a pruned node answers
+// with less rather than with empty filters.
+func (lp *LightPeer) CFilters(from, to uint64) (CFilterSet, error) {
+	out := CFilterSet{Addr: lp.s.addr, From: from}
+	if to < from {
+		return out, fmt.Errorf("filter range %d..%d is empty", from, to)
+	}
+	if !lp.ServesFilters() {
+		return out, fmt.Errorf("%s does not serve compact filters", lp.s.addr)
+	}
+	next := from
+	for next <= to {
+		if err := lp.s.w.Encode(Message{Type: MsgGetCFilters, From: next, To: to}); err != nil {
+			return out, err
+		}
+		m, err := lp.s.readFor(MsgCFilters)
+		if err != nil {
+			return out, fmt.Errorf("%s: %w", lp.s.addr, err)
+		}
+		out.Base = m.Base
+		if len(m.Filters) == 0 {
+			if len(out.Filters) == 0 && m.Base > next {
+				out.From = m.Base
+			}
+			return out, nil
+		}
+		if m.From != next {
+			if m.From > next && len(out.Filters) == 0 {
+				// It skipped a stretch it cannot serve, at the very start:
+				// take the rest, starting where it said it starts.
+				next = m.From
+				out.From = m.From
+			} else {
+				return out, fmt.Errorf("%s: answered filters from height %d, asked from %d", lp.s.addr, m.From, next)
+			}
+		}
+		fs := m.Filters
+		if want := to - next + 1; uint64(len(fs)) > want {
+			fs = fs[:want]
+		}
+		for i, f := range fs {
+			if f.Index != next+uint64(i) {
+				return out, fmt.Errorf("%s: filter %d of a batch from %d is for height %d", lp.s.addr, i, next, f.Index)
+			}
+		}
+		out.Filters = append(out.Filters, fs...)
+		next += uint64(len(fs))
+	}
+	return out, nil
+}
+
+// Blocks fetches the block bodies at heights from..to inclusive, paging as the
+// peer's batch limit requires. Unlike filters, a partial answer is an error:
+// a body is wanted because a filter matched, and a client that silently got
+// fewer blocks than it asked for would under-report a wallet's history.
+//
+// A node that has nothing in the range answers with an empty batch, which fails
+// here at once; one from before that change stays silent, and costs a read
+// timeout instead of a hang.
+func (lp *LightPeer) Blocks(from, to uint64) ([]core.Block, error) {
+	if to < from {
+		return nil, fmt.Errorf("block range %d..%d is empty", from, to)
+	}
+	var out []core.Block
+	next := from
+	for next <= to {
+		if err := lp.s.w.Encode(Message{Type: MsgGetBlocks, From: next, To: to}); err != nil {
+			return out, err
+		}
+		m, err := lp.s.readFor(MsgBlocks)
+		if err != nil {
+			return out, fmt.Errorf("%s: blocks from %d: %w", lp.s.addr, next, err)
+		}
+		if len(m.Blocks) == 0 {
+			return out, fmt.Errorf("%s: no blocks from height %d", lp.s.addr, next)
+		}
+		bs := m.Blocks
+		if want := to - next + 1; uint64(len(bs)) > want {
+			bs = bs[:want]
+		}
+		for i, b := range bs {
+			h := next + uint64(i)
+			if b.Index != h {
+				return out, fmt.Errorf("%s: block %d of a batch from %d is height %d", lp.s.addr, i, next, b.Index)
+			}
+			if b.IsPlaceholder() {
+				// A pruned height keeps a header-only record. Handing it back as
+				// a body would read as a block with no transactions in it.
+				return out, fmt.Errorf("%s has pruned the body of block %d", lp.s.addr, h)
+			}
+		}
+		out = append(out, bs...)
+		next += uint64(len(bs))
+	}
+	return out, nil
+}

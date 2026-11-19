@@ -222,16 +222,29 @@ func verifyAncestryProof(this js.Value, args []js.Value) any {
 	return map[string]any{"ok": true, "valid": core.VerifyAncestryProof(p, arg(args, 1))}
 }
 
-// verifyCommittedFilter checks a compact filter against the FilterRoot its
-// header commits, given the parent's root. This is the check that makes
-// non-inclusion trustless rather than a matter of asking several peers.
+// verifyCommittedFilter checks a compact filter against the header it claims
+// to describe: dnas.verifyCommittedFilter(filterJSON, parentFilterRoot,
+// headerJSON). The header must be one whose proof of work the page verified.
+//
+// It used to take the committed root as a bare string and check the fold only.
+// The fold covers a filter's item count and data, not its key — so a filter
+// re-keyed by whoever served it still folded, and then matched none of the
+// addresses in its block: a forged "never paid". Taking the header lets core
+// check the key, the block hash and the height against it too
+// (core.VerifyFilterAgainstHeader), and takes the root from the same place.
 func verifyCommittedFilter(this js.Value, args []js.Value) any {
 	var f core.BlockFilter
 	if err := decode(arg(args, 0), &f); err != nil {
 		return fail("filter: %v", err)
 	}
-	return map[string]any{
-		"ok":    true,
-		"valid": core.VerifyCommittedFilter(f, arg(args, 1), arg(args, 2)),
+	var h core.Header
+	if err := decode(arg(args, 2), &h); err != nil {
+		return fail("header (the third argument is the header now, not its filter root): %v", err)
 	}
+	out := map[string]any{"ok": true, "valid": true}
+	if err := core.VerifyFilterAgainstHeader(f, arg(args, 1), h); err != nil {
+		out["valid"] = false
+		out["reason"] = err.Error()
+	}
+	return out
 }

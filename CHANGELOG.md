@@ -48,6 +48,33 @@ end-to-end run on a real host found in them.
   lookup per hash. `core.Blockchain.HeightOf` exposes it, and `GET /block/{ref}`
   and `GET /header/{ref}` accept a 64-hex block hash as well as a height.
 
+- **Filters and block bodies from peers.** With `-peers`, `dnas spv scan`,
+  `history`, `wallet update` and invoice scans fetch compact filters and the
+  matched block bodies over the peer protocol (`node.LightPeer`,
+  `getcfilters`/`getblocks`), rotating across the peers in 1024-height chunks.
+  Every answer is verified exactly as an HTTP one is; a peer whose answer is
+  short, misordered, pruned or fails verification is dropped for the rest of
+  the command, and the API node is used only when every peer has failed a
+  range — with a warning, since not depending on it was the point
+  ([cmd/dnas/spvpeers.go](cmd/dnas/spvpeers.go)). The genesis filter is built
+  locally: a node serves filters over the wire from height 1.
+
+### Security
+
+- **A re-keyed compact filter was accepted as a proof of absence.** The
+  filter-header fold (and, from `UpgradeFilterCommit`, the header's
+  `FilterRoot`) commits a filter's `N` and `Data` only. Clients checked the
+  fold and the block hash, but not `BlockFilter.Key` — so a server could keep a
+  filter that folds correctly, swap its SipHash key, and make every address in
+  the block a non-match. `core.CheckFilterBinding` checks height, block hash
+  and key against the PoW-verified header (the key is the block hash below the
+  upgrade and a digest of `PrevHash`/`MerkleRoot` above it, all header fields),
+  and every CLI filter path now calls it. The WebAssembly bundle's
+  `dnas.verifyCommittedFilter` now takes the HEADER as its third argument
+  instead of a bare filter root, and checks binding and committed fold together
+  (`core.VerifyFilterAgainstHeader`); a header that commits no root is a
+  failure, not a pass. Nothing in the explorer called it yet, so no page breaks.
+
 ### Fixed — found by an end-to-end run on a separate host
 
 The unit and e2e suites were run from cross-compiled binaries on a 1-CPU
@@ -90,6 +117,16 @@ retargeting. Every suite passed as it was; these came from the scenarios.
   prints it with the ready-to-use `pin=<identity>@<advertise>`.
 
 ### Changed
+
+- **`getblocks` is always answered.** A node that has nothing in the range
+  replies with an empty `blocks` batch naming where it starts, as `getheaders`
+  already did. It used to stay silent, so a light client waited out a 10 s read
+  timeout per peer — and a syncing node waited 20 s, then disconnected and
+  ban-scored an honest peer for "stalling" when it was only behind. An empty
+  answer to the request actually outstanding frees the slot with no penalty and
+  keeps that peer out of the rotation for that window for 20 s
+  (`node.onEmptyBlocks`, `lackMarkTTL`); an unsolicited one is ignored. A peer
+  that accepts a request and never answers is still dropped as before.
 
 - **`scripts/version.sh`** prints `X.Y.Z+dirty` for the tagged commit with
   uncommitted changes; it printed `X.Y.Z.dirty`, which reads as a fourth

@@ -367,13 +367,9 @@ func scanInvoice(base string, inv invoiceFile, confirmations uint64) (invoicePay
 		if f.Index < inv.FromHeight || !f.Match(inv.Address) {
 			continue
 		}
-		b, err := fetchBlock(base, f.Index)
+		b, err := spvFetchBlock(base, headers[f.Index])
 		if err != nil {
 			return invoicePayment{}, tip, fmt.Errorf("fetch block %d: %w", f.Index, err)
-		}
-		hdr := headers[f.Index]
-		if b.Hash != hdr.Hash || core.MerkleRoot(b.Transactions) != hdr.MerkleRoot {
-			return invoicePayment{}, tip, fmt.Errorf("block %d does not match its verified header", f.Index)
 		}
 		matched = append(matched, b)
 	}

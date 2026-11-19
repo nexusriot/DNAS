@@ -319,7 +319,7 @@ sections matter most for "toy → real".
   whole chain where a ranged request would do — throttled per peer, and now
   capped, but still the one message with no natural size.
 
-- **`[M]` A peer-protocol light client.** Compact filters and the filter-header
+- ~~**`[M]` A peer-protocol light client.**~~ **Done.** Compact filters and the filter-header
   chain are now served over the WIRE as well as over HTTP
   ([node/cfilterwire.go](node/cfilterwire.go), gated on the `cf` capability), so
   a light client can be one peer among several instead of an HTTP client of one
@@ -333,9 +333,14 @@ sections matter most for "toy → real".
   node before a non-match counts as absence. Every `dnas spv` command that
   verifies the header chain also asks each `-peers` peer where its chain leaves
   the API node's ([cmd/dnas/crosscheck.go](cmd/dnas/crosscheck.go)): a heavier
-  branch is refused, and the tip must be confirmed by min(2, peers). What
-  remains is that filters and blocks themselves still come over HTTP from one
-  node; only the header chain that binds them is cross-checked.
+  branch is refused, and the tip must be confirmed by min(2, peers). The last
+  piece is in too: with `-peers`, the filters themselves and the block bodies
+  a match calls for come from the peers
+  ([cmd/dnas/spvpeers.go](cmd/dnas/spvpeers.go), `node.LightPeer`), rotated
+  across them, each answer verified and a failing peer dropped; the API node is
+  a stated fallback, not the source. Doing it turned up a real hole: a filter's
+  `Key` is outside the fold, so a re-keyed filter verified and hid every address
+  in its block. `core.CheckFilterBinding` now checks it against the header.
 
 ## 3. Programmability
 

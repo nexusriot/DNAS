@@ -1242,7 +1242,12 @@ now tracks what it asked for, from whom and when:
 
 - every ranged block request is recorded against its peer, and a `syncLoop` tick
   disconnects (and ban-scores) a peer that has not answered within
-  `blockRequestTimeout`, freeing the slot for someone else;
+  `blockRequestTimeout`, freeing the slot for someone else. Answering is not
+  the same as having: a node with nothing in the range replies with an empty
+  batch naming where it starts, which frees the slot at once with no penalty
+  and keeps that peer out of the rotation for that window for `lackMarkTTL`.
+  Only silence is treated as stalling — before the empty answer existed, an
+  honest peer that was merely behind got ban-scored for it;
 - `bestHeight` records the highest height any peer has announced, so the loop can
   tell it is behind and restart the headers-first pipeline when nothing is
   outstanding — announcements are only hints, and nothing is trusted until the
@@ -1525,7 +1530,8 @@ false negatives: a non-match is a **proof of non-inclusion** for that block; a
 match is "probably present, download to confirm" (≈1/M false positives). The API
 serves `/cfilter/{index}`, `/cfilters`, and a BIP157-style filter-header chain at
 `/cfheaders`; `dnas spv scan <addr>` PoW-verifies the headers, checks each filter
-is bound to its header and consistent with the filter-header chain, then reports
+is bound to its header (height, block hash and SipHash key) and consistent with
+the filter-header chain, then reports
 matches and how many blocks the address is provably absent from.
 
 **Cross-checking the tip** ([cmd/dnas/crosscheck.go](cmd/dnas/crosscheck.go)).
@@ -1566,7 +1572,36 @@ one height.
 The committed chain starts AT the activation height, because the parent of the
 first committed block carries no root to extend. A client verifies filters
 against the commitment from there forward and falls back to the uncommitted
-filter-header chain below it. `core.VerifyCommittedFilter` is the check.
+filter-header chain below it. `core.VerifyCommittedFilter` is the fold;
+`core.VerifyFilterAgainstHeader` is the whole check (fold plus the binding
+below), and it is what the browser bundle's `dnas.verifyCommittedFilter` runs.
+
+**What the fold does not cover.** A filter's commitment is its item count and
+its encoded set — not its height, its block hash, or its `Key`. So a filter can
+fold to the committed root, uncommitted or committed alike, and still be keyed
+by a digest the server chose; every address in the block then fails to match,
+which is a forged proof of absence with the chain's work apparently behind it.
+The key is never something a client has to take on trust, though: it is the
+block hash below the upgrade and a digest of `PrevHash` and `MerkleRoot` above
+it, and the header carries all three. `core.CheckFilterBinding` checks height,
+block hash and key against the PoW-verified header, and every CLI path that
+treats a non-match as absence calls it before the fold. (It used to check the
+block hash only.)
+
+**Filters and blocks from peers** ([cmd/dnas/spvpeers.go](cmd/dnas/spvpeers.go)).
+Once the header chain and the filter-header chain are confirmed across
+`-peers`, nothing the API node serves afterwards can lie — a filter must fold
+and bind, a block must hash to its header and fold to its merkle root. It could
+still *withhold*: a node that refuses the filter or the block a wallet needs
+leaves it nothing to verify. So with `-peers` the filters (in chunks of 1024
+heights) and the bodies a match calls for are fetched over the peer protocol
+(`node.LightPeer`: `getcfilters` and `getblocks` on one session per peer),
+rotating across the peers so no one of them carries a whole scan. An answer that
+is short, misordered, a pruned placeholder, or fails verification drops that
+peer for the rest of the command and the next is asked; the API node is the
+fallback only when every peer has failed a range, and the client says so. The
+genesis filter is built locally — every client holds that block, and a node
+answers filters over the wire from its body base, height 1.
 
 **Ancestry proofs.** A header chain proves ancestry only by holding all of it:
 knowing block 10 is an ancestor of block 1,000,000 means having the 999,990

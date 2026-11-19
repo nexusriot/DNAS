@@ -235,7 +235,8 @@ type Node struct {
 	// accepts a request and never answers stalls catch-up forever.
 	syncMu     sync.Mutex
 	inflight   map[*peer]*blockRequest
-	bestHeight int64 // atomic
+	lacking    map[*peer]lackMark // peers that said they lack a range (sync.go)
+	bestHeight int64              // atomic
 
 	mining atomic.Bool // whether the miner is currently active (toggle at runtime)
 	tipGen int64       // atomic; bumped whenever the tip changes to interrupt mining
@@ -313,6 +314,7 @@ func New(cfg Config, chain *core.Blockchain, mp *core.Mempool, w *wallet.Wallet)
 		dand:         newDandelion(),
 		orphans:      newOrphanPool(orphanPoolCapacity, orphanPoolBytes),
 		inflight:     map[*peer]*blockRequest{},
+		lacking:      map[*peer]lackMark{},
 		quit:         make(chan struct{}),
 	}
 	// Bind the mempool to the chain so admission can check what a sender has
@@ -1025,12 +1027,18 @@ func (n *Node) handleMessage(p *peer, m Message) {
 		n.onHeaders(p, m.Headers)
 
 	case MsgGetBlocks:
-		if bs := n.chain.BlocksRange(m.From, m.To, maxBlocksBatch); len(bs) > 0 {
-			p.send(Message{Type: MsgBlocks, Blocks: bs})
-		}
+		// Always answered, like getheaders. An empty batch naming where it
+		// starts says "I do not have that"; silence used to say nothing, so the
+		// asker waited out a timeout — and a syncing node then dropped and
+		// ban-scored an honest peer for being behind.
+		p.send(Message{Type: MsgBlocks, From: m.From, Blocks: n.chain.BlocksRange(m.From, m.To, maxBlocksBatch)})
 
 	case MsgBlocks:
-		n.onBlocks(p, m.Blocks)
+		if len(m.Blocks) == 0 {
+			n.onEmptyBlocks(p, m.From)
+		} else {
+			n.onBlocks(p, m.Blocks)
+		}
 
 	// Compact filters over the wire (see cfilterwire.go), so a light client can
 	// be a peer among several rather than an HTTP client of one.

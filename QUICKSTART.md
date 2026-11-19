@@ -460,6 +460,9 @@ branch with more work makes the command refuse (the API node is serving a stale
 or minority chain), and the tip must be confirmed by two peers (or by the one,
 if you gave one). `scan` and `history` also need two or more to agree on the
 filter-header chain before a non-match counts as "this address is absent".
+With `-peers`, the filters and any block bodies a match needs are then fetched
+from the peers rather than the API node; it is only asked for a range no peer
+could serve, and the command prints a warning when that happens.
 
 **Pinning a peer's identity.** Any `-peers` entry — for `dnas node` as well as
 the light clients — may be written `<pubkey>@host:port`. The peer must then

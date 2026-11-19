@@ -23,7 +23,7 @@ dnas htlc new|address|claim|refund [-asset ID]     hash-time-locked contracts (c
 dnas htlc swap -hash H -asset-owner A -coin-owner B ...   derive both legs of an asset-for-coin swap
 dnas vault address|spend                           time-delayed vault: cold key now, hot key from a height
 dnas spv [-api URL] sync|verify <txhash>|scan|balance|history <address>   light client (headers/proof/filters/state)
-dnas spv [-peers LIST] [-netkey KEY] sync|scan|history ...                 cross-check the tip (and filter headers) against P2P peers; [<pubkey>@]host:port pins one
+dnas spv [-peers LIST] [-netkey KEY] sync|scan|history ...                 cross-check the tip (and filter headers) against P2P peers, then fetch filters and blocks from them; [<pubkey>@]host:port pins one
 dnas spv [-api URL] wallet [-f FILE] add|update|status|list|forget          persistent light wallet (incremental, -watch)
 dnas spv [-api URL] wallet -key FILE new|send <to> <amount>                 self-custodial light wallet (signs locally)
 dnas spv [-api URL] wallet -key FILE issue <ticker> <supply>                mint a native asset (token)

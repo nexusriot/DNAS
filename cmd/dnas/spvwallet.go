@@ -219,7 +219,8 @@ func (sw *SPVWallet) update(base string) error {
 	if err != nil {
 		return err
 	}
-	fetch := func(h uint64) (core.Block, error) { return fetchBlock(base, h) }
+	// headers is re-read below on a rescan; the closure follows it.
+	fetch := func(h uint64) (core.Block, error) { return spvFetchBlock(base, headers[h]) }
 	err = sw.syncFrom(headers, from, filters, fetch)
 	if !errors.Is(err, errRescanNeeded) {
 		return err
